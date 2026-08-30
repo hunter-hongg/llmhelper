@@ -602,13 +602,11 @@ dependencies = [
  "crossterm",
  "csv",
  "dirs",
- "parking_lot",
  "ratatui",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
  "toml",
 ]

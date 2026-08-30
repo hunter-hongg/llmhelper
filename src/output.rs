@@ -2,54 +2,8 @@ use std::io::Write;
 
 use serde::Serialize;
 
-use crate::domain::record::TokenBreakdown;
-
-/// A single row of grouped aggregation output.
-#[derive(Clone, Debug, Serialize)]
-pub struct GroupRow {
-    pub key: String,
-    pub source: String,
-    pub sessions: usize,
-    pub messages: usize,
-    pub tokens: TokenBreakdown,
-    pub cost: Option<f64>,
-}
-
-impl GroupRow {
-    pub fn to_json_map(&self) -> serde_json::Map<String, serde_json::Value> {
-        let mut m = serde_json::Map::new();
-        m.insert(
-            "key".to_string(),
-            serde_json::Value::String(self.key.clone()),
-        );
-        m.insert(
-            "source".to_string(),
-            serde_json::Value::String(self.source.clone()),
-        );
-        m.insert(
-            "sessions".to_string(),
-            serde_json::Value::Number(self.sessions.into()),
-        );
-        m.insert(
-            "messages".to_string(),
-            serde_json::Value::Number(self.messages.into()),
-        );
-        m.insert(
-            "tokens".to_string(),
-            serde_json::to_value(&self.tokens).unwrap(),
-        );
-        m.insert(
-            "cost".to_string(),
-            match self.cost {
-                Some(c) => serde_json::Value::Number(
-                    serde_json::Number::from_f64(c).unwrap_or(serde_json::Number::from(0)),
-                ),
-                None => serde_json::Value::Null,
-            },
-        );
-        m
-    }
-}
+use crate::aggregator::Group;
+use crate::source::SourceStatus;
 
 #[derive(Clone, Debug, Serialize)]
 struct SourceInfo {
@@ -62,7 +16,7 @@ struct SourceInfo {
 struct JsonPayload {
     sources: Vec<SourceInfo>,
     group_by: String,
-    groups: Vec<serde_json::Value>,
+    groups: Vec<Group>,
 }
 
 pub struct OutputRenderer;
@@ -70,8 +24,8 @@ pub struct OutputRenderer;
 impl OutputRenderer {
     pub fn json<W: Write>(
         &self,
-        groups: &[GroupRow],
-        source_statuses: &[crate::source::SourceStatus],
+        groups: &[Group],
+        source_statuses: &[SourceStatus],
         group_by: &str,
         out: &mut W,
     ) -> anyhow::Result<()> {
@@ -89,16 +43,13 @@ impl OutputRenderer {
         let payload = JsonPayload {
             sources,
             group_by: group_by.to_string(),
-            groups: groups
-                .iter()
-                .map(|g| serde_json::Value::Object(g.to_json_map()))
-                .collect(),
+            groups: groups.to_vec(),
         };
         serde_json::to_writer_pretty(out, &payload)?;
         Ok(())
     }
 
-    pub fn csv<W: Write>(&self, groups: &[GroupRow], out: &mut W) -> anyhow::Result<()> {
+    pub fn csv<W: Write>(&self, groups: &[Group], out: &mut W) -> anyhow::Result<()> {
         let mut w = csv::Writer::from_writer(out);
         w.write_record(&[
             "group_key",
@@ -136,10 +87,10 @@ impl OutputRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::record::Record;
-    use crate::domain::GroupBy;
-    use crate::filter::Filter;
     use crate::aggregator::AggregateResult;
+    use crate::domain::GroupBy;
+    use crate::domain::record::{Record, TokenBreakdown};
+    use crate::filter::Filter;
     use chrono::Utc;
 
     fn fake_record(source: &str, project: &str, model: &str, cost: Option<f64>) -> Record {
@@ -163,14 +114,9 @@ mod tests {
             fake_record("claude", "/proj/a", "auto", None),
             fake_record("opencode", "/proj/a", "big-pickle", Some(0.12)),
         ];
-        let agg = AggregateResult::from_records(
-            &records,
-            &Filter::none(),
-            GroupBy::Source,
-        );
-        let rows: Vec<GroupRow> = agg.groups.iter().map(|g| GroupRow { key: g.key.clone(), source: g.source.clone(), sessions: g.sessions, messages: g.messages, tokens: g.tokens.clone(), cost: g.cost }).collect();
+        let agg = AggregateResult::from_records(&records, &Filter::none(), GroupBy::Source);
         let mut buf = Vec::new();
-        OutputRenderer.csv(&rows, &mut buf).unwrap();
+        OutputRenderer.csv(&agg.groups, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("group_key,source,sessions,messages"));
         assert!(text.contains("claude"));
@@ -180,18 +126,49 @@ mod tests {
     #[test]
     fn csv_cost_blank_for_claude() {
         let records = vec![fake_record("claude", "/p", "auto", None)];
-        let agg = AggregateResult::from_records(
-            &records,
-            &Filter::none(),
-            GroupBy::Source,
-        );
-        let rows: Vec<GroupRow> = agg.groups.iter().map(|g| GroupRow { key: g.key.clone(), source: g.source.clone(), sessions: g.sessions, messages: g.messages, tokens: g.tokens.clone(), cost: g.cost }).collect();
+        let agg = AggregateResult::from_records(&records, &Filter::none(), GroupBy::Source);
         let mut buf = Vec::new();
-        OutputRenderer.csv(&rows, &mut buf).unwrap();
+        OutputRenderer.csv(&agg.groups, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = text.trim().split('\n').collect();
         assert_eq!(lines.len(), 2);
         let parts: Vec<&str> = lines[1].split(',').collect();
-        assert_eq!(parts[9], ""); // cost column
+        assert_eq!(parts[9], "");
+    }
+
+    #[test]
+    fn json_output_structure() {
+        let records = vec![
+            fake_record("claude", "/proj/a", "auto", None),
+            fake_record("opencode", "/proj/a", "big-pickle", Some(0.12)),
+        ];
+        let agg = AggregateResult::from_records(&records, &Filter::none(), GroupBy::Source);
+        let statuses = vec![
+            SourceStatus {
+                name: "claude".to_string(),
+                record_count: 1,
+                error: None,
+            },
+            SourceStatus {
+                name: "opencode".to_string(),
+                record_count: 1,
+                error: None,
+            },
+        ];
+        let mut buf = Vec::new();
+        let renderer = OutputRenderer;
+        renderer.json(&agg.groups, &statuses, "source", &mut buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert!(parsed.get("sources").is_some());
+        assert!(parsed.get("groups").is_some());
+        assert_eq!(parsed["group_by"], "source");
+        let group_keys: Vec<&str> = parsed["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["key"].as_str().unwrap())
+            .collect();
+        assert!(group_keys.contains(&"claude"));
+        assert!(group_keys.contains(&"opencode"));
     }
 }

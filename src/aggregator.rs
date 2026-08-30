@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 
+use serde::Serialize;
+
 use crate::domain::group::GroupBy;
 use crate::domain::record::{Record, TokenBreakdown};
 use crate::filter::Filter;
 
 /// A single group within an aggregated result.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Group {
     pub key: String,
     pub source: String,
@@ -28,7 +30,7 @@ impl AggregateResult {
     /// Build an aggregate from raw records, a filter, and a grouping dimension.
     pub fn from_records(records: &[Record], filter: &Filter, group_by: GroupBy) -> Self {
         let filtered: Vec<&Record> = filter.apply(records);
-        let mut groups: BTreeMap<String, Group> = BTreeMap::new();
+        let mut groups: BTreeMap<String, GroupEntry> = BTreeMap::new();
 
         for r in &filtered {
             let key = match group_by {
@@ -36,9 +38,9 @@ impl AggregateResult {
                 GroupBy::Project => r.project.clone(),
                 GroupBy::Model => r.model.clone(),
             };
-            let entry = groups.entry(key.clone()).or_insert_with(|| Group {
-                key,
+            let entry = groups.entry(key).or_insert_with(|| GroupEntry {
                 source: r.source.clone(),
+                mixed_source: false,
                 sessions: 0,
                 messages: 0,
                 tokens: TokenBreakdown::default(),
@@ -47,27 +49,40 @@ impl AggregateResult {
             entry.sessions += 1;
             entry.messages += r.message_count as usize;
             entry.tokens.add(&r.tokens);
-            // Sum cost within-group only. Mixed-source groups (Claude + OpenCode)
-            // have cost=None since we cannot reliably sum across sources.
-            if let (Some(a), Some(b)) = (entry.cost, r.cost) {
+
+            // Cost scoping: only sum within a single source.
+            // Once a group has records from multiple sources, cost is permanently None.
+            if entry.mixed_source {
+                entry.cost = None;
+            } else if let (Some(a), Some(b)) = (entry.cost, r.cost) {
                 entry.cost = Some(a + b);
             } else if entry.cost.is_none() && r.cost.is_some() {
-                // If entry already has records from a different source, mixed group → None
                 if entry.source != r.source {
+                    entry.mixed_source = true;
                     entry.cost = None;
                 } else {
                     entry.cost = r.cost;
                 }
             } else if entry.cost.is_some() && r.cost.is_none() {
-                // Mixed source group: clear cost
+                entry.mixed_source = true;
                 entry.cost = None;
             }
         }
-        // Fix keys after the insert loop.
-        let groups = groups.into_values().collect();
+
+        let groups: Vec<Group> = groups
+            .into_iter()
+            .map(|(key, e)| Group {
+                key,
+                source: e.source,
+                sessions: e.sessions,
+                messages: e.messages,
+                tokens: e.tokens,
+                cost: e.cost,
+            })
+            .collect();
 
         let grand_tokens = TokenBreakdown::sum(&filtered);
-        let grand_messages = filtered.iter().map(|r| r.message_count as usize).sum();
+        let grand_messages: usize = filtered.iter().map(|r| r.message_count as usize).sum();
         let grand_sessions = filtered.len();
 
         Self {
@@ -77,6 +92,16 @@ impl AggregateResult {
             groups,
         }
     }
+}
+
+/// Internal mutable accumulator during aggregation.
+struct GroupEntry {
+    source: String,
+    mixed_source: bool,
+    sessions: usize,
+    messages: usize,
+    tokens: TokenBreakdown,
+    cost: Option<f64>,
 }
 
 #[cfg(test)]
@@ -125,16 +150,27 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_claude_cost_stays_none_in_mixed_group() {
-        // When grouping by project that contains both sources, the group
-        // should have cost=None since we can't reliably sum across sources.
+    fn aggregate_mixed_group_cost_is_none() {
+        // Interleaved: opencode, claude, opencode — cost must be None.
         let records = vec![
-            rec("claude", "/shared", "auto", None),
-            rec("opencode", "/shared", "big-pickle", Some(0.05)),
+            rec("opencode", "/shared", "m", Some(0.1)),
+            rec("claude", "/shared", "m", None),
+            rec("opencode", "/shared", "m", Some(0.2)),
         ];
         let agg = AggregateResult::from_records(&records, &Filter::none(), GroupBy::Project);
         let shared = agg.groups.iter().find(|g| g.key == "/shared").unwrap();
-        assert_eq!(shared.cost, None);
+        assert_eq!(shared.cost, None, "mixed group must have cost=None");
+    }
+
+    #[test]
+    fn aggregate_same_source_costs_sum() {
+        let records = vec![
+            rec("opencode", "/p", "m", Some(0.1)),
+            rec("opencode", "/p", "m", Some(0.2)),
+        ];
+        let agg = AggregateResult::from_records(&records, &Filter::none(), GroupBy::Source);
+        let oc = agg.groups.iter().find(|g| g.key == "opencode").unwrap();
+        assert!((oc.cost.unwrap() - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -165,7 +201,6 @@ mod tests {
             ..Default::default()
         };
         let agg = AggregateResult::from_records(&records, &f, GroupBy::Source);
-        // only the first record is recent enough
         assert_eq!(agg.groups.iter().filter(|g| g.key == "claude").count(), 1);
     }
 }

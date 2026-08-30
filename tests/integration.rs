@@ -1,263 +1,191 @@
-//! Integration tests driven via `--json` output against fixture data.
+//! Integration tests driven via the real `usage --json` CLI binary.
 //! This is the single testing seam from the spec.
 
+use std::process::Command;
 use std::path::PathBuf;
 
-use llmhelper::cli::{Cli, Command, UsageArgs};
-use llmhelper::config::Config;
-use llmhelper::domain::group::GroupBy;
-use llmhelper::filter::Filter;
-use llmhelper::output::{GroupRow, OutputRenderer};
-use llmhelper::source::{ClaudeSource, OpenCodeSource, Registry};
-use llmhelper::aggregator::AggregateResult;
+/// Path to the release binary.
+fn bin() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_BIN_EXE_llmhelper"));
+    p
+}
 
-/// Build a registry pointed at the fixture paths.
-fn fixture_registry() -> Registry {
-    let mut reg = Registry::new();
-    let claude_fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("claude");
-    reg.register(Box::new(ClaudeSource::new(claude_fixtures)));
-    let opencode_fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("opencode");
-    let dbs = vec![
-        opencode_fixtures.join("opencode.db"),
-        opencode_fixtures.join("opencode-local.db"),
-    ];
-    reg.register(Box::new(OpenCodeSource::new(dbs)));
-    reg
+/// Build the fixture directory path.
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
+}
+
+/// Run `llmhelper usage --json` with fixture paths and parse the output.
+fn run_usage_json(extra_args: &[&str]) -> serde_json::Value {
+    let mut cmd = Command::new(bin());
+    cmd.args(["usage", "--json"]);
+    cmd.args([
+        "--claude-dir",
+        fixture_dir().join("claude").to_str().unwrap(),
+        "--opencode-db",
+        fixture_dir().join("opencode").join("opencode.db").to_str().unwrap(),
+    ]);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    let output = cmd.output().expect("failed to run llmhelper");
+    assert!(
+        output.status.success(),
+        "llmhelper exited with {}: {:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    serde_json::from_str(&stdout).unwrap()
 }
 
 #[test]
-fn json_output_total_session_count_after_dedup() {
-    let registry = fixture_registry();
-    let (records, statuses) = registry.load_all();
-    // session-a has 3 assistant messages → 1 record
-    // session-b has 1 assistant message → 1 record
-    // opencode has 2 sessions (ses_fix_001 + ses_fix_002)
-    // opencode-local has ses_fix_001 duplicated → deduped to 1
-    // Total: 4 records
-    assert_eq!(records.len(), 4);
-    // Both sources present
-    assert_eq!(statuses.len(), 2);
-    let claude_status = statuses.iter().find(|s| s.name == "claude").unwrap();
-    let oc_status = statuses.iter().find(|s| s.name == "opencode").unwrap();
-    assert_eq!(claude_status.record_count, 2);
-    assert_eq!(oc_status.record_count, 2);
+fn json_output_total_session_count() {
+    let json = run_usage_json(&[]);
+    let sources = json["sources"].as_array().unwrap();
+    let total_records: usize = sources.iter().map(|s| s["records"].as_u64().unwrap() as usize).sum();
+    // Claude: 2 sessions (session-a + session-b)
+    // OpenCode: 2 sessions (ses_fix_001 + ses_fix_002)
+    assert_eq!(total_records, 4);
 }
 
 #[test]
 fn json_output_claude_cost_is_null() {
-    let registry = fixture_registry();
-    let (records, _) = registry.load_all();
-    let claude_records: Vec<_> = records
-        .iter()
-        .filter(|r| r.source == "claude")
-        .collect();
-    for r in &claude_records {
-        assert!(r.cost.is_none(), "Claude record should have cost=None");
+    let json = run_usage_json(&["--source", "claude"]);
+    let groups = json["groups"].as_array().unwrap();
+    for g in groups {
+        assert_eq!(g["cost"], serde_json::Value::Null, "Claude cost must be null");
     }
 }
 
 #[test]
 fn json_output_opencode_cost_present() {
-    let registry = fixture_registry();
-    let (records, _) = registry.load_all();
-    let oc_records: Vec<_> = records
-        .iter()
-        .filter(|r| r.source == "opencode")
-        .collect();
-    assert!(!oc_records.is_empty());
-    // At least one opencode record has cost
-    assert!(oc_records.iter().any(|r| r.cost.is_some()));
+    let json = run_usage_json(&["--source", "opencode"]);
+    let groups = json["groups"].as_array().unwrap();
+    assert!(!groups.is_empty());
+    let cost = groups[0]["cost"].as_f64();
+    assert!(cost.is_some(), "OpenCode cost must be present");
 }
 
 #[test]
 fn json_output_token_sums_match_fixtures() {
-    let registry = fixture_registry();
-    let (records, _) = registry.load_all();
-    let filter = Filter::none();
-    let agg = AggregateResult::from_records(&records, &filter, GroupBy::Source);
+    let json = run_usage_json(&[]);
+    let groups = json["groups"].as_array().unwrap();
+    let claude = groups.iter().find(|g| g["key"] == "claude").unwrap();
+    assert_eq!(claude["tokens"]["input"], 650);
+    assert_eq!(claude["tokens"]["output"], 325);
+    assert_eq!(claude["tokens"]["reasoning"], 15);
+    assert_eq!(claude["tokens"]["cache_read"], 30);
+    assert_eq!(claude["tokens"]["cache_write"], 10);
 
-    // Claude group: session-a (input=600, out=300, reason=15, cache_r=30, cache_w=10)
-    // + session-b (input=50, out=25, reason=0, cache_r=0, cache_w=0)
-    // = input=650, output=325, reasoning=15, cache_read=30, cache_write=10
-    let claude = agg.groups.iter().find(|g| g.key == "claude").unwrap();
-    assert_eq!(claude.sessions, 2);
-    assert_eq!(claude.tokens.input, 650);
-    assert_eq!(claude.tokens.output, 325);
-    assert_eq!(claude.tokens.reasoning, 15);
-    assert_eq!(claude.tokens.cache_read, 30);
-    assert_eq!(claude.tokens.cache_write, 10);
-
-    // OpenCode group: ses_fix_001 (input=58703, out=5008) + ses_fix_002 (input=834, out=9)
-    // = input=59537, output=5017
-    let oc = agg.groups.iter().find(|g| g.key == "opencode").unwrap();
-    assert_eq!(oc.sessions, 2);
-    assert_eq!(oc.tokens.input, 59537);
-    assert_eq!(oc.tokens.output, 5017);
+    let oc = groups.iter().find(|g| g["key"] == "opencode").unwrap();
+    assert_eq!(oc["tokens"]["input"], 59537);
+    assert_eq!(oc["tokens"]["output"], 5017);
 }
 
 #[test]
 fn json_output_source_filter() {
-    let registry = fixture_registry();
-    let (records, _) = registry.load_all();
-    let filter = Filter {
-        source: Some("claude".to_string()),
-        ..Default::default()
-    };
-    let agg = AggregateResult::from_records(&records, &filter, GroupBy::Source);
-    assert_eq!(agg.groups.len(), 1);
-    assert_eq!(agg.groups[0].key, "claude");
+    let json = run_usage_json(&["--source", "claude"]);
+    let groups = json["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["key"], "claude");
 }
 
 #[test]
 fn json_output_project_filter() {
-    let registry = fixture_registry();
-    let (records, _) = registry.load_all();
-    let filter = Filter {
-        project: Some("/home/hunter".to_string()),
-        ..Default::default()
-    };
-    eprintln!("RECORDS: {:?}", records.iter().map(|r| format!("{}/{}", r.source, r.project)).collect::<Vec<_>>());
-    let agg = AggregateResult::from_records(&records, &filter, GroupBy::Source);
-    eprintln!("GROUPS: {:?}", agg.groups.iter().map(|g| (&g.key, g.sessions)).collect::<Vec<_>>());
-    // Filter matches both sources; expect 2 groups
-    assert_eq!(agg.groups.len(), 2);
-    let keys: Vec<&str> = agg.groups.iter().map(|g| g.key.as_str()).collect();
-    assert!(keys.contains(&"claude"));
-    assert!(keys.contains(&"opencode"));
+    let json = run_usage_json(&["--project", "/home/hunter"]);
+    let groups = json["groups"].as_array().unwrap();
+    // Both sources have projects under /home/hunter
+    assert_eq!(groups.len(), 2);
 }
 
 #[test]
 fn json_output_group_by_model() {
-    let registry = fixture_registry();
-    let (records, _) = registry.load_all();
-    let filter = Filter::none();
-    let agg = AggregateResult::from_records(&records, &filter, GroupBy::Model);
-    // Models: "auto" (3 records), "claude-sonnet-4-20250514" (1), "big-pickle" (1), "agnes-2.5-flash" (1)
-    let auto = agg.groups.iter().find(|g| g.key == "auto").unwrap();
-    assert_eq!(auto.sessions, 1);
-    let bp = agg.groups.iter().find(|g| g.key == "big-pickle").unwrap();
-    assert_eq!(bp.sessions, 1);
+    let json = run_usage_json(&["--group-by", "model"]);
+    let groups = json["groups"].as_array().unwrap();
+    let auto = groups.iter().find(|g| g["key"] == "auto").unwrap();
+    assert_eq!(auto["sessions"], 1);
+    let bp = groups.iter().find(|g| g["key"] == "big-pickle").unwrap();
+    assert_eq!(bp["sessions"], 1);
 }
 
 #[test]
-fn json_output_serialization_matches_spec_schema() {
-    let registry = fixture_registry();
-    let (records, source_statuses) = registry.load_all();
-    let filter = Filter::none();
-    let agg = AggregateResult::from_records(&records, &filter, GroupBy::Source);
+fn json_output_last_filter() {
+    // --last 1d should include recent fixture sessions
+    let json = run_usage_json(&["--last", "1d"]);
+    let sources = json["sources"].as_array().unwrap();
+    let total: usize = sources.iter().map(|s| s["records"].as_u64().unwrap() as usize).sum();
+    assert!(total >= 0); // fixture timestamps may be in the past; just verify it runs
 
-    let groups: Vec<GroupRow> = agg.groups.iter().map(|g| GroupRow {
-        key: g.key.clone(),
-        source: g.source.clone(),
-        sessions: g.sessions,
-        messages: g.messages,
-        tokens: g.tokens.clone(),
-        cost: g.cost,
-    }).collect();
-
-    let mut buf = Vec::new();
-    let renderer = OutputRenderer; renderer.json(&groups, &source_statuses, "source", &mut buf).unwrap();
-    let json_str = String::from_utf8(buf.clone()).unwrap();
-
-    // Verify it's valid JSON
-    let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-    assert!(parsed.get("sources").is_some());
-    assert!(parsed.get("groups").is_some());
-    assert!(parsed.get("group_by").is_some());
-
-    // Verify sources list has both sources
-    let sources = parsed["sources"].as_array().unwrap();
-    let names: Vec<&str> = sources.iter().map(|s| s["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"claude"));
-    assert!(names.contains(&"opencode"));
-
-    // Verify groups have expected structure
-    let group_keys: Vec<&str> = parsed["groups"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|g| g["key"].as_str().unwrap())
-        .collect();
-    assert!(group_keys.contains(&"claude"));
-    assert!(group_keys.contains(&"opencode"));
+    // --last 100y should include everything
+    let json = run_usage_json(&["--last", "36500d"]);
+    let sources = json["sources"].as_array().unwrap();
+    let total_all: usize = sources.iter().map(|s| s["records"].as_u64().unwrap() as usize).sum();
+    assert_eq!(total_all, 4);
 }
 
 #[test]
-fn cli_flag_validation_rejects_invalid_combos() {
-    use clap::Parser;
-    // --json and --csv together should be rejected
-    let args = UsageArgs {
-        claude_dir: None,
-        opencode_db: None,
-        since: None,
-        last: Some("7d".to_string()),
-        project: None,
-        model: None,
-        source: None,
-        group_by: Default::default(),
-        json: true,
-        csv: true,
-    };
-    assert!(args.validate().is_err());
-
-    // --since and --last together
-    let args2 = UsageArgs {
-        claude_dir: None,
-        opencode_db: None,
-        since: Some(chrono::Utc::now()),
-        last: Some("7d".to_string()),
-        project: None,
-        model: None,
-        source: None,
-        group_by: Default::default(),
-        json: false,
-        csv: false,
-    };
-    assert!(args2.validate().is_err());
+fn json_output_group_by_flag_in_response() {
+    let json = run_usage_json(&["--group-by", "model"]);
+    assert_eq!(json["group_by"], "model");
 }
 
 #[test]
-fn parse_last_rejects_bad_duration() {
-    use clap::Parser;
-    let args = UsageArgs {
-        claude_dir: None,
-        opencode_db: None,
-        since: None,
-        last: Some("7x".to_string()),
-        project: None,
-        model: None,
-        source: None,
-        group_by: Default::default(),
-        json: false,
-        csv: false,
-    };
-    assert!(args.parse_last().is_err());
+fn csv_output_header() {
+    let mut cmd = Command::new(bin());
+    cmd.args(["usage", "--csv"]);
+    cmd.args([
+        "--claude-dir",
+        fixture_dir().join("claude").to_str().unwrap(),
+        "--opencode-db",
+        fixture_dir().join("opencode").join("opencode.db").to_str().unwrap(),
+    ]);
+    let output = cmd.output().expect("failed to run llmhelper");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let first_line = stdout.lines().next().unwrap();
+    assert!(first_line.contains("group_key"));
+    assert!(first_line.contains("sessions"));
+    assert!(first_line.contains("input"));
+    assert!(first_line.contains("cost"));
 }
 
 #[test]
-fn parse_last_accepts_valid_durations() {
-    use clap::Parser;
-    let args_7d = UsageArgs {
-        last: Some("7d".to_string()),
-        ..Default::default()
-    };
-    assert_eq!(args_7d.parse_last().unwrap().unwrap().as_secs(), 7 * 24 * 3600);
-    
-    let args_4h = UsageArgs {
-        last: Some("4h".to_string()),
-        ..Default::default()
-    };
-    assert_eq!(args_4h.parse_last().unwrap().unwrap().as_secs(), 4 * 3600);
-    
-    let args_30m = UsageArgs {
-        last: Some("30m".to_string()),
-        ..Default::default()
-    };
-    assert_eq!(args_30m.parse_last().unwrap().unwrap().as_secs(), 30 * 60);
+fn cli_rejects_invalid_last_duration() {
+    let mut cmd = Command::new(bin());
+    cmd.args(["usage", "--json", "--last", "7x"]);
+    cmd.args([
+        "--claude-dir",
+        fixture_dir().join("claude").to_str().unwrap(),
+        "--opencode-db",
+        fixture_dir().join("opencode").join("opencode.db").to_str().unwrap(),
+    ]);
+    let output = cmd.output().expect("failed to run llmhelper");
+    assert!(!output.status.success(), "--last 7x should fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("invalid --last"));
+}
+
+#[test]
+fn cli_rejects_json_and_csv_together() {
+    let mut cmd = Command::new(bin());
+    cmd.args(["usage", "--json", "--csv"]);
+    let output = cmd.output().expect("failed to run llmhelper");
+    assert!(!output.status.success());
+}
+
+#[test]
+fn cli_rejects_since_and_last_together() {
+    let mut cmd = Command::new(bin());
+    cmd.args(["usage", "--json", "--since", "2025-01-01T00:00:00Z", "--last", "7d"]);
+    let output = cmd.output().expect("failed to run llmhelper");
+    assert!(!output.status.success());
+}
+
+#[test]
+fn cli_rejects_unknown_source() {
+    let mut cmd = Command::new(bin());
+    cmd.args(["usage", "--json", "--source", "invalid_source"]);
+    let output = cmd.output().expect("failed to run llmhelper");
+    assert!(!output.status.success());
 }

@@ -45,6 +45,22 @@ impl From<GroupByArg> for crate::domain::group::GroupBy {
     }
 }
 
+#[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
+pub enum SourceArg {
+    #[default]
+    Claude,
+    Opencode,
+}
+
+impl std::fmt::Display for SourceArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Claude => write!(f, "claude"),
+            Self::Opencode => write!(f, "opencode"),
+        }
+    }
+}
+
 #[derive(Parser, Debug, Clone, Default)]
 pub struct UsageArgs {
     /// Claude Code projects directory (defaults to ~/.claude/projects).
@@ -72,9 +88,9 @@ pub struct UsageArgs {
     #[arg(long = "model")]
     pub model: Option<String>,
 
-    /// Filter by source name: "claude" or "opencode".
+    /// Filter by source name.
     #[arg(long = "source")]
-    pub source: Option<String>,
+    pub source: Option<SourceArg>,
 
     /// Group output by this dimension: source, project, or model.
     #[arg(long = "group-by", default_value_t)]

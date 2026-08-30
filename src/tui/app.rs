@@ -19,7 +19,6 @@ use crate::source::SourceStatus;
 pub struct TuiState {
     pub app: App,
     pub table_state: TableState,
-    pub frame_count: u64,
 }
 
 impl TuiState {
@@ -27,7 +26,6 @@ impl TuiState {
         Self {
             app: App::default(),
             table_state: TableState::default(),
-            frame_count: 0,
         }
     }
 }
@@ -38,14 +36,11 @@ pub struct App {
     pub group_by: GroupBy,
     pub result: Option<AggregateResult>,
     pub source_statuses: Vec<SourceStatus>,
-    pub error: Option<String>,
-    pub refresh_requested: bool,
 }
 
 impl App {
     pub fn cycle_group(&mut self) {
         self.group_by = self.group_by.next();
-        self.refresh_requested = true;
     }
 }
 

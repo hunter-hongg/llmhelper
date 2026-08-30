@@ -134,7 +134,7 @@ mod tests {
             rec("a", "/p", "m", old),
             rec("a", "/p", "m", now),
         ];
-        let f = Filter { last: Some(Duration::from_secs(30 * 24 * 3600)), ..Default::default() }; // 30 days
+        let f = Filter { last: Some(Duration::from_secs(30 * 24 * 3600)), ..Default::default() };
         assert_eq!(f.apply(&r).len(), 1);
     }
 }
