@@ -192,36 +192,72 @@ fn json_output_serialization_matches_spec_schema() {
 fn cli_flag_validation_rejects_invalid_combos() {
     use clap::Parser;
     // --json and --csv together should be rejected
-    let result = std::panic::catch_unwind(|| {
-        let args = UsageArgs {
-            claude_dir: None,
-            opencode_db: None,
-            since: None,
-            last: Some("7d".to_string()),
-            project: None,
-            model: None,
-            source: None,
-            json: true,
-            csv: true,
-        };
-        args.validate().unwrap();
-    });
-    assert!(result.is_err() || true); // validation should fail
+    let args = UsageArgs {
+        claude_dir: None,
+        opencode_db: None,
+        since: None,
+        last: Some("7d".to_string()),
+        project: None,
+        model: None,
+        source: None,
+        group_by: Default::default(),
+        json: true,
+        csv: true,
+    };
+    assert!(args.validate().is_err());
 
     // --since and --last together
-    let result2 = std::panic::catch_unwind(|| {
-        let args = UsageArgs {
-            claude_dir: None,
-            opencode_db: None,
-            since: Some(chrono::Utc::now()),
-            last: Some("7d".to_string()),
-            project: None,
-            model: None,
-            source: None,
-            json: false,
-            csv: false,
-        };
-        args.validate().unwrap();
-    });
-    assert!(result2.is_err() || true);
+    let args2 = UsageArgs {
+        claude_dir: None,
+        opencode_db: None,
+        since: Some(chrono::Utc::now()),
+        last: Some("7d".to_string()),
+        project: None,
+        model: None,
+        source: None,
+        group_by: Default::default(),
+        json: false,
+        csv: false,
+    };
+    assert!(args2.validate().is_err());
+}
+
+#[test]
+fn parse_last_rejects_bad_duration() {
+    use clap::Parser;
+    let args = UsageArgs {
+        claude_dir: None,
+        opencode_db: None,
+        since: None,
+        last: Some("7x".to_string()),
+        project: None,
+        model: None,
+        source: None,
+        group_by: Default::default(),
+        json: false,
+        csv: false,
+    };
+    assert!(args.parse_last().is_err());
+}
+
+#[test]
+fn parse_last_accepts_valid_durations() {
+    use clap::Parser;
+    let args_7d = UsageArgs {
+        last: Some("7d".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(args_7d.parse_last().unwrap().unwrap().as_secs(), 7 * 24 * 3600);
+    
+    let args_4h = UsageArgs {
+        last: Some("4h".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(args_4h.parse_last().unwrap().unwrap().as_secs(), 4 * 3600);
+    
+    let args_30m = UsageArgs {
+        last: Some("30m".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(args_30m.parse_last().unwrap().unwrap().as_secs(), 30 * 60);
 }

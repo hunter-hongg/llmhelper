@@ -7,7 +7,6 @@ use ratatui::{
     Frame, Terminal,
 };
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -90,39 +89,6 @@ impl TerminalApp {
             terminal,
             state: TuiState::new(),
         })
-    }
-
-    pub fn run(&mut self) -> anyhow::Result<()> {
-        while self.state.app.running {
-            self.state.frame_count += 1;
-            self.terminal.draw(|frame| {
-                crate::tui::render::render(frame, &mut self.state);
-            })?;
-
-            if event::poll(std::time::Duration::from_millis(100))? {
-                if let Event::Key(KeyEvent { code, .. }) = event::read()? {
-                    match code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            self.state.app.running = false;
-                        }
-                        KeyCode::Tab => {
-                            self.state.app.cycle_group();
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            self.state.select_next();
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            self.state.select_previous();
-                        }
-                        KeyCode::Char('r') => {
-                            self.state.app.refresh_requested = true;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     pub fn exit(&mut self) -> anyhow::Result<()> {

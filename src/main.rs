@@ -1,14 +1,17 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
+use parking_lot::Mutex as ParkMutex;
+use tokio::runtime::Runtime;
 
 use llmhelper::aggregator::AggregateResult;
-use llmhelper::cli::{Cli, Command, UsageArgs};
+use llmhelper::cli::{Cli, Command, GroupByArg, UsageArgs};
 use llmhelper::config::Config;
 use llmhelper::domain::group::GroupBy;
 use llmhelper::filter::Filter;
 use llmhelper::output::{GroupRow, OutputRenderer};
-use llmhelper::source::{ClaudeSource, OpenCodeSource, Registry};
+use llmhelper::source::{ClaudeSource, OpenCodeSource, Registry, SourceStatus};
 use llmhelper::tui::TerminalApp;
 
 fn discover_sources(config: &Config) -> Registry {
@@ -40,7 +43,17 @@ fn discover_sources(config: &Config) -> Registry {
 fn build_filter(args: &UsageArgs) -> Filter {
     Filter {
         since: args.since,
-        last: args.parse_last(),
+        last: args.last.as_ref().and_then(|s| {
+            if s.ends_with('d') {
+                s[..s.len() - 1].parse::<u64>().ok().map(|n| std::time::Duration::from_secs(n * 24 * 3600))
+            } else if s.ends_with('h') {
+                s[..s.len() - 1].parse::<u64>().ok().map(|n| std::time::Duration::from_secs(n * 3600))
+            } else if s.ends_with('m') {
+                s[..s.len() - 1].parse::<u64>().ok().map(|n| std::time::Duration::from_secs(n * 60))
+            } else {
+                None
+            }
+        }),
         project: args.project.clone(),
         model: args.model.clone(),
         source: args.source.clone(),
@@ -63,10 +76,10 @@ fn reload(
 
 fn run_usage(args: UsageArgs) -> anyhow::Result<()> {
     args.validate()?;
+    let group_by: GroupBy = args.group_by.clone().into();
     let config = Config::load().merge(&args);
     let registry = discover_sources(&config);
     let filter = build_filter(&args);
-    let group_by = GroupBy::default();
 
     let (records, source_statuses) = registry.load_all();
     let agg = AggregateResult::from_records(&records, &filter, group_by.clone());
@@ -100,10 +113,47 @@ fn run_tui(
     filter: Filter,
     group_by: GroupBy,
 ) -> anyhow::Result<()> {
-    let mut tui = TerminalApp::new()?;
+    let rt = Runtime::new()?;
+    // Use parking_lot::Mutex for lock() -> guard directly (no Result)
+    let state = Arc::new(ParkMutex::new(None::<AggregateResult>));
+    let status_state = Arc::new(ParkMutex::new(None::<Vec<SourceStatus>>));
 
     // Initial load
-    reload(&registry, &filter, &group_by, &mut tui);
+    let (records, statuses) = registry.load_all();
+    let agg = AggregateResult::from_records(&records, &filter, group_by.clone());
+    *state.lock() = Some(agg);
+    *status_state.lock() = Some(statuses);
+
+    let mut tui = TerminalApp::new()?;
+    {
+        let locked = state.lock();
+        if let Some(s) = locked.as_ref() {
+            tui.state.app.result = Some(s.clone());
+        }
+        if let Some(st) = status_state.lock().as_ref() {
+            tui.state.app.source_statuses = st.clone();
+        }
+    }
+
+    // Background refresh loop
+    let reg_arc = Arc::new(registry);
+    let reg_for_task = reg_arc.clone();
+    let reg_for_main = reg_arc.clone();
+    let filter_clone = filter.clone();
+    let group_by_clone = group_by.clone();
+    let state_clone = state.clone();
+    let status_clone = status_state.clone();
+    rt.spawn(async move {
+        use tokio::time::{interval, Duration};
+        let mut tick = interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            let (records, statuses) = reg_for_task.load_all();
+            let agg = AggregateResult::from_records(&records, &filter_clone, group_by.clone());
+            *state_clone.lock() = Some(agg);
+            *status_clone.lock() = Some(statuses);
+        }
+    });
 
     // Main loop
     while tui.state.app.running {
@@ -118,10 +168,23 @@ fn run_tui(
                         break;
                     }
                     crossterm::event::KeyCode::Char('r') => {
-                        reload(&registry, &filter, &group_by, &mut tui);
+                        // Manual refresh: reload from registry
+                        let (records, statuses) = reg_for_main.load_all();
+                        let agg = AggregateResult::from_records(&records, &filter, group_by_clone.clone());
+                        *state.lock() = Some(agg);
+                        *status_state.lock() = Some(statuses);
+                        tui.state.app.result = state.lock().clone();
+                        tui.state.app.source_statuses = status_state.lock().clone().unwrap_or_default();
                     }
                     crossterm::event::KeyCode::Tab => {
                         tui.state.app.cycle_group();
+                        // Tab changes grouping — reload with new group
+                        let (records, statuses) = reg_for_main.load_all();
+                        let agg = AggregateResult::from_records(&records, &filter, tui.state.app.group_by.clone());
+                        *state.lock() = Some(agg);
+                        *status_state.lock() = Some(statuses);
+                        tui.state.app.result = state.lock().clone();
+                        tui.state.app.source_statuses = status_state.lock().clone().unwrap_or_default();
                     }
                     crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
                         tui.state.select_next();

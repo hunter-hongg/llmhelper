@@ -205,11 +205,8 @@ mod claude {
                             messages.push((ts, model.unwrap_or_default(), usage));
                         }
                     }
-                    if messages.is_empty() {
-                        continue;
-                    }
                     messages.sort_by_key(|(ts, _, _)| *ts);
-                    let started_at = messages.first().unwrap().0;
+                    let started_at = messages.first().map(|(ts, _, _)| *ts).unwrap_or_else(|| Utc::now());
                     let ended_at = messages.last().map(|(ts, _, _)| *ts);
                     let last_model = messages
                         .iter()
@@ -369,8 +366,10 @@ mod opencode {
                     if !seen.insert(id.clone()) {
                         continue;
                     }
-                    let started_at =
-                        Self::ms_to_datetime(time_created).unwrap_or_else(|| Utc::now());
+                    let started_at = match Self::ms_to_datetime(time_created) {
+                        Some(t) => t,
+                        None => continue, // skip rows with invalid timestamps
+                    };
                     let ended_at = Self::ms_to_datetime(time_updated);
                     records.push(Record {
                         session_id: id,
@@ -388,7 +387,7 @@ mod opencode {
                             cache_write: tokens_cache_write as u64,
                         },
                         message_count: 0,
-                        cost: if cost > 0.0 { Some(cost) } else { None },
+                        cost: Some(cost),
                     });
                 }
             }

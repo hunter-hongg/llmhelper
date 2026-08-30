@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use chrono::{DateTime, Utc};
 
 /// Main CLI entry point.
@@ -17,7 +17,35 @@ pub enum Command {
     Usage(UsageArgs),
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
+pub enum GroupByArg {
+    #[default]
+    Source,
+    Project,
+    Model,
+}
+
+impl std::fmt::Display for GroupByArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Source => write!(f, "source"),
+            Self::Project => write!(f, "project"),
+            Self::Model => write!(f, "model"),
+        }
+    }
+}
+
+impl From<GroupByArg> for crate::domain::group::GroupBy {
+    fn from(v: GroupByArg) -> Self {
+        match v {
+            GroupByArg::Source => Self::Source,
+            GroupByArg::Project => Self::Project,
+            GroupByArg::Model => Self::Model,
+        }
+    }
+}
+
+#[derive(Parser, Debug, Clone, Default)]
 pub struct UsageArgs {
     /// Claude Code projects directory (defaults to ~/.claude/projects).
     #[arg(long = "claude-dir")]
@@ -32,7 +60,7 @@ pub struct UsageArgs {
     pub since: Option<DateTime<Utc>>,
 
     /// Only include sessions from the last N days/hours (e.g. "7d", "4h").
-    /// Mutually exclusive with --since.
+    /// Mutually exclusive with --since. Errors on unparseable input.
     #[arg(long = "last")]
     pub last: Option<String>,
 
@@ -48,6 +76,10 @@ pub struct UsageArgs {
     #[arg(long = "source")]
     pub source: Option<String>,
 
+    /// Group output by this dimension: source, project, or model.
+    #[arg(long = "group-by", default_value_t)]
+    pub group_by: GroupByArg,
+
     /// Output as JSON instead of the interactive TUI.
     #[arg(long = "json")]
     pub json: bool,
@@ -58,21 +90,34 @@ pub struct UsageArgs {
 }
 
 impl UsageArgs {
-    /// Parse --last duration string into a Duration.
-    pub fn parse_last(&self) -> Option<Duration> {
-        let s = self.last.as_deref()?;
+    /// Parse --last duration string into a Duration. Errors on bad input.
+    pub fn parse_last(&self) -> anyhow::Result<Option<Duration>> {
+        let s = match &self.last {
+            Some(s) => s,
+            None => return Ok(None),
+        };
         if s.ends_with('d') {
-            let n: u64 = s[..s.len() - 1].parse().ok()?;
-            Some(Duration::from_secs(n * 24 * 3600))
-        } else if s.ends_with('h') {
-            let n: u64 = s[..s.len() - 1].parse().ok()?;
-            Some(Duration::from_secs(n * 3600))
-        } else if s.ends_with('m') {
-            let n: u64 = s[..s.len() - 1].parse().ok()?;
-            Some(Duration::from_secs(n * 60))
-        } else {
-            None
+            let n: u64 = s[..s.len() - 1]
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --last duration '{}': {}", s, e))?;
+            return Ok(Some(Duration::from_secs(n * 24 * 3600)));
         }
+        if s.ends_with('h') {
+            let n: u64 = s[..s.len() - 1]
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --last duration '{}': {}", s, e))?;
+            return Ok(Some(Duration::from_secs(n * 3600)));
+        }
+        if s.ends_with('m') {
+            let n: u64 = s[..s.len() - 1]
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --last duration '{}': {}", s, e))?;
+            return Ok(Some(Duration::from_secs(n * 60)));
+        }
+        Err(anyhow::anyhow!(
+            "invalid --last duration '{}': expected N d/h/m (e.g. 7d, 4h)",
+            s
+        ))
     }
 
     /// Validate mutually-exclusive flag combinations.
