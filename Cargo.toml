@@ -1,0 +1,23 @@
+[package]
+name = "llmhelper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+csv = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+dirs = "6"
+anyhow = "1"
+thiserror = "2"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
