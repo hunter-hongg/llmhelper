@@ -2,16 +2,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use llmhelper::aggregator::AggregateResult;
 
-use llmhelper::aggregator::{AggregateResult, Group};
-use llmhelper::cli::{Cli, Command, UsageArgs};
+use llmhelper::cli::{Cli, Command, UsageArgs, DiffArgs};
 use llmhelper::config::Config;
 use llmhelper::domain::group::GroupBy;
+use llmhelper::diff::compute_diff;
 use llmhelper::filter::Filter;
-use llmhelper::output::OutputRenderer;
-use llmhelper::source::{ClaudeSource, OpenCodeSource, Registry, SourceStatus};
+use llmhelper::output::{
+    OutputRenderer, render_diff_json, render_diff_csv, render_diff_table,
+};
+use llmhelper::source::{ClaudeSource, OpenCodeSource, OmpSource, Registry, SourceStatus};
 use llmhelper::tui::TerminalApp;
 
 /// Shared state between background refresh task and TUI main loop.
@@ -43,6 +47,15 @@ fn discover_sources(config: &Config) -> Registry {
             .collect()
     };
     reg.register(Box::new(OpenCodeSource::new(opencode_dbs)));
+    let omp_dir = config
+        .omp_dir
+        .clone()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|h| h.join(".omp").join("agent").join("sessions"))
+                .unwrap_or_default()
+        });
+    reg.register(Box::new(OmpSource::new(omp_dir)));
     reg
 }
 
@@ -51,10 +64,118 @@ fn build_filter(args: &UsageArgs) -> anyhow::Result<Filter> {
     Ok(Filter {
         since: args.since,
         last,
+        until: None,
         project: args.project.clone(),
         model: args.model.clone(),
         source: args.source.as_ref().map(|s| s.to_string()),
     })
+}
+
+fn run_tui(
+    registry: Registry,
+    filter: Filter,
+    group_by: GroupBy,
+    refresh_secs: u64,
+) -> anyhow::Result<()> {
+    let rt = Runtime::new()?;
+
+    // Shared grouping dimension. The TUI loop mutates it on Tab; the background
+    // refresh task reads it through the same handle so re-aggregation always
+    // uses the current dimension. Without sharing, Tab changed only the local
+    // `app.group_by` while the task kept using its captured initial value.
+    let group_by = Arc::new(Mutex::new(group_by));
+    let group_by_clone = group_by.clone();
+
+    // Bounded mpsc channel(1) — only latest update is kept, stale ones dropped.
+    let (tx, mut rx) = mpsc::channel::<TuiData>(1);
+
+    // Background refresh task
+    let reg_arc = Arc::new(registry);
+    let reg_for_task = reg_arc.clone();
+    let filter_clone = filter.clone();
+    rt.spawn(async move {
+        use tokio::time::{interval, Duration};
+        let mut tick = interval(Duration::from_secs(refresh_secs));
+        loop {
+            tick.tick().await;
+            let (records, statuses) = reg_for_task.load_all();
+            let agg = AggregateResult::from_records(
+                &records,
+                &filter_clone,
+                group_by_clone.lock().clone(),
+            );
+            let data = TuiData {
+                result: Some(agg),
+                source_statuses: statuses,
+            };
+            // Bounded channel(1): drop stale data if TUI is busy
+            let _ = tx.send(data).await;
+        }
+    });
+
+    let mut tui = TerminalApp::new()?;
+    tui.state.app.running = true;
+    tui.state.app.group_by = group_by.lock().clone();
+
+    // Initial load
+    let (records, statuses) = reg_arc.load_all();
+    let agg = AggregateResult::from_records(&records, &filter, tui.state.app.group_by.clone());
+    tui.state.app.result = Some(agg);
+    tui.state.app.source_statuses = statuses;
+
+    // Main loop: poll channel each frame for background updates
+    while tui.state.app.running {
+        // Check for background refresh data
+        if let Ok(data) = rx.try_recv() {
+            tui.state.app.result = data.result;
+            tui.state.app.source_statuses = data.source_statuses;
+        }
+
+        tui.terminal.draw(|frame| {
+            llmhelper::tui::render::render(frame, &mut tui.state);
+        })?;
+
+        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                match key.code {
+                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
+                        tui.state.app.running = false;
+                    }
+                    crossterm::event::KeyCode::Char('r') => {
+                        let (records, statuses) = reg_arc.load_all();
+                        let agg = AggregateResult::from_records(
+                            &records,
+                            &filter,
+                            group_by.lock().clone(),
+                        );
+                        tui.state.app.result = Some(agg);
+                        tui.state.app.source_statuses = statuses;
+                    }
+                    crossterm::event::KeyCode::Tab => {
+                        tui.state.app.cycle_group();
+                        *group_by.lock() = tui.state.app.group_by.clone();
+                        let (records, statuses) = reg_arc.load_all();
+                        let agg = AggregateResult::from_records(
+                            &records,
+                            &filter,
+                            tui.state.app.group_by.clone(),
+                        );
+                        tui.state.app.result = Some(agg);
+                        tui.state.app.source_statuses = statuses;
+                    }
+                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                        tui.state.select_next();
+                    }
+                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                        tui.state.select_previous();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    tui.exit()?;
+    Ok(())
 }
 
 fn run_usage(args: UsageArgs) -> anyhow::Result<()> {
@@ -82,101 +203,78 @@ fn run_usage(args: UsageArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_tui(
-    registry: Registry,
-    filter: Filter,
-    group_by: GroupBy,
-    refresh_secs: u64,
-) -> anyhow::Result<()> {
-    let rt = Runtime::new()?;
+fn run_diff(args: DiffArgs) -> anyhow::Result<()> {
+    args.validate()?;
+    let (last_duration, prev_duration) = args.parse_windows()?;
 
-    // Bounded mpsc channel(1) — only latest update is kept, stale ones dropped.
-    let (tx, mut rx) = mpsc::channel::<TuiData>(1);
+    let now = chrono::Utc::now();
+    let prev_until = now - last_duration;
+    let curr_since = prev_until - chrono::Duration::seconds(prev_duration.as_secs() as i64);
 
-    // Background refresh task
-    let reg_arc = Arc::new(registry);
-    let reg_for_task = reg_arc.clone();
-    let filter_clone = filter.clone();
-    let group_by_clone = group_by.clone();
-    rt.spawn(async move {
-        use tokio::time::{interval, Duration};
-        let mut tick = interval(Duration::from_secs(refresh_secs));
-        loop {
-            tick.tick().await;
-            let (records, statuses) = reg_for_task.load_all();
-            let agg = AggregateResult::from_records(&records, &filter_clone, group_by_clone.clone());
-            let data = TuiData {
-                result: Some(agg),
-                source_statuses: statuses,
-            };
-            // Bounded channel(1): drop stale data if TUI is busy
-            let _ = tx.send(data).await;
-        }
-    });
+    // Build filters for both windows
+    let prev_filter = Filter {
+        since: Some(curr_since),
+        until: Some(prev_until),
+        project: args.project.clone(),
+        model: args.model.clone(),
+        source: args.source.as_ref().map(|s| s.to_string()),
+        ..Default::default()
+    };
+    let curr_filter = Filter {
+        since: Some(prev_until),
+        until: Some(now),
+        project: args.project.clone(),
+        model: args.model.clone(),
+        source: args.source.as_ref().map(|s| s.to_string()),
+        ..Default::default()
+    };
 
-    let mut tui = TerminalApp::new()?;
-    tui.state.app.running = true;
-    tui.state.app.group_by = group_by.clone();
+    let group_by: GroupBy = args.group_by.clone().into();
 
-    // Initial load
-    let (records, statuses) = reg_arc.load_all();
-    let agg = AggregateResult::from_records(&records, &filter, group_by.clone());
-    tui.state.app.result = Some(agg);
-    tui.state.app.source_statuses = statuses;
+    // Load sources once (they don't change between windows)
+    let config = Config::load().merge(&diff_args_to_usage_args(&args));
+    let registry = discover_sources(&config);
 
-    // Main loop: poll channel each frame for background updates
-    while tui.state.app.running {
-        // Check for background refresh data
-        if let Ok(data) = rx.try_recv() {
-            tui.state.app.result = data.result;
-            tui.state.app.source_statuses = data.source_statuses;
-        }
+    let (records, source_statuses) = registry.load_all();
 
-        tui.terminal.draw(|frame| {
-            llmhelper::tui::render::render(frame, &mut tui.state);
-        })?;
+    let prev_agg = AggregateResult::from_records(&records, &prev_filter, group_by.clone());
+    let curr_agg = AggregateResult::from_records(&records, &curr_filter, group_by.clone());
 
-        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                match key.code {
-                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
-                        tui.state.app.running = false;
-                    }
-                    crossterm::event::KeyCode::Char('r') => {
-                        let (records, statuses) = reg_arc.load_all();
-                        let agg = AggregateResult::from_records(&records, &filter, group_by.clone());
-                        tui.state.app.result = Some(agg);
-                        tui.state.app.source_statuses = statuses;
-                    }
-                    crossterm::event::KeyCode::Tab => {
-                        tui.state.app.cycle_group();
-                        let (records, statuses) = reg_arc.load_all();
-                        let agg = AggregateResult::from_records(
-                            &records,
-                            &filter,
-                            tui.state.app.group_by.clone(),
-                        );
-                        tui.state.app.result = Some(agg);
-                        tui.state.app.source_statuses = statuses;
-                    }
-                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                        tui.state.select_next();
-                    }
-                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                        tui.state.select_previous();
-                    }
-                    _ => {}
-                }
-            }
-        }
+    let rows = compute_diff(&prev_agg, &curr_agg);
+
+    // Render output
+    if args.json {
+        render_diff_json(&rows, &source_statuses, group_by.label(), curr_since, prev_until, prev_until, now)?;
+    } else if args.csv {
+        render_diff_csv(&rows, &source_statuses, &prev_agg, &curr_agg)?;
+    } else {
+        render_diff_table(&rows, prev_agg.grand_sessions, curr_agg.grand_sessions, &source_statuses)?;
     }
-    tui.exit()?;
+
     Ok(())
+}
+
+/// Clone config overrides from diff args into a UsageArgs for config merging.
+fn diff_args_to_usage_args(args: &DiffArgs) -> UsageArgs {
+    UsageArgs {
+        claude_dir: args.claude_dir.clone(),
+        opencode_db: args.opencode_db.clone(),
+        omp_dir: args.omp_dir.clone(),
+        since: None,
+        last: None,
+        project: args.project.clone(),
+        model: args.model.clone(),
+        source: args.source.clone(),
+        group_by: args.group_by.clone(),
+        json: false,
+        csv: false,
+    }
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Usage(args) => run_usage(args),
+        Command::Diff(args) => run_diff(args),
     }
 }

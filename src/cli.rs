@@ -15,6 +15,8 @@ pub struct Cli {
 pub enum Command {
     /// Show token usage and activity across Agent/LLM sources.
     Usage(UsageArgs),
+    /// Compare token usage between two time windows.
+    Diff(DiffArgs),
 }
 
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
@@ -50,6 +52,7 @@ pub enum SourceArg {
     #[default]
     Claude,
     Opencode,
+    Omp,
 }
 
 impl std::fmt::Display for SourceArg {
@@ -57,6 +60,7 @@ impl std::fmt::Display for SourceArg {
         match self {
             Self::Claude => write!(f, "claude"),
             Self::Opencode => write!(f, "opencode"),
+            Self::Omp => write!(f, "omp"),
         }
     }
 }
@@ -70,6 +74,10 @@ pub struct UsageArgs {
     /// OpenCode database path(s). Can be specified multiple times.
     #[arg(long = "opencode-db")]
     pub opencode_db: Option<Vec<std::path::PathBuf>>,
+
+    /// OMP sessions directory (defaults to ~/.omp/agent/sessions).
+    #[arg(long = "omp-dir")]
+    pub omp_dir: Option<std::path::PathBuf>,
 
     /// Only include sessions started at or after this RFC 3339 timestamp.
     #[arg(long = "since")]
@@ -112,28 +120,7 @@ impl UsageArgs {
             Some(s) => s,
             None => return Ok(None),
         };
-        if s.ends_with('d') {
-            let n: u64 = s[..s.len() - 1]
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid --last duration '{}': {}", s, e))?;
-            return Ok(Some(Duration::from_secs(n * 24 * 3600)));
-        }
-        if s.ends_with('h') {
-            let n: u64 = s[..s.len() - 1]
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid --last duration '{}': {}", s, e))?;
-            return Ok(Some(Duration::from_secs(n * 3600)));
-        }
-        if s.ends_with('m') {
-            let n: u64 = s[..s.len() - 1]
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid --last duration '{}': {}", s, e))?;
-            return Ok(Some(Duration::from_secs(n * 60)));
-        }
-        Err(anyhow::anyhow!(
-            "invalid --last duration '{}': expected N d/h/m (e.g. 7d, 4h)",
-            s
-        ))
+        parse_duration(s).map_err(|e| anyhow::anyhow!("invalid --last {}", e)).map(Some)
     }
 
     /// Validate mutually-exclusive flag combinations.
@@ -145,5 +132,107 @@ impl UsageArgs {
             anyhow::bail!("--since and --last are mutually exclusive");
         }
         Ok(())
+    }
+}
+
+/// Parse a duration string in `Nd`, `Nh`, `Nm`, or `Ns` form (e.g. `7d`, `24h`, `30m`, `86400s`).
+pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
+    if s.ends_with('d') {
+        let n: u64 = s[..s.len() - 1]
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid duration '{}': {}", s, e))?;
+        return Ok(Duration::from_secs(n * 24 * 3600));
+    }
+    if s.ends_with('h') {
+        let n: u64 = s[..s.len() - 1]
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid duration '{}': {}", s, e))?;
+        return Ok(Duration::from_secs(n * 3600));
+    }
+    if s.ends_with('m') {
+        let n: u64 = s[..s.len() - 1]
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid duration '{}': {}", s, e))?;
+        return Ok(Duration::from_secs(n * 60));
+    }
+    if s.ends_with('s') {
+        let n: u64 = s[..s.len() - 1]
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid duration '{}': {}", s, e))?;
+        return Ok(Duration::from_secs(n));
+    }
+    Err(anyhow::anyhow!(
+        "invalid duration '{}': expected N d/h/m/s (e.g. 7d, 4h, 30m, 86400s)",
+        s
+    ))
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct DiffArgs {
+    /// Current window length, e.g. "7d" or "4h". Required.
+    #[arg(long = "last")]
+    pub last: Option<String>,
+
+    /// Previous window length, e.g. "7d" or "4h". Required.
+    #[arg(long = "prev")]
+    pub prev: Option<String>,
+
+    /// Claude Code projects directory (defaults to ~/.claude/projects).
+    #[arg(long = "claude-dir")]
+    pub claude_dir: Option<std::path::PathBuf>,
+
+    /// OpenCode database path(s). Can be specified multiple times.
+    #[arg(long = "opencode-db")]
+    pub opencode_db: Option<Vec<std::path::PathBuf>>,
+
+    /// OMP sessions directory (defaults to ~/.omp/agent/sessions).
+    #[arg(long = "omp-dir")]
+    pub omp_dir: Option<std::path::PathBuf>,
+
+    /// Filter by project path substring.
+    #[arg(long = "project")]
+    pub project: Option<String>,
+
+    /// Filter by model substring (case-insensitive).
+    #[arg(long = "model")]
+    pub model: Option<String>,
+
+    /// Filter by source name.
+    #[arg(long = "source")]
+    pub source: Option<SourceArg>,
+
+    /// Group output by this dimension: source, project, or model.
+    #[arg(long = "group-by", default_value_t)]
+    pub group_by: GroupByArg,
+
+    /// Output as JSON instead of the terminal table.
+    #[arg(long = "json")]
+    pub json: bool,
+
+    /// Output as CSV instead of the terminal table.
+    #[arg(long = "csv")]
+    pub csv: bool,
+}
+
+impl DiffArgs {
+    /// Validate that --last and --prev are present and --json/--csv are mutually exclusive.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.json && self.csv {
+            anyhow::bail!("--json and --csv are mutually exclusive");
+        }
+        Ok(())
+    }
+
+    /// Parse both --last and --prev into Durations. Errors on missing or malformed input.
+    pub fn parse_windows(&self) -> anyhow::Result<(Duration, Duration)> {
+        let last = match &self.last {
+            Some(s) => parse_duration(s).map_err(|e| anyhow::anyhow!("invalid --last {}", e))?,
+            None => anyhow::bail!("--last is required"),
+        };
+        let prev = match &self.prev {
+            Some(s) => parse_duration(s).map_err(|e| anyhow::anyhow!("invalid --prev {}", e))?,
+            None => anyhow::bail!("--prev is required"),
+        };
+        Ok((last, prev))
     }
 }

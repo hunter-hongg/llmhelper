@@ -6,7 +6,6 @@ use chrono::{DateTime, Utc};
 pub struct TokenBreakdown {
     pub input: u64,
     pub output: u64,
-    pub reasoning: u64,
     pub cache_read: u64,
     pub cache_write: u64,
 }
@@ -16,7 +15,6 @@ impl TokenBreakdown {
     pub fn add(&mut self, other: &TokenBreakdown) {
         self.input += other.input;
         self.output += other.output;
-        self.reasoning += other.reasoning;
         self.cache_read += other.cache_read;
         self.cache_write += other.cache_write;
     }
@@ -55,18 +53,17 @@ mod tests {
     #[test]
     fn token_breakdown_adds_correctly() {
         let a = TokenBreakdown {
-            input: 100, output: 50, reasoning: 10,
+            input: 100, output: 50,
             cache_read: 20, cache_write: 5,
         };
         let b = TokenBreakdown {
-            input: 200, output: 100, reasoning: 0,
+            input: 200, output: 100,
             cache_read: 10, cache_write: 3,
         };
         let mut result = a.clone();
         result.add(&b);
         assert_eq!(result.input, 300);
         assert_eq!(result.output, 150);
-        assert_eq!(result.reasoning, 10);
         assert_eq!(result.cache_read, 30);
         assert_eq!(result.cache_write, 8);
     }
@@ -79,7 +76,7 @@ mod tests {
     #[test]
     fn token_breakdown_serialize_roundtrip() {
         let t = TokenBreakdown {
-            input: 1, output: 2, reasoning: 3,
+            input: 1, output: 2,
             cache_read: 4, cache_write: 5,
         };
         let s = serde_json::to_string(&t).unwrap();

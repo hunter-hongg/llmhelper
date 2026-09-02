@@ -2,6 +2,7 @@ pub mod domain;
 pub mod source;
 pub mod filter;
 pub mod aggregator;
+pub mod diff;
 pub mod output;
 pub mod config;
 pub mod cli;

@@ -602,6 +602,7 @@ dependencies = [
  "crossterm",
  "csv",
  "dirs",
+ "parking_lot",
  "ratatui",
  "rusqlite",
  "serde",

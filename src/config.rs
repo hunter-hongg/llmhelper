@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub claude_dir: Option<PathBuf>,
     pub opencode_dbs: Option<Vec<PathBuf>>,
+    pub omp_dir: Option<PathBuf>,
     pub refresh_interval_seconds: u64,
 }
 
@@ -12,6 +13,7 @@ impl Default for Config {
         Self {
             claude_dir: None,
             opencode_dbs: None,
+            omp_dir: None,
             refresh_interval_seconds: 5,
         }
     }
@@ -43,6 +45,7 @@ impl Config {
         Self {
             claude_dir: parsed.source.as_ref().and_then(|s| s.claude.as_ref().and_then(|c| c.dir.clone())),
             opencode_dbs: parsed.source.as_ref().and_then(|s| s.opencode.as_ref().and_then(|o| o.db.clone())),
+            omp_dir: parsed.source.as_ref().and_then(|s| s.omp.as_ref().and_then(|o| o.dir.clone())),
             refresh_interval_seconds: parsed
                 .ui
                 .and_then(|u| u.refresh_interval_seconds)
@@ -55,6 +58,7 @@ impl Config {
         Self {
             claude_dir: cli.claude_dir.clone().or(self.claude_dir),
             opencode_dbs: cli.opencode_db.clone().or(self.opencode_dbs),
+            omp_dir: cli.omp_dir.clone().or(self.omp_dir),
             refresh_interval_seconds: self.refresh_interval_seconds,
         }
     }
@@ -70,6 +74,7 @@ struct ConfigTable {
 struct SourceConfig {
     claude: Option<ClaudeSourceConfig>,
     opencode: Option<OpenCodeSourceConfig>,
+    omp: Option<OmpSourceConfig>,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -80,6 +85,11 @@ struct ClaudeSourceConfig {
 #[derive(serde::Deserialize, Debug, Default)]
 struct OpenCodeSourceConfig {
     db: Option<Vec<PathBuf>>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct OmpSourceConfig {
+    dir: Option<PathBuf>,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -103,6 +113,9 @@ dir = "/custom/claude"
 [source.opencode]
 db = ["/custom/opencode.db"]
 
+[source.omp]
+dir = "/custom/omp/sessions"
+
 [ui]
 refresh_interval_seconds = 10
 "#).unwrap();
@@ -116,6 +129,10 @@ refresh_interval_seconds = 10
         assert_eq!(
             parsed.source.as_ref().and_then(|s| s.opencode.as_ref().and_then(|o| o.db.clone())).unwrap().len(),
             1
+        );
+        assert_eq!(
+            parsed.source.as_ref().and_then(|s| s.omp.as_ref().and_then(|o| o.dir.clone())).as_deref(),
+            Some(Path::new("/custom/omp/sessions"))
         );
         assert_eq!(
             parsed.ui.as_ref().and_then(|u| u.refresh_interval_seconds).unwrap(),

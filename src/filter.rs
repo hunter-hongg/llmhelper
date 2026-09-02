@@ -9,9 +9,24 @@ use crate::domain::record::Record;
 pub struct Filter {
     pub since: Option<DateTime<Utc>>,
     pub last: Option<Duration>,
+    /// Upper bound for the time window (inclusive). Only used by `diff` to
+    /// express the previous window's end.
+    pub until: Option<DateTime<Utc>>,
     pub project: Option<String>,
     pub model: Option<String>,
     pub source: Option<String>,
+}
+
+impl Filter {
+    /// Build a filter constrained to a half-open interval `[since, until]`.
+    /// Used by `diff` to slice two distinct time windows.
+    pub fn within(since: DateTime<Utc>, until: DateTime<Utc>) -> Self {
+        Self {
+            since: Some(since),
+            until: Some(until),
+            ..Self::default()
+        }
+    }
 }
 
 impl Filter {
@@ -29,6 +44,11 @@ impl Filter {
         if let Some(window) = self.last {
             let cutoff = Utc::now() - window;
             if r.started_at < cutoff {
+                return false;
+            }
+        }
+        if let Some(until) = self.until {
+            if r.started_at > until {
                 return false;
             }
         }
