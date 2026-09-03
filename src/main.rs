@@ -13,10 +13,10 @@ use llmhelper::domain::group::GroupBy;
 use llmhelper::diff::compute_diff;
 use llmhelper::filter::Filter;
 use llmhelper::output::{
-    OutputRenderer, render_diff_json, render_diff_csv, render_diff_table,
+    OutputRenderer, render_diff_json, render_diff_csv,
 };
 use llmhelper::source::{ClaudeSource, OpenCodeSource, OmpSource, Registry, SourceStatus};
-use llmhelper::tui::TerminalApp;
+use llmhelper::tui::{TerminalApp, DiffTuiApp};
 
 /// Shared state between background refresh task and TUI main loop.
 struct TuiData {
@@ -178,6 +178,131 @@ fn run_tui(
     Ok(())
 }
 
+struct DiffTuiData {
+    prev_agg: Option<AggregateResult>,
+    curr_agg: Option<AggregateResult>,
+    rows: Vec<llmhelper::diff::DiffRow>,
+    source_statuses: Vec<SourceStatus>,
+}
+
+fn run_diff_tui(
+    registry: Registry,
+    prev_filter: Filter,
+    curr_filter: Filter,
+    group_by: GroupBy,
+    window_prev_start: chrono::DateTime<chrono::Utc>,
+    window_prev_end: chrono::DateTime<chrono::Utc>,
+    window_curr_end: chrono::DateTime<chrono::Utc>,
+    refresh_secs: u64,
+) -> anyhow::Result<()> {
+    let rt = Runtime::new()?;
+
+    let group_by = Arc::new(Mutex::new(group_by));
+    let group_by_clone = group_by.clone();
+
+    let (tx, mut rx) = mpsc::channel::<DiffTuiData>(1);
+
+    let reg_arc = Arc::new(registry);
+    let reg_for_task = reg_arc.clone();
+    let prev_filter_clone = prev_filter.clone();
+    let curr_filter_clone = curr_filter.clone();
+    rt.spawn(async move {
+        use tokio::time::{interval, Duration};
+        let mut tick = interval(Duration::from_secs(refresh_secs));
+        loop {
+            tick.tick().await;
+            let (records, statuses) = reg_for_task.load_all();
+            let gb = group_by_clone.lock().clone();
+            let prev_agg = AggregateResult::from_records(&records, &prev_filter_clone, gb.clone());
+            let curr_agg = AggregateResult::from_records(&records, &curr_filter_clone, gb);
+            let rows = compute_diff(&prev_agg, &curr_agg);
+            let data = DiffTuiData {
+                prev_agg: Some(prev_agg),
+                curr_agg: Some(curr_agg),
+                rows,
+                source_statuses: statuses,
+            };
+            let _ = tx.send(data).await;
+        }
+    });
+
+    let mut tui = DiffTuiApp::new()?;
+    tui.state.app.running = true;
+    tui.state.app.group_by = group_by.lock().clone();
+    tui.state.app.window_prev_start = Some(window_prev_start);
+    tui.state.app.window_prev_end = Some(window_prev_end);
+    tui.state.app.window_curr_start = Some(window_prev_end);
+    tui.state.app.window_curr_end = Some(window_curr_end);
+
+    let (records, statuses) = reg_arc.load_all();
+    let gb = group_by.lock().clone();
+    let prev_agg = AggregateResult::from_records(&records, &prev_filter, gb.clone());
+    let curr_agg = AggregateResult::from_records(&records, &curr_filter, gb);
+    let rows = compute_diff(&prev_agg, &curr_agg);
+    tui.state.app.prev_agg = Some(prev_agg);
+    tui.state.app.curr_agg = Some(curr_agg);
+    tui.state.app.rows = rows;
+    tui.state.app.source_statuses = statuses;
+
+    let reg_arc_read = reg_arc;
+
+    while tui.state.app.running {
+        if let Ok(data) = rx.try_recv() {
+            tui.state.app.prev_agg = data.prev_agg;
+            tui.state.app.curr_agg = data.curr_agg;
+            tui.state.app.rows = data.rows;
+            tui.state.app.source_statuses = data.source_statuses;
+        }
+
+        tui.terminal.draw(|frame| {
+            llmhelper::tui::diff_render::render(frame, &mut tui.state);
+        })?;
+
+        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                match key.code {
+                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
+                        tui.state.app.running = false;
+                    }
+                    crossterm::event::KeyCode::Char('r') => {
+                        let gb = group_by.lock().clone();
+                        let (records, statuses) = reg_arc_read.load_all();
+                        let prev_agg = AggregateResult::from_records(&records, &prev_filter, gb.clone());
+                        let curr_agg = AggregateResult::from_records(&records, &curr_filter, gb);
+                        let rows = compute_diff(&prev_agg, &curr_agg);
+                        tui.state.app.prev_agg = Some(prev_agg);
+                        tui.state.app.curr_agg = Some(curr_agg);
+                        tui.state.app.rows = rows;
+                        tui.state.app.source_statuses = statuses;
+                    }
+                    crossterm::event::KeyCode::Tab => {
+                        tui.state.app.cycle_group();
+                        *group_by.lock() = tui.state.app.group_by.clone();
+                        let gb = tui.state.app.group_by.clone();
+                        let (records, statuses) = reg_arc_read.load_all();
+                        let prev_agg = AggregateResult::from_records(&records, &prev_filter, gb.clone());
+                        let curr_agg = AggregateResult::from_records(&records, &curr_filter, gb);
+                        let rows = compute_diff(&prev_agg, &curr_agg);
+                        tui.state.app.prev_agg = Some(prev_agg);
+                        tui.state.app.curr_agg = Some(curr_agg);
+                        tui.state.app.rows = rows;
+                        tui.state.app.source_statuses = statuses;
+                    }
+                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                        tui.state.select_next();
+                    }
+                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                        tui.state.select_previous();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    tui.exit()?;
+    Ok(())
+}
+
 fn run_usage(args: UsageArgs) -> anyhow::Result<()> {
     args.validate()?;
     let group_by: GroupBy = args.group_by.clone().into();
@@ -248,7 +373,7 @@ fn run_diff(args: DiffArgs) -> anyhow::Result<()> {
     } else if args.csv {
         render_diff_csv(&rows, &source_statuses, &prev_agg, &curr_agg)?;
     } else {
-        render_diff_table(&rows, prev_agg.grand_sessions, curr_agg.grand_sessions, &source_statuses)?;
+        run_diff_tui(registry, prev_filter, curr_filter, group_by, curr_since, prev_until, now, config.refresh_interval_seconds)?;
     }
 
     Ok(())
