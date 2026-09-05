@@ -1,9 +1,9 @@
-pub mod domain;
-pub mod source;
-pub mod filter;
 pub mod aggregator;
-pub mod diff;
-pub mod output;
-pub mod config;
 pub mod cli;
+pub mod config;
+pub mod diff;
+pub mod domain;
+pub mod filter;
+pub mod output;
+pub mod source;
 pub mod tui;

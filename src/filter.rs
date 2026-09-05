@@ -1,5 +1,5 @@
-use std::time::Duration;
 use chrono::{DateTime, Utc};
+use std::time::Duration;
 
 use crate::domain::record::Record;
 
@@ -98,7 +98,10 @@ mod tests {
 
     #[test]
     fn empty_filter_retains_all() {
-        let r = vec![rec("a", "/p", "m", Utc::now()), rec("b", "/q", "n", Utc::now())];
+        let r = vec![
+            rec("a", "/p", "m", Utc::now()),
+            rec("b", "/q", "n", Utc::now()),
+        ];
         assert_eq!(Filter::none().apply(&r).len(), 2);
     }
 
@@ -108,7 +111,10 @@ mod tests {
             rec("claude", "/p", "m", Utc::now()),
             rec("opencode", "/p", "m", Utc::now()),
         ];
-        let f = Filter { source: Some("claude".to_string()), ..Default::default() };
+        let f = Filter {
+            source: Some("claude".to_string()),
+            ..Default::default()
+        };
         assert_eq!(f.apply(&r).len(), 1);
         assert_eq!(f.apply(&r)[0].source, "claude");
     }
@@ -119,7 +125,10 @@ mod tests {
             rec("a", "/home/user/proj-x", "m", Utc::now()),
             rec("a", "/other/y", "m", Utc::now()),
         ];
-        let f = Filter { project: Some("proj".to_string()), ..Default::default() };
+        let f = Filter {
+            project: Some("proj".to_string()),
+            ..Default::default()
+        };
         assert_eq!(f.apply(&r).len(), 1);
     }
 
@@ -129,7 +138,10 @@ mod tests {
             rec("a", "/p", "Big-Pickle", Utc::now()),
             rec("a", "/p", "Auto", Utc::now()),
         ];
-        let f = Filter { model: Some("big".to_string()), ..Default::default() };
+        let f = Filter {
+            model: Some("big".to_string()),
+            ..Default::default()
+        };
         assert_eq!(f.apply(&r).len(), 1);
         assert_eq!(f.apply(&r)[0].model, "Big-Pickle");
     }
@@ -138,11 +150,11 @@ mod tests {
     fn filter_since() {
         let now = Utc::now();
         let old = now - chrono::Duration::days(30);
-        let r = vec![
-            rec("a", "/p", "m", old),
-            rec("a", "/p", "m", now),
-        ];
-        let f = Filter { since: Some(now - chrono::Duration::days(7)), ..Default::default() };
+        let r = vec![rec("a", "/p", "m", old), rec("a", "/p", "m", now)];
+        let f = Filter {
+            since: Some(now - chrono::Duration::days(7)),
+            ..Default::default()
+        };
         assert_eq!(f.apply(&r).len(), 1);
     }
 
@@ -150,11 +162,11 @@ mod tests {
     fn filter_last() {
         let now = Utc::now();
         let old = now - chrono::Duration::days(60);
-        let r = vec![
-            rec("a", "/p", "m", old),
-            rec("a", "/p", "m", now),
-        ];
-        let f = Filter { last: Some(Duration::from_secs(30 * 24 * 3600)), ..Default::default() };
+        let r = vec![rec("a", "/p", "m", old), rec("a", "/p", "m", now)];
+        let f = Filter {
+            last: Some(Duration::from_secs(30 * 24 * 3600)),
+            ..Default::default()
+        };
         assert_eq!(f.apply(&r).len(), 1);
     }
 }

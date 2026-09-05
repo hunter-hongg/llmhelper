@@ -1,89 +1,153 @@
 ---
 id: 0003
-title: "sessions — drill down into individual Agent Sessions"
+title: "sessions — TUI Session inventory with Enter detail"
 status: ready-for-agent
 created: 2026-09-05
+updated: 2026-09-05
 triage: ready-for-agent
 ---
 
 ## Problem Statement
 
-`usage` provides aggregated token consumption grouped by Source / Project / Model, and `diff` compares two sliding windows. Neither command allows an agent user to locate, inspect, or filter a single Session record. The user cannot answer "which session id produced this spike?" or "show me all sessions for project X in the last 3 days" without exporting JSON and processing it externally. There is no native drill-down seam in the CLI.
+`sessions` is the flat Session inventory for this CLI: it lists normalized Session records across all configured Sources. `usage` answers aggregate questions, and its group-to-Session drill-down is intentionally contextual: it answers "which Sessions make up this selected group?" It does not answer "show me every Session matching these filters, newest first, across all groups."
+
+The current `sessions` implementation already defaults to a TUI and already advertises `Enter` in the footer, but pressing `Enter` does nothing. This leaves the command in an inconsistent state: the user is told a Session detail interaction exists, but the UI does not provide one. At the same time, the command-level responsibilities remain clear: `usage` owns Usage aggregation, `diff` owns window comparison, and `sessions` owns flat Session listing, lookup, and export.
+
+This spec updates the `sessions` contract so the TUI is explicitly part of the default command experience and so `Enter` actually opens a detail view for the selected Session.
 
 ## Solution
 
-A new subcommand `sessions` that lists normalized Session records from all configured Sources, applies the same filter set as `usage`, and renders a tabular list plus optional detail view. The command reuses the existing Source registry, Record normalization, and Filter pipeline, and renders via terminal table, `--json`, and `--csv`. It is a read-only, one-shot listing operation with no live refresh.
+Make `sessions` a TUI-first Session inventory command with an interactive detail view.
+
+In the default TUI, Sessions are listed as a flat table sorted by `started_at` descending. Selecting a Session and pressing `Enter` replaces the list with a detail view for that one Session. The detail view shows the Session's source-native id, Source, Project, raw Model, optional agent, start/end times, message count, canonical Token Breakdown, and source-scoped Cost where available. Pressing `Esc` returns to the list while preserving the previous list selection. `q` quits from either view. `r` refreshes data, and background refresh keeps both the list and any open detail view synchronized.
+
+The non-TUI command paths remain unchanged: `--json`, `--csv`, and `--detail <session-id>` continue to provide scriptable one-shot output for automation and exact lookup. Pagination flags remain available to those non-TUI paths. `sessions` does not introduce grouping or aggregation; that responsibility remains with `usage`.
 
 ## User Stories
 
-1. As an agent user, I want to list all Sessions across Sources, so that I can see what Sessions exist locally.
-2. As an agent user, I want to filter Sessions by `--last <duration>`, so that I can focus on recent activity.
-3. As an agent user, I want to filter Sessions by `--since <RFC3339>`, so that I can inspect a specific time range.
-4. As an agent user, I want to filter Sessions by `--project <substring>`, so that I can isolate a repository.
-5. As an agent user, I want to filter Sessions by `--model <substring>`, so that I can find Sessions using a specific model.
-6. As an agent user, I want to filter Sessions by `--source <claude|opencode|omp|kilo>`, so that I can narrow to one agent.
-7. As an agent user, I want Sessions sorted by `started_at` descending by default, so that the most recent Sessions appear first.
-8. As an agent user, I want a summary column showing sessions count, messages, input/output/cache tokens and optional cost, so that I can scan Session health at a glance.
-9. As an agent user, I want to view Session detail with `--detail <session-id>`, so that I can see full Record fields.
-10. As an agent user, I want Session ids to be the source-native id, so that I can correlate with original transcripts.
-11. As a power user, I want `--limit <n>` to cap the number of listed Sessions, so that large result sets stay manageable.
-12. As a power user, I want `--offset <n>` for pagination, so that I can page through results.
-13. As a script author, I want `--json` output, so that I can pipe Session listings into jq or other tools.
-14. As a script author, I want `--csv` output, so that I can import Session listings into spreadsheets.
-15. As a config-driven user, I want `sessions` to respect `~/.config/llmhelper/config.toml` source overrides, so that defaults are shared with `usage`/`diff`.
-16. As a multi-machine user, I want CLI overrides `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db` on `sessions`, so that it works with non-default paths.
-17. As a user, I want missing Sources to degrade gracefully with a SourceStatus error, so that partial data does not abort the listing.
-18. As a user, I want cost to be shown only when the Source records it, so that I do not see misleading zeros.
-19. As a user, I want token counts formatted with K/M/B magnitude, so that large numbers are readable.
-20. As a user, I want the listing to preserve the canonical TokenBreakdown fields input/output/cache_read/cache_write with reasoning folded into output, so that terminology stays consistent.
-21. As a developer, I want `sessions` to reuse the existing Filter and Record types, so that no new domain types are introduced.
-22. As a developer, I want `sessions` to be testable via the existing `--json` CLI seam, so that integration tests remain uniform.
+1. As an agent user, I want `sessions` to open a TUI by default, so that Session inventory matches the interactive experience of the other commands.
+2. As an agent user, I want to list all Sessions across Sources, so that I can see what Sessions exist locally.
+3. As an agent user, I want Sessions sorted by `started_at` descending, so that the most recent Sessions appear first.
+4. As an agent user, I want to see the Session count in the header, so that I can tell whether my filters matched data.
+5. As an agent user, I want to see each Source's loaded record count and error status, so that missing Sources do not look like empty data.
+6. As an agent user, I want to see each Session's Source, Project, Model, start time, end time, message count, and tokens, so that I can scan Session health at a glance.
+7. As an agent user, I want token counts formatted with K/M/B magnitude, so that large numbers remain readable.
+8. As an agent user, I want Cost shown only when the Source records it, so that I do not interpret missing spend data as zero.
+9. As an agent user, I want to navigate the Session list with arrow keys, so that the control is discoverable.
+10. As an agent user, I want to navigate the Session list with `j` and `k`, so that keyboard-only navigation is fast.
+11. As an agent user, I want the selected row to scroll into view, so that I never lose track of the current Session.
+12. As an agent user, I want to press `Enter` on the selected Session, so that I can inspect that Session without leaving the command.
+13. As an agent user, I want the Session detail view to show the source-native Session id, so that I can correlate it with original transcripts.
+14. As an agent user, I want the Session detail view to show Source, Project, and raw Model, so that the detail row is interpretable even outside its list row.
+15. As an agent user, I want the Session detail view to show the optional agent field when present, so that agent-level activity is visible without inventing new semantics.
+16. As an agent user, I want the Session detail view to show start and end times, so that I can understand the Session's active window.
+17. As an agent user, I want the Session detail view to show message count, so that activity level is visible.
+18. As an agent user, I want the Session detail view to show input, output, cache-read, and cache-write tokens, so that the canonical Token Breakdown is visible.
+19. As an agent user, I want output tokens to include reasoning tokens in Session detail, so that detail matches aggregate accounting.
+20. As an agent user, I want Cost shown only for Sessions whose Source records it, so that source-scoped Cost behavior is preserved.
+21. As an agent user, I want the footer to advertise `Enter` while in the list view, so that the detail interaction is discoverable.
+22. As an agent user, I want `Esc` to return from Session detail to the Session list, so that drill-down is non-destructive.
+23. As an agent user, I want the previous list selection to be preserved when I return from detail, so that I can reopen the same Session quickly.
+24. As an agent user, I want the footer in detail to advertise `Esc`, so that the return control is discoverable.
+25. As an agent user, I want `q` to quit from either the list or the detail view, so that exit behavior is predictable.
+26. As an agent user, I want `Enter` to be a no-op when no Session is selected, so that an empty state does not trigger an error.
+27. As an agent user, I want navigation in the detail view to remain harmless or disabled, so that arrow keys do not accidentally navigate through unrelated records.
+28. As an agent user, I want `r` to refresh while in the list, so that newly written Sessions appear without quitting.
+29. As an agent user, I want `r` to refresh while in the detail view, so that the detail row reflects current source data.
+30. As an agent user, I want an open detail view to remain open when the selected Session id still exists after refresh, so that refresh does not unexpectedly close my inspection.
+31. As an agent user, I want an open detail view to close when the selected Session id disappears after refresh, so that the UI does not show a record that no longer matches the current data.
+32. As an agent user, I want the list selection to clamp into bounds after refresh when Session counts shrink, so that the UI does not point at a nonexistent row.
+33. As an agent user, I want background refresh to update the list while I browse, so that new Sessions appear without manual refresh.
+34. As an agent user, I want background refresh to keep an open detail row synchronized, so that stale detail data does not linger.
+35. As an agent user, I want background refresh to close a missing detail Session, so that live data does not present a stale record as current.
+36. As an agent user, I want `sessions` to respect `--last <duration>`, so that I can focus on recent activity.
+37. As an agent user, I want `sessions` to respect `--since <RFC3339>`, so that I can inspect a specific time range.
+38. As an agent user, I want `--last` and `--since` to be mutually exclusive, so that overlapping time filters do not produce ambiguous results.
+39. As an agent user, I want to filter Sessions by `--project <substring>`, so that I can isolate a repository.
+40. As an agent user, I want to filter Sessions by `--model <substring>`, so that I can find Sessions using a specific model.
+41. As an agent user, I want to filter Sessions by `--source <source>`, so that I can narrow to one agent.
+42. As a power user, I want `--limit <n>` to cap the number of listed Sessions in non-TUI output, so that large result sets stay manageable.
+43. As a power user, I want `--offset <n>` in non-TUI output, so that I can page through results.
+44. As a power user, I want `--detail <session-id>` to fetch one Session without opening the TUI, so that I can correlate an id found elsewhere.
+45. As a power user, I want `--detail <session-id>` to fail clearly when the id is absent, so that automation can distinguish lookup misses.
+46. As a power user, I want `--json` output, so that I can pipe Session listings or one Session detail into `jq` or other tools.
+47. As a power user, I want `--csv` output, so that I can import Session listings into spreadsheets.
+48. As a power user, I want `--json` and `--csv` to be mutually exclusive, so that output format is unambiguous.
+49. As a config-driven user, I want `sessions` to respect configured source path overrides, so that defaults are shared with `usage` and `diff`.
+50. As a multi-machine user, I want CLI overrides for Claude, OpenCode, OMP, and Kilo data locations on `sessions`, so that it works with non-default paths.
+51. As a user, I want missing or unreadable Sources to degrade gracefully with a SourceStatus error, so that partial data does not abort the Session inventory.
+52. As a user, I want source errors shown in the TUI, so that I can diagnose missing data without leaving the command.
+53. As a user, I want Session detail to show missing end time clearly, so that an unfinished Session is not confused with missing data.
+54. As a user, I want Session detail to distinguish unavailable Cost from zero, so that Sources without spend data are not misrepresented.
+55. As a power user, I want the raw Model value to remain unresolved in detail, so that routing aliases are not guessed.
+56. As a developer, I want `sessions` to reuse the existing Source, Filter, and Record pipeline, so that no new domain model is introduced.
+57. As a developer, I want `sessions` to keep its data model flat, so that grouping responsibilities remain with `usage`.
+58. As a developer, I want Session detail state to be modeled as TUI state, so that it can be tested without driving a real terminal.
+59. As a developer, I want the TUI state methods to preserve or close detail deterministically during refresh, so that concurrent live updates remain predictable.
+60. As a developer, I want existing JSON, CSV, pagination, and detail integration tests to remain valid, so that adding TUI detail does not regress scriptable behavior.
 
 ## Implementation Decisions
 
-- New CLI enum variant `Command::Sessions(SessionsArgs)` with flags: `last`, `since`, `project`, `model`, `source`, `limit`, `offset`, `detail`, `json`, `csv`, plus source path overrides shared with `usage`.
-- Validation: `--last` and `--since` are mutually exclusive; `--json` and `--csv` are mutually exclusive; `--detail` requires a session id.
-- Data flow: `discover_sources(config)` → `registry.load_all()` → `Filter::matches(record)` → sort by `started_at` desc → apply `limit/offset` → render.
-- Detail mode renders a single Record with all fields: session_id, source, project, model, agent, started_at, ended_at, message_count, tokens breakdown, cost.
-- Listing mode columns: source, project, model, started_at, ended_at, sessions=1, messages, input, output, cache_read, cache_write, cost.
-- Grouping is not performed; `sessions` is a flat list. Grouping remains the responsibility of `usage`.
-- Cost handling follows ADR-0001: cost is shown per Source, never summed across Sources; `None` is rendered as empty.
-- Token formatting uses the shared magnitude formatter from `usage` to keep K/M/B display consistent.
-- No TUI / live refresh for `sessions`; it is a one-shot command.
-- The `Filter` type is reused as-is; no new filter semantics are added.
-- `SessionsArgs` mirrors `UsageArgs` for temporal and path filters to keep UX consistent.
+- `sessions` keeps a flat Session list. No grouping is introduced.
+- The default command mode is TUI. `--json`, `--csv`, and `--detail <session-id>` continue to select non-TUI output paths.
+- The TUI has two views: list and detail.
+- The list view shows all filtered Session records, sorted by `started_at` descending.
+- The detail view is keyed by source-native Session id.
+- The detail record is a normalized Record snapshot selected from the current filtered list.
+- Pressing `Enter` in the list view with a selected record opens the detail view.
+- Pressing `Enter` with no list selection, an empty list, or while already in detail is a no-op.
+- Pressing `Esc` in detail returns to list and preserves the list selection.
+- Pressing `Esc` in list quits, matching the existing sessions behavior.
+- Pressing `q` quits from either view.
+- Arrow and `j`/`k` navigation belongs to the list view. In detail, navigation should not change an unrelated Session.
+- Manual refresh reloads sources, reapplies the filter, resorts the list, and updates source statuses in either view.
+- Background refresh uses the existing bounded channel and the same update rules as manual refresh.
+- During refresh, the list selection is clamped into the new list bounds.
+- If an open detail Session id still exists after refresh, the detail view remains open and its Record is replaced with the refreshed Record.
+- If the open detail Session id disappears after refresh, the detail view closes and the user returns to list.
+- The list table continues to show Source, Project, Model, Started, Ended, Messages, Input, Output, Cache Read, Cache Write, and Cost.
+- The detail view adds the fields that are not fully visible in the list, especially Session id and optional agent.
+- Cost remains per Session and source-scoped. It is never summed across Sources.
+- Model remains the raw value recorded by the Source. Routing aliases such as `auto` are not resolved.
+- Reasoning tokens continue to be folded into output before rendering.
+- Non-TUI JSON/CSV schemas are unchanged.
+- `--limit`, `--offset`, and `--detail` validation remains unchanged.
+- The TUI footer is view-aware: list advertises `Enter`, detail advertises `Esc`.
+- The command remains read-only. No Session editing, deletion, transcript export, or source write-back is added.
 
 ## Testing Decisions
 
-- Good test = external behavior only: given fixture source directories and CLI flags, the emitted `--json` output matches expected Sessions list and field values.
-- Prior art: `tests/integration.rs` for `usage` and `diff` drives the binary with `--json` against `tests/fixtures/claude/`, `opencode/`, `omp/`, `kilo/`.
-- Seam: single highest seam = CLI `--json` output. No new unit seams. The same fixture strategy is reused.
-- Assertions cover:
-  * total Session count matches fixture sum
-  * `--source` filter returns only that Source's Sessions
-  * `--project` substring filter matches decoded project paths
-  * `--last` / `--since` time window filtering
-  * `--limit` / `--offset` pagination
-  * `--detail <id>` returns a single Record with correct tokens and cost
-  * cost is `null` for Claude, present for OpenCode/OMP/Kilo where non-zero
-  * model values are raw and normalized per Source rules
-  * sorting by `started_at` desc
-- No tests for internal rendering, TUI, or registry internals.
+- The highest meaningful seam for the interactive detail behavior is the TUI state API, following the pattern established for `usage` drill-down. A real terminal should not be required to test state transitions.
+- Add focused unit tests for sessions TUI state:
+  - `Enter` with a selected Session opens detail for that exact Session id.
+  - `Enter` without a selection is a no-op.
+  - `Enter` with an empty list is a no-op.
+  - `Esc` returns to list while preserving the list selection.
+  - Refresh clamps the list selection into bounds when records shrink.
+  - Refresh preserves an open detail view when the Session id still exists and replaces its data.
+  - Refresh closes an open detail view when the Session id disappears.
+  - Detail navigation does not alter the selected Session record.
+- Existing integration tests for `sessions --json`, filters, pagination, `--detail`, and sorting remain valid and must continue to pass.
+- No new Source trait tests are required because no adapter behavior changes.
+- Rendering layout should be verified manually in a terminal after unit tests pass, including narrow and wide widths.
 
 ## Out of Scope
 
-- Live refresh / TUI for `sessions`
-- Editing or deleting Sessions
-- Cross-Source cost aggregation
-- Session content export, transcript retrieval, or message-level listing
-- Creating new Sessions or writing data back to Sources
-- Calendar-aligned windows or historical arbitrary date pairs; only simple `since`/`last` filters
-- Grouping or aggregation; that is `usage`'s responsibility
-- Interactive pagination in terminal; pagination is flag-based
+- Message-level transcript contents or transcript export.
+- Editing, deleting, creating, or writing back Session data.
+- Grouping or aggregation inside `sessions`.
+- Cross-Source Cost totals in list or detail.
+- Resolving model routing aliases.
+- New JSON fields or CSV columns.
+- New CLI flags beyond the existing sessions arguments.
+- TUI pagination flags or interactive date filters.
+- Persistent memory of the last opened Session across separate invocations.
+- Nested drill-down from Session detail into deeper source-specific structures.
+- A separate `usage` Session export schema.
 
 ## Further Notes
 
-- The Session list provides the drill-down missing between `usage` aggregation and raw source files.
-- Future `report` features can compose `sessions` + `usage` data.
-- The spec respects domain glossary: Usage, Source, Project, Cost, TokenBreakdown, Model, Session.
-- ADR-0001 source-scoped cost and ADR-0004 raw model value are preserved.
+- The Session list in `usage` remains an aggregate-to-Session bridge for the currently selected group.
+- `sessions` remains the flat, command-level Session inventory and the scriptable Session record interface.
+- This update intentionally supersedes the earlier decision that `sessions` had no TUI or live refresh. The current project convention is to default CLI commands to TUI unless the user explicitly selects JSON or CSV output.
+- The detail view is not a transcript viewer. It is a normalized Record detail view for the selected Session.

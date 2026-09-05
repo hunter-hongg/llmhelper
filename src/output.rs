@@ -52,7 +52,7 @@ impl OutputRenderer {
 
     pub fn csv<W: Write>(&self, groups: &[Group], out: &mut W) -> anyhow::Result<()> {
         let mut w = csv::Writer::from_writer(out);
-        w.write_record(&[
+        w.write_record([
             "group_key",
             "source",
             "sessions",
@@ -64,7 +64,7 @@ impl OutputRenderer {
             "cost",
         ])?;
         for g in groups {
-            w.write_record(&[
+            w.write_record([
                 &g.key,
                 &g.source,
                 &g.sessions.to_string(),
@@ -73,9 +73,7 @@ impl OutputRenderer {
                 &g.tokens.output.to_string(),
                 &g.tokens.cache_read.to_string(),
                 &g.tokens.cache_write.to_string(),
-                &g.cost
-                    .map(|c| format!("{:.6}", c))
-                    .unwrap_or_default(),
+                &g.cost.map(|c| format!("{:.6}", c)).unwrap_or_default(),
             ])?;
         }
         w.flush()?;
@@ -171,18 +169,35 @@ pub fn render_diff_csv(
     _curr_agg: &AggregateResult,
 ) -> anyhow::Result<()> {
     let mut w = csv::Writer::from_writer(std::io::stdout());
-    w.write_record(&[
-        "group_key", "presence",
-        "prev_sessions", "curr_sessions", "delta_sessions",
-        "prev_messages", "curr_messages", "delta_messages",
-        "prev_input", "curr_input", "delta_input", "delta_pct_input",
-        "prev_output", "curr_output", "delta_output", "delta_pct_output",
-        "prev_cache_read", "curr_cache_read", "delta_cache_read",
-        "prev_cache_write", "curr_cache_write", "delta_cache_write",
-        "prev_cost", "curr_cost", "delta_cost",
+    w.write_record([
+        "group_key",
+        "presence",
+        "prev_sessions",
+        "curr_sessions",
+        "delta_sessions",
+        "prev_messages",
+        "curr_messages",
+        "delta_messages",
+        "prev_input",
+        "curr_input",
+        "delta_input",
+        "delta_pct_input",
+        "prev_output",
+        "curr_output",
+        "delta_output",
+        "delta_pct_output",
+        "prev_cache_read",
+        "curr_cache_read",
+        "delta_cache_read",
+        "prev_cache_write",
+        "curr_cache_write",
+        "delta_cache_write",
+        "prev_cost",
+        "curr_cost",
+        "delta_cost",
     ])?;
     for row in rows {
-        w.write_record(&[
+        w.write_record([
             &row.key,
             &row.presence.to_string(),
             &opt_snap_cell(row.prev.as_ref().map(|s| s.sessions as u64)),
@@ -234,9 +249,13 @@ pub fn render_diff_table(
         })
         .collect();
 
-    writeln!(out, "diff  |  total sessions: prev={} curr={} delta={}",
-        prev_total_sessions, curr_total_sessions,
-        curr_total_sessions as i64 - prev_total_sessions as i64)?;
+    writeln!(
+        out,
+        "diff  |  total sessions: prev={} curr={} delta={}",
+        prev_total_sessions,
+        curr_total_sessions,
+        curr_total_sessions as i64 - prev_total_sessions as i64
+    )?;
     writeln!(out, "sources: {}", sources_line.join("  "))?;
     writeln!(out)?;
 
@@ -269,9 +288,8 @@ pub fn render_diff_table(
             row.key.clone()
         };
 
-        let cell = |v: Option<u64>| -> String {
-            v.map(token_disp).unwrap_or_else(|| "—".to_string())
-        };
+        let cell =
+            |v: Option<u64>| -> String { v.map(token_disp).unwrap_or_else(|| "—".to_string()) };
         let prev_in = cell(row.prev.as_ref().map(|s| s.tokens.input));
         let curr_in = cell(row.curr.as_ref().map(|s| s.tokens.input));
         let prev_out = cell(row.prev.as_ref().map(|s| s.tokens.output));
@@ -279,11 +297,27 @@ pub fn render_diff_table(
 
         let delta_in = i64_disp(row.delta.tokens.input);
         let delta_out = i64_disp(row.delta.tokens.output);
-        let delta_in_pct = row.delta.pct.as_ref().and_then(|p| p.input).map(|v| format!("{:.1}%", v)).unwrap_or_default();
-        let delta_out_pct = row.delta.pct.as_ref().and_then(|p| p.output).map(|v| format!("{:.1}%", v)).unwrap_or_default();
+        let delta_in_pct = row
+            .delta
+            .pct
+            .as_ref()
+            .and_then(|p| p.input)
+            .map(|v| format!("{:.1}%", v))
+            .unwrap_or_default();
+        let delta_out_pct = row
+            .delta
+            .pct
+            .as_ref()
+            .and_then(|p| p.output)
+            .map(|v| format!("{:.1}%", v))
+            .unwrap_or_default();
 
         let sess_delta = i64_disp(row.delta.sessions);
-        let cost_delta = row.delta.cost.map(|c| format!("{:+.6}", c)).unwrap_or_else(|| "N/A".to_string());
+        let cost_delta = row
+            .delta
+            .cost
+            .map(|c| format!("{:+.6}", c))
+            .unwrap_or_else(|| "N/A".to_string());
 
         writeln!(out,
             "{:<width$}  | {:>token$} {:>token$} {:>token$} {:>token$}  | {:>token$} {:>token$} {:>token$} {:>token$}  | {:>+token$} | {:>+token$}",
@@ -298,7 +332,11 @@ pub fn render_diff_table(
 }
 
 fn col_width(rows: &[DiffRow], field: impl Fn(&DiffRow) -> &str) -> usize {
-    rows.iter().map(|r| field(r).len()).max().unwrap_or(0).min(24)
+    rows.iter()
+        .map(|r| field(r).len())
+        .max()
+        .unwrap_or(0)
+        .min(24)
 }
 
 fn token_disp(v: u64) -> String {
@@ -341,8 +379,8 @@ pub fn format_tokens(n: u64) -> String {
 mod tests {
     use super::*;
     use crate::aggregator::AggregateResult;
-    use crate::domain::GroupBy;
     use crate::domain::record::{Record, TokenBreakdown};
+    use crate::domain::GroupBy;
     use crate::filter::Filter;
     use chrono::Utc;
 
@@ -410,7 +448,9 @@ mod tests {
         ];
         let mut buf = Vec::new();
         let renderer = OutputRenderer;
-        renderer.json(&agg.groups, &statuses, "source", &mut buf).unwrap();
+        renderer
+            .json(&agg.groups, &statuses, "source", &mut buf)
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(parsed.get("sources").is_some());
         assert!(parsed.get("groups").is_some());

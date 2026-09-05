@@ -161,13 +161,19 @@ fn token_diff(
 
 /// Cost delta respects ADR-0001: only when both windows carry cost.
 fn cost_delta(prev: &Option<Snapshot>, curr: &Option<Snapshot>) -> Option<f64> {
-    match (prev.as_ref().and_then(|s| s.cost), curr.as_ref().and_then(|s| s.cost)) {
+    match (
+        prev.as_ref().and_then(|s| s.cost),
+        curr.as_ref().and_then(|s| s.cost),
+    ) {
         (Some(p), Some(c)) => Some(((c - p) * 1_000_000.0).round() / 1_000_000.0),
         _ => None,
     }
 }
 
-fn pct_delta(prev: Option<&Snapshot>, token_delta: &TokenBreakdownDelta) -> Option<TokenBreakdownPct> {
+fn pct_delta(
+    prev: Option<&Snapshot>,
+    token_delta: &TokenBreakdownDelta,
+) -> Option<TokenBreakdownPct> {
     let prev = prev?;
     let t = &prev.tokens;
 

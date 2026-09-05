@@ -7,8 +7,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::source::SourceStatus;
 use super::diff_app::DiffTuiState;
+use crate::source::SourceStatus;
 
 // ---------------------------------------------------------------------------
 // Palette — shares the same calm dark theme as the usage TUI so both commands
@@ -86,10 +86,10 @@ pub fn render(frame: &mut Frame, state: &mut DiffTuiState) {
 
     let chunks = Layout::default()
         .constraints([
-            Constraint::Length(8),  // header: title + window bounds
-            Constraint::Length(3),  // sources
-            Constraint::Min(8),     // table
-            Constraint::Length(3),  // legend + key hints
+            Constraint::Length(8), // header: title + window bounds
+            Constraint::Length(3), // sources
+            Constraint::Min(8),    // table
+            Constraint::Length(3), // legend + key hints
         ])
         .split(area);
 
@@ -114,16 +114,32 @@ fn render_header(state: &DiffTuiState) -> Paragraph<'_> {
 
     if let Some((ps, pe, cs, ce, d_prev, d_curr)) = state.app.window_bounds() {
         lines.push(Line::from(vec![
-            Span::styled("prev  ", Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
             Span::styled(
-                format!("{} → {}  ({}  earlier)", fmt_ts(ps), fmt_ts(pe), fmt_dur(*d_prev)),
+                "prev  ",
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "{} → {}  ({}  earlier)",
+                    fmt_ts(ps),
+                    fmt_ts(pe),
+                    fmt_dur(*d_prev)
+                ),
                 Style::default().fg(MUTED),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("curr  ", Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
             Span::styled(
-                format!("{} → {}  (last {})", fmt_ts(cs), fmt_ts(ce), fmt_dur(*d_curr)),
+                "curr  ",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "{} → {}  (last {})",
+                    fmt_ts(cs),
+                    fmt_ts(ce),
+                    fmt_dur(*d_curr)
+                ),
                 Style::default().fg(TEXT),
             ),
         ]));
@@ -150,10 +166,7 @@ fn render_sources(statuses: &[SourceStatus]) -> Paragraph<'_> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
         if let Some(err) = &s.error {
-            spans.push(Span::styled(
-                format!(" {}", err),
-                Style::default().fg(RED),
-            ));
+            spans.push(Span::styled(format!(" {}", err), Style::default().fg(RED)));
         } else {
             spans.push(Span::styled(
                 format!(" {} records loaded", s.record_count),
@@ -173,7 +186,10 @@ fn render_footer() -> Paragraph<'static> {
         ("q", "quit"),
     ];
     let mut spans = vec![
-        Span::styled("status  ", Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "status  ",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("✓ ", Style::default().fg(MUTED)),
         Span::styled("in both windows    ", Style::default().fg(MUTED)),
         Span::styled("+ ", Style::default().fg(GREEN)),
@@ -324,17 +340,42 @@ const SHOW_PCT_WIDTH: usize = 110;
 
 fn build_columns(show_pct: bool) -> Vec<ColMeta> {
     let mut cols = vec![
-        ColMeta { kind: ColKind::Key, band: "", band_color: TITLE, name: "Key" },
-        ColMeta { kind: ColKind::Status, band: "", band_color: TITLE, name: "st" },
+        ColMeta {
+            kind: ColKind::Key,
+            band: "",
+            band_color: TITLE,
+            name: "Key",
+        },
+        ColMeta {
+            kind: ColKind::Status,
+            band: "",
+            band_color: TITLE,
+            name: "st",
+        },
         ColMeta {
             kind: ColKind::Value,
             band: "prev",
             band_color: MUTED,
             name: "in",
         },
-        ColMeta { kind: ColKind::Value, band: "", band_color: MUTED, name: "out" },
-        ColMeta { kind: ColKind::Value, band: "curr", band_color: TEXT, name: "in" },
-        ColMeta { kind: ColKind::Value, band: "", band_color: TEXT, name: "out" },
+        ColMeta {
+            kind: ColKind::Value,
+            band: "",
+            band_color: MUTED,
+            name: "out",
+        },
+        ColMeta {
+            kind: ColKind::Value,
+            band: "curr",
+            band_color: TEXT,
+            name: "in",
+        },
+        ColMeta {
+            kind: ColKind::Value,
+            band: "",
+            band_color: TEXT,
+            name: "out",
+        },
     ];
     cols.push(ColMeta {
         kind: ColKind::Delta,
@@ -413,9 +454,8 @@ fn render_table(state: &mut DiffTuiState, width: usize) -> Table<'static> {
 
     if state.app.rows.is_empty() {
         return Table::new(
-            vec![Row::new(vec![Cell::from(" No groups to compare. ")]).style(
-                Style::default().fg(MUTED).bg(BG),
-            )],
+            vec![Row::new(vec![Cell::from(" No groups to compare. ")])
+                .style(Style::default().fg(MUTED).bg(BG))],
             vec![Constraint::Min(20)],
         )
         .header(Row::new(vec![Cell::from("")]))
@@ -439,22 +479,23 @@ fn render_table(state: &mut DiffTuiState, width: usize) -> Table<'static> {
             let line1 = Line::from(Span::styled(
                 format!(" {} ", c.band),
                 Style::default()
-                    .fg(if show_label { c.band_color } else { Color::Reset })
+                    .fg(if show_label {
+                        c.band_color
+                    } else {
+                        Color::Reset
+                    })
                     .add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Right);
             let line2 = Line::from(Span::styled(
                 c.name.to_string(),
-                Style::default()
-                    .fg(TITLE)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(TITLE).add_modifier(Modifier::BOLD),
             ));
-            let text = Text::from(vec![line1, line2])
-                .alignment(if c.kind == ColKind::Key {
-                    Alignment::Left
-                } else {
-                    Alignment::Right
-                });
+            let text = Text::from(vec![line1, line2]).alignment(if c.kind == ColKind::Key {
+                Alignment::Left
+            } else {
+                Alignment::Right
+            });
             Cell::from(text).style(Style::default().bg(SURFACE))
         })
         .collect();
@@ -527,21 +568,30 @@ fn render_table(state: &mut DiffTuiState, width: usize) -> Table<'static> {
             ];
             if show_pct {
                 cells.push(num(p_in, delta_color(row.delta.tokens.input), true, false));
-                cells.push(num(p_out, delta_color(row.delta.tokens.output), true, false));
+                cells.push(num(
+                    p_out,
+                    delta_color(row.delta.tokens.output),
+                    true,
+                    false,
+                ));
             }
             cells.push(num(d_sess, delta_color(row.delta.sessions), true, false));
-            cells.push(Cell::new(fmt_delta_msgs(row.delta.messages)).style(
-                Style::default().fg(delta_color(row.delta.messages)).bg(row_bg),
-            ));
+            cells.push(
+                Cell::new(fmt_delta_msgs(row.delta.messages)).style(
+                    Style::default()
+                        .fg(delta_color(row.delta.messages))
+                        .bg(row_bg),
+                ),
+            );
             // Cost color: green if positive, red if negative, muted if zero or n/a.
             let cost_fg = match row.delta.cost {
                 Some(c) if c > 0.0 => GREEN,
                 Some(c) if c < 0.0 => RED,
                 _ => MUTED,
             };
-            cells.push(Cell::new(fmt_cost(row.delta.cost)).style(
-                Style::default().fg(cost_fg).bg(row_bg),
-            ));
+            cells.push(
+                Cell::new(fmt_cost(row.delta.cost)).style(Style::default().fg(cost_fg).bg(row_bg)),
+            );
 
             let row = Row::new(cells).height(1);
             row

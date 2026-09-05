@@ -2,22 +2,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use llmhelper::aggregator::AggregateResult;
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use llmhelper::aggregator::AggregateResult;
 
-use llmhelper::cli::{Cli, Command, UsageArgs, DiffArgs, SessionsArgs};
+use llmhelper::cli::{Cli, Command, DiffArgs, SessionsArgs, UsageArgs};
 use llmhelper::config::Config;
+use llmhelper::diff::compute_diff;
 use llmhelper::domain::group::GroupBy;
 use llmhelper::domain::record::Record;
-use llmhelper::diff::compute_diff;
 use llmhelper::filter::Filter;
-use llmhelper::output::{
-    OutputRenderer, render_diff_json, render_diff_csv, format_tokens,
+use llmhelper::output::{format_tokens, render_diff_csv, render_diff_json, OutputRenderer};
+use llmhelper::source::{
+    ClaudeSource, KiloSource, OmpSource, OpenCodeSource, Registry, SourceStatus,
 };
-use llmhelper::source::{ClaudeSource, KiloSource, OpenCodeSource, OmpSource, Registry, SourceStatus};
-use llmhelper::tui::{TerminalApp, DiffTuiApp, SessionsTuiApp};
+use llmhelper::tui::{DiffTuiApp, SessionsData, SessionsTuiApp, SessionsView, TerminalApp};
 
 /// Shared state between background refresh task and TUI main loop.
 struct TuiData {
@@ -26,11 +26,7 @@ struct TuiData {
     source_statuses: Vec<SourceStatus>,
 }
 
-fn load_usage_data(
-    registry: &Registry,
-    filter: &Filter,
-    group_by: GroupBy,
-) -> TuiData {
+fn load_usage_data(registry: &Registry, filter: &Filter, group_by: GroupBy) -> TuiData {
     let (records, statuses) = registry.load_all();
     let filtered: Vec<Record> = filter.apply(&records).into_iter().cloned().collect();
     let filtered_refs: Vec<&Record> = filtered.iter().collect();
@@ -44,14 +40,11 @@ fn load_usage_data(
 
 fn discover_sources(config: &Config) -> Registry {
     let mut reg = Registry::new();
-    let claude_dir = config
-        .claude_dir
-        .clone()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .map(|h| h.join(".claude").join("projects"))
-                .unwrap_or_default()
-        });
+    let claude_dir = config.claude_dir.clone().unwrap_or_else(|| {
+        dirs::home_dir()
+            .map(|h| h.join(".claude").join("projects"))
+            .unwrap_or_default()
+    });
     reg.register(Box::new(ClaudeSource::new(claude_dir)));
     let opencode_dbs: Vec<PathBuf> = if let Some(ref overrides) = config.opencode_dbs {
         overrides.clone()
@@ -65,26 +58,18 @@ fn discover_sources(config: &Config) -> Registry {
             .collect()
     };
     reg.register(Box::new(OpenCodeSource::new(opencode_dbs)));
-    let omp_dir = config
-        .omp_dir
-        .clone()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .map(|h| h.join(".omp").join("agent").join("sessions"))
-                .unwrap_or_default()
-        });
+    let omp_dir = config.omp_dir.clone().unwrap_or_else(|| {
+        dirs::home_dir()
+            .map(|h| h.join(".omp").join("agent").join("sessions"))
+            .unwrap_or_default()
+    });
     reg.register(Box::new(OmpSource::new(omp_dir)));
-    let kilo_db = config
-        .kilo_dbs
-        .clone()
-        .unwrap_or_else(|| {
-            vec![
-                dirs::data_local_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("kilo")
-                    .join("kilo.db"),
-            ]
-        });
+    let kilo_db = config.kilo_dbs.clone().unwrap_or_else(|| {
+        vec![dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("kilo")
+            .join("kilo.db")]
+    });
     reg.register(Box::new(KiloSource::new(kilo_db)));
     reg
 }
@@ -162,13 +147,15 @@ fn run_tui(
 
     // Initial load
     let initial = load_usage_data(&reg_arc, &filter, tui.state.app.group_by);
-    tui.state.apply_data(initial.records, initial.result, initial.source_statuses);
+    tui.state
+        .apply_data(initial.records, initial.result, initial.source_statuses);
 
     // Main loop: poll channel each frame for background updates
     while tui.state.app.running {
         // Check for background refresh data
         if let Ok(data) = rx.try_recv() {
-            tui.state.apply_data(data.records, data.result, data.source_statuses);
+            tui.state
+                .apply_data(data.records, data.result, data.source_statuses);
         }
 
         tui.terminal.draw(|frame| {
@@ -194,16 +181,16 @@ fn run_tui(
                         }
                     }
                     crossterm::event::KeyCode::Char('r') => {
-                        let data =
-                            load_usage_data(&reg_arc, &filter, *group_by.lock());
-                        tui.state.apply_data(data.records, data.result, data.source_statuses);
+                        let data = load_usage_data(&reg_arc, &filter, *group_by.lock());
+                        tui.state
+                            .apply_data(data.records, data.result, data.source_statuses);
                     }
                     crossterm::event::KeyCode::Tab => {
                         tui.state.cycle_group();
                         *group_by.lock() = tui.state.app.group_by;
-                        let data =
-                            load_usage_data(&reg_arc, &filter, tui.state.app.group_by);
-                        tui.state.apply_data(data.records, data.result, data.source_statuses);
+                        let data = load_usage_data(&reg_arc, &filter, tui.state.app.group_by);
+                        tui.state
+                            .apply_data(data.records, data.result, data.source_statuses);
                     }
                     crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
                         tui.state.select_next();
@@ -280,18 +267,17 @@ fn window_filters(
 ) -> (Filter, Filter) {
     let prev_until = now - last_duration;
     let curr_since = prev_until - prev_duration;
-    let non_temporal = |since: chrono::DateTime<chrono::Utc>,
-                        until: chrono::DateTime<chrono::Utc>|
-     -> Filter {
-        Filter {
-            since: Some(since),
-            until: Some(until),
-            project: args.project.clone(),
-            model: args.model.clone(),
-            source: args.source.as_ref().map(|s| s.to_string()),
-            ..Default::default()
-        }
-    };
+    let non_temporal =
+        |since: chrono::DateTime<chrono::Utc>, until: chrono::DateTime<chrono::Utc>| -> Filter {
+            Filter {
+                since: Some(since),
+                until: Some(until),
+                project: args.project.clone(),
+                model: args.model.clone(),
+                source: args.source.as_ref().map(|s| s.to_string()),
+                ..Default::default()
+            }
+        };
     (
         non_temporal(curr_since, prev_until),
         non_temporal(prev_until, now),
@@ -401,6 +387,16 @@ fn run_diff_tui(
     Ok(())
 }
 
+fn load_sessions_data(registry: &Registry, filter: &Filter) -> SessionsData {
+    let (records, source_statuses) = registry.load_all();
+    let mut records: Vec<Record> = filter.apply(&records).into_iter().cloned().collect();
+    records.sort_by_key(|a| std::cmp::Reverse(a.started_at));
+    SessionsData {
+        records,
+        source_statuses,
+    }
+}
+
 fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
     args.validate()?;
     if args.detail.is_some() || args.json || args.csv {
@@ -423,17 +419,35 @@ fn run_sessions_non_tui(args: &SessionsArgs) -> anyhow::Result<()> {
             eprintln!("warn: source {} error: {}", status.name, err);
         }
     }
-    let mut records: Vec<llmhelper::domain::record::Record> = filter.apply(&records).into_iter().cloned().collect();
+    let mut records: Vec<llmhelper::domain::record::Record> =
+        filter.apply(&records).into_iter().cloned().collect();
     if let Some(id) = args.detail.clone() {
-        let rec = records.iter().find(|r| r.session_id == id).cloned().ok_or_else(|| anyhow::anyhow!("session id not found"))?;
+        let rec = records
+            .iter()
+            .find(|r| r.session_id == id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("session id not found"))?;
         if args.json {
             let mut buf = Vec::new();
             serde_json::to_writer_pretty(&mut buf, &rec)?;
             println!("{}", String::from_utf8(buf)?);
         } else if args.csv {
             let mut w = csv::Writer::from_writer(std::io::stdout());
-            w.write_record(&["session_id","source","project","model","started_at","ended_at","message_count","input","output","cache_read","cache_write","cost"])?;
-            w.write_record(&[
+            w.write_record([
+                "session_id",
+                "source",
+                "project",
+                "model",
+                "started_at",
+                "ended_at",
+                "message_count",
+                "input",
+                "output",
+                "cache_read",
+                "cache_write",
+                "cost",
+            ])?;
+            w.write_record([
                 &rec.session_id,
                 &rec.source,
                 &rec.project,
@@ -456,12 +470,17 @@ fn run_sessions_non_tui(args: &SessionsArgs) -> anyhow::Result<()> {
             println!("started_at: {}", rec.started_at);
             println!("ended_at: {:?}", rec.ended_at);
             println!("message_count: {}", rec.message_count);
-            println!("tokens: input={}, output={}, cache_read={}, cache_write={}", rec.tokens.input, rec.tokens.output, rec.tokens.cache_read, rec.tokens.cache_write);
-            if let Some(cost) = rec.cost { println!("cost: {:.6}", cost); }
+            println!(
+                "tokens: input={}, output={}, cache_read={}, cache_write={}",
+                rec.tokens.input, rec.tokens.output, rec.tokens.cache_read, rec.tokens.cache_write
+            );
+            if let Some(cost) = rec.cost {
+                println!("cost: {:.6}", cost);
+            }
         }
         return Ok(());
     }
-    records.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    records.sort_by_key(|a| std::cmp::Reverse(a.started_at));
     let offset = args.offset.unwrap_or(0);
     let limit = args.limit.unwrap_or(usize::MAX);
     let paginated: Vec<_> = records.into_iter().skip(offset).take(limit).collect();
@@ -471,9 +490,21 @@ fn run_sessions_non_tui(args: &SessionsArgs) -> anyhow::Result<()> {
         println!("{}", String::from_utf8(buf)?);
     } else if args.csv {
         let mut w = csv::Writer::from_writer(std::io::stdout());
-        w.write_record(&["source","project","model","started_at","ended_at","messages","input","output","cache_read","cache_write","cost"])?;
+        w.write_record([
+            "source",
+            "project",
+            "model",
+            "started_at",
+            "ended_at",
+            "messages",
+            "input",
+            "output",
+            "cache_read",
+            "cache_write",
+            "cost",
+        ])?;
         for r in &paginated {
-            w.write_record(&[
+            w.write_record([
                 &r.source,
                 &r.project,
                 &r.model,
@@ -489,15 +520,31 @@ fn run_sessions_non_tui(args: &SessionsArgs) -> anyhow::Result<()> {
         }
         w.flush()?;
     } else {
-        let header = format!("{:<12} {:<30} {:<20} {:<20} {:<20} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}",
-            "source","project","model","started_at","ended_at","messages","input","output","cache_read","cache_write","cost");
+        let header = format!(
+            "{:<12} {:<30} {:<20} {:<20} {:<20} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "source",
+            "project",
+            "model",
+            "started_at",
+            "ended_at",
+            "messages",
+            "input",
+            "output",
+            "cache_read",
+            "cache_write",
+            "cost"
+        );
         println!("{}", header);
         println!("{}", "-".repeat(header.len()));
         for r in &paginated {
             let started = r.started_at.format("%Y-%m-%dT%H:%M:%S").to_string();
-            let ended = r.ended_at.map(|e| e.format("%Y-%m-%dT%H:%M:%S").to_string()).unwrap_or_default();
+            let ended = r
+                .ended_at
+                .map(|e| e.format("%Y-%m-%dT%H:%M:%S").to_string())
+                .unwrap_or_default();
             let cost_str = r.cost.map(|c| format!("{:.4}", c)).unwrap_or_default();
-            println!("{:<12} {:<30} {:<20} {:<20} {:<20} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            println!(
+                "{:<12} {:<30} {:<20} {:<20} {:<20} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}",
                 r.source,
                 r.project.chars().take(30).collect::<String>(),
                 r.model.chars().take(20).collect::<String>(),
@@ -517,7 +564,7 @@ fn run_sessions_non_tui(args: &SessionsArgs) -> anyhow::Result<()> {
 
 fn run_sessions_tui(registry: Registry, filter: Filter, refresh_secs: u64) -> anyhow::Result<()> {
     let rt = Runtime::new()?;
-    let (tx, mut rx) = mpsc::channel::<(Vec<llmhelper::domain::record::Record>, Vec<SourceStatus>)>(1);
+    let (tx, mut rx) = mpsc::channel::<SessionsData>(1);
     let reg_arc = Arc::new(registry);
     let reg_for_task = reg_arc.clone();
     let filter_clone = filter.clone();
@@ -526,25 +573,17 @@ fn run_sessions_tui(registry: Registry, filter: Filter, refresh_secs: u64) -> an
         let mut tick = interval(Duration::from_secs(refresh_secs.max(1)));
         loop {
             tick.tick().await;
-            let (records, statuses) = reg_for_task.load_all();
-            let filtered: Vec<_> = filter_clone.apply(&records).into_iter().cloned().collect();
-            let mut sorted = filtered;
-            sorted.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-            let _ = tx.send((sorted, statuses)).await;
+            let data = load_sessions_data(&reg_for_task, &filter_clone);
+            let _ = tx.send(data).await;
         }
     });
     let mut tui = SessionsTuiApp::new()?;
     tui.state.app.running = true;
-    let (records, statuses) = reg_arc.load_all();
-    let filtered: Vec<_> = filter.apply(&records).into_iter().cloned().collect();
-    let mut sorted = filtered;
-    sorted.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-    tui.state.app.records = sorted;
-    tui.state.app.source_statuses = statuses;
+    let data = load_sessions_data(&reg_arc, &filter);
+    tui.state.apply_data(data);
     while tui.state.app.running {
-        if let Ok((records, statuses)) = rx.try_recv() {
-            tui.state.app.records = records;
-            tui.state.app.source_statuses = statuses;
+        if let Ok(data) = rx.try_recv() {
+            tui.state.apply_data(data);
         }
         tui.terminal.draw(|frame| {
             llmhelper::tui::sessions_render::render(frame, &mut tui.state);
@@ -552,16 +591,22 @@ fn run_sessions_tui(registry: Registry, filter: Filter, refresh_secs: u64) -> an
         if crossterm::event::poll(std::time::Duration::from_millis(200))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 match key.code {
-                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
+                    crossterm::event::KeyCode::Char('q') => {
                         tui.state.app.running = false;
                     }
+                    crossterm::event::KeyCode::Esc => {
+                        if tui.state.app.view == SessionsView::Detail {
+                            tui.state.close_detail();
+                        } else {
+                            tui.state.app.running = false;
+                        }
+                    }
+                    crossterm::event::KeyCode::Enter => {
+                        tui.state.open_detail();
+                    }
                     crossterm::event::KeyCode::Char('r') => {
-                        let (records, statuses) = reg_arc.load_all();
-                        let filtered: Vec<_> = filter.apply(&records).into_iter().cloned().collect();
-                        let mut sorted = filtered;
-                        sorted.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-                        tui.state.app.records = sorted;
-                        tui.state.app.source_statuses = statuses;
+                        let data = load_sessions_data(&reg_arc, &filter);
+                        tui.state.apply_data(data);
                     }
                     crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
                         tui.state.select_next();
@@ -629,11 +674,26 @@ fn run_diff(args: DiffArgs) -> anyhow::Result<()> {
 
     // Render output
     if args.json {
-        render_diff_json(&rows, &source_statuses, group_by.label(), prev_since, prev_until, curr_since, curr_until)?;
+        render_diff_json(
+            &rows,
+            &source_statuses,
+            group_by.label(),
+            prev_since,
+            prev_until,
+            curr_since,
+            curr_until,
+        )?;
     } else if args.csv {
         render_diff_csv(&rows, &source_statuses, &prev_agg, &curr_agg)?;
     } else {
-        run_diff_tui(registry, &args, group_by, last_duration, prev_duration, config.refresh_interval_seconds)?;
+        run_diff_tui(
+            registry,
+            &args,
+            group_by,
+            last_duration,
+            prev_duration,
+            config.refresh_interval_seconds,
+        )?;
     }
 
     Ok(())

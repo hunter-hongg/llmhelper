@@ -6,8 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::source::SourceStatus;
 use super::app::{App, TuiState, View};
+use crate::source::SourceStatus;
 
 // ---------------------------------------------------------------------------
 // Palette — a calm dark theme so the data, not the chrome, draws the eye.
@@ -115,10 +115,7 @@ fn panel_with_title(title: String) -> Block<'static> {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(BORDER))
         .style(Style::default().bg(BG))
-        .title(Line::from(Span::styled(
-            title,
-            Style::default().fg(TITLE),
-        )))
+        .title(Line::from(Span::styled(title, Style::default().fg(TITLE))))
 }
 
 fn render_header(state: &TuiState) -> Paragraph<'_> {
@@ -183,10 +180,7 @@ fn render_sources(statuses: &[SourceStatus]) -> Paragraph<'_> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
         if let Some(err) = &s.error {
-            spans.push(Span::styled(
-                format!(" {}", err),
-                Style::default().fg(RED),
-            ));
+            spans.push(Span::styled(format!(" {}", err), Style::default().fg(RED)));
         } else {
             spans.push(Span::styled(
                 format!(" {}", s.record_count),
@@ -204,9 +198,8 @@ fn render_detail_table(state: &TuiState) -> Table<'static> {
         Some(d) => d,
         None => {
             return Table::new(
-                vec![Row::new(vec![Cell::from(" No detail data. ")]).style(
-                    Style::default().fg(MUTED).bg(BG),
-                )],
+                vec![Row::new(vec![Cell::from(" No detail data. ")])
+                    .style(Style::default().fg(MUTED).bg(BG))],
                 vec![Constraint::Min(20)],
             )
             .header(Row::new(vec![Cell::from("")]))
@@ -220,8 +213,8 @@ fn render_detail_table(state: &TuiState) -> Table<'static> {
         detail.records.len()
     ));
     let headers = [
-        "Session", "Source", "Project", "Model", "Started", "Ended", "Messages", "Input",
-        "Output", "Cache R", "Cache W", "Cost",
+        "Session", "Source", "Project", "Model", "Started", "Ended", "Messages", "Input", "Output",
+        "Cache R", "Cache W", "Cost",
     ];
     let col_fg = [
         ACCENT, ACCENT2, TEXT, TEXT, MUTED, MUTED, YELLOW, GREEN, BLUE, ACCENT, YELLOW, RED,
@@ -290,10 +283,15 @@ fn render_detail_table(state: &TuiState) -> Table<'static> {
                     "{} {}",
                     if is_sel { "▶" } else { " " },
                     r.session_id
-                )).style(
+                ))
+                .style(
                     Style::default()
                         .fg(ACCENT)
-                        .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })
+                        .add_modifier(if is_sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        })
                         .bg(row_bg),
                 ),
                 Cell::new(r.source.clone()).style(style(source_color(&r.source))),
@@ -301,18 +299,12 @@ fn render_detail_table(state: &TuiState) -> Table<'static> {
                 Cell::new(r.model.chars().take(14).collect::<String>()).style(style(TEXT)),
                 Cell::new(r.started_at.format("%Y-%m-%d %H:%M").to_string()).style(style(MUTED)),
                 Cell::new(ended).style(style(MUTED)),
-                Cell::from(
-                    Text::from(r.message_count.to_string()).alignment(Alignment::Right),
-                )
-                .style(style(YELLOW)),
-                Cell::from(
-                    Text::from(format_tokens(r.tokens.input)).alignment(Alignment::Right),
-                )
-                .style(style(GREEN)),
-                Cell::from(
-                    Text::from(format_tokens(r.tokens.output)).alignment(Alignment::Right),
-                )
-                .style(style(BLUE)),
+                Cell::from(Text::from(r.message_count.to_string()).alignment(Alignment::Right))
+                    .style(style(YELLOW)),
+                Cell::from(Text::from(format_tokens(r.tokens.input)).alignment(Alignment::Right))
+                    .style(style(GREEN)),
+                Cell::from(Text::from(format_tokens(r.tokens.output)).alignment(Alignment::Right))
+                    .style(style(BLUE)),
                 Cell::from(
                     Text::from(cache_cell(&r.source, r.tokens.cache_read))
                         .alignment(Alignment::Right),
@@ -396,9 +388,8 @@ fn render_table(state: &mut TuiState) -> Table<'static> {
         Some(r) => r,
         None => {
             return Table::new(
-                vec![Row::new(vec![Cell::from(" No data loaded yet. ")]).style(
-                    Style::default().fg(MUTED).bg(BG),
-                )],
+                vec![Row::new(vec![Cell::from(" No data loaded yet. ")])
+                    .style(Style::default().fg(MUTED).bg(BG))],
                 vec![Constraint::Min(20)],
             )
             .header(Row::new(vec![Cell::from("")]))
@@ -408,8 +399,7 @@ fn render_table(state: &mut TuiState) -> Table<'static> {
 
     // Each column carries its own color so the header doubles as a legend.
     let headers = [
-        "Group", "Source", "Sessions", "Messages", "Input", "Output", "Cache R", "Cache W",
-        "Cost",
+        "Group", "Source", "Sessions", "Messages", "Input", "Output", "Cache R", "Cache W", "Cost",
     ];
     let col_fg = [
         ACCENT, ACCENT2, YELLOW, YELLOW, GREEN, BLUE, ACCENT, YELLOW, RED,
@@ -481,15 +471,10 @@ fn render_table(state: &mut TuiState) -> Table<'static> {
                 } else {
                     // Pad with a leading space so the column width does not
                     // shift when the selection marker appears/disappears.
-                    Cell::new(format!("  {}", g.key)).style(
-                        Style::default().fg(TEXT).bg(row_bg),
-                    )
+                    Cell::new(format!("  {}", g.key)).style(Style::default().fg(TEXT).bg(row_bg))
                 },
-                Cell::new(g.source.clone()).style(
-                    Style::default()
-                        .fg(source_color(&g.source))
-                        .bg(row_bg),
-                ),
+                Cell::new(g.source.clone())
+                    .style(Style::default().fg(source_color(&g.source)).bg(row_bg)),
                 num(g.sessions.to_string(), TEXT, true),
                 num(g.messages.to_string(), TEXT, true),
                 num(format_tokens(g.tokens.input), GREEN, true),

@@ -2,9 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-
-use chrono::{DateTime, Utc};
 use crate::domain::record::{Record, TokenBreakdown};
+use chrono::{DateTime, Utc};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceError {
@@ -39,9 +38,17 @@ pub struct Registry {
     sources: BTreeMap<String, Box<dyn Source>>,
 }
 
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Registry {
     pub fn new() -> Self {
-        Self { sources: BTreeMap::new() }
+        Self {
+            sources: BTreeMap::new(),
+        }
     }
     pub fn register(&mut self, source: Box<dyn Source>) {
         self.sources.insert(source.name().to_string(), source);
@@ -232,11 +239,15 @@ mod claude {
     }
 
     impl Source for ClaudeSource {
-        fn name(&self) -> &str { "claude" }
+        fn name(&self) -> &str {
+            "claude"
+        }
 
         fn load(&self) -> Result<Vec<Record>, SourceError> {
             if !self.project_dir.exists() {
-                return Err(SourceError::Absent(self.project_dir.to_string_lossy().to_string()));
+                return Err(SourceError::Absent(
+                    self.project_dir.to_string_lossy().to_string(),
+                ));
             }
             let mut records = Vec::new();
             let entries = match self.project_dir.read_dir() {
@@ -297,7 +308,7 @@ mod claude {
                                 c.ephemeral_5m_input_tokens.unwrap_or(0)
                                     + c.ephemeral_1h_input_tokens.unwrap_or(0)
                             })
-                            .or_else(|| u.cache_creation_input_tokens)
+                            .or(u.cache_creation_input_tokens)
                             .unwrap_or(0);
                         let model = line
                             .message
@@ -367,8 +378,7 @@ mod opencode {
             if self.dbs.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut seen: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut records = Vec::new();
             for db_path in &self.dbs {
                 if !db_path.exists() {
@@ -386,7 +396,7 @@ mod opencode {
                             tokens_input, tokens_output, tokens_reasoning,
                             tokens_cache_read, tokens_cache_write,
                             time_created, time_updated
-                     FROM session"
+                     FROM session",
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -419,10 +429,19 @@ mod opencode {
                 };
                 for row in rows {
                     let (
-                        id, model_raw, agent, directory, _title,
-                        cost, tokens_input, tokens_output, tokens_reasoning,
-                        tokens_cache_read, tokens_cache_write,
-                        time_created, time_updated,
+                        id,
+                        model_raw,
+                        agent,
+                        directory,
+                        _title,
+                        cost,
+                        tokens_input,
+                        tokens_output,
+                        tokens_reasoning,
+                        tokens_cache_read,
+                        tokens_cache_write,
+                        time_created,
+                        time_updated,
                     ) = match row {
                         Ok(r) => r,
                         Err(e) => {
@@ -442,7 +461,7 @@ mod opencode {
                         session_id: id,
                         source: "opencode".to_string(),
                         project: directory,
-                                                model: normalize_model(&model_raw),
+                        model: normalize_model(&model_raw),
                         agent,
                         started_at,
                         ended_at,
@@ -486,6 +505,7 @@ mod omp {
     struct MessageInner {
         role: Option<String>,
         model: Option<String>,
+        #[allow(dead_code)]
         provider: Option<String>,
         usage: Option<Usage>,
     }
@@ -531,11 +551,15 @@ mod omp {
     }
 
     impl Source for OmpSource {
-        fn name(&self) -> &str { "omp" }
+        fn name(&self) -> &str {
+            "omp"
+        }
 
         fn load(&self) -> Result<Vec<Record>, SourceError> {
             if !self.sessions_dir.exists() {
-                return Err(SourceError::Absent(self.sessions_dir.to_string_lossy().to_string()));
+                return Err(SourceError::Absent(
+                    self.sessions_dir.to_string_lossy().to_string(),
+                ));
             }
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
             let mut records = Vec::new();
@@ -549,7 +573,7 @@ mod omp {
                         continue;
                     }
                 };
-                let mut project_dir = p.parent();
+                let project_dir = p.parent();
                 let decoded_project = project_dir
                     .and_then(|d| d.file_name())
                     .and_then(|n| n.to_str())
@@ -568,8 +592,8 @@ mod omp {
                         Some("session") => {
                             session_id = session_id.or(line.id);
                             session_cwd = session_cwd.or(line.cwd);
-                            session_started_at =
-                                session_started_at.or_else(|| line.timestamp.as_deref().and_then(parse_timestamp));
+                            session_started_at = session_started_at
+                                .or_else(|| line.timestamp.as_deref().and_then(parse_timestamp));
                         }
                         Some("message") => {
                             let m = match line.message {
@@ -607,7 +631,10 @@ mod omp {
                 if let Some(rec) = build_session_record(
                     "omp",
                     session_id.unwrap_or_else(|| {
-                        p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string()
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string()
                     }),
                     project,
                     session_started_at,
@@ -645,9 +672,14 @@ mod kilo {
         /// Count `message` rows per session. Message counts are a separate
         /// lookup because the `message` table may be absent from older schemas;
         /// a failure there degrades to a zero count instead of failing the source.
-        fn message_counts(conn: &Connection, db_path: &Path) -> std::collections::HashMap<String, u32> {
+        fn message_counts(
+            conn: &Connection,
+            db_path: &Path,
+        ) -> std::collections::HashMap<String, u32> {
             let mut counts = std::collections::HashMap::new();
-            let mut stmt = match conn.prepare("SELECT session_id, COUNT(*) FROM message GROUP BY session_id") {
+            let mut stmt = match conn
+                .prepare("SELECT session_id, COUNT(*) FROM message GROUP BY session_id")
+            {
                 Ok(stmt) => stmt,
                 Err(e) => {
                     eprintln!("warn: cannot count messages in {:?}: {}", db_path, e);
@@ -671,7 +703,9 @@ mod kilo {
     }
 
     impl Source for KiloSource {
-        fn name(&self) -> &str { "kilo" }
+        fn name(&self) -> &str {
+            "kilo"
+        }
 
         fn load(&self) -> Result<Vec<Record>, SourceError> {
             if self.dbs.is_empty() {
@@ -693,7 +727,7 @@ mod kilo {
                             tokens_input, tokens_output, tokens_reasoning,
                             tokens_cache_read, tokens_cache_write,
                             time_created, time_updated
-                     FROM session"
+                     FROM session",
                 ) {
                     Ok(s) => s,
                     Err(e) => return Err(SourceError::Unreadable(e.to_string())),
@@ -719,10 +753,18 @@ mod kilo {
                 };
                 for row in rows {
                     let (
-                        id, model_raw, agent, directory, cost,
-                        tokens_input, tokens_output, tokens_reasoning,
-                        tokens_cache_read, tokens_cache_write,
-                        time_created, time_updated,
+                        id,
+                        model_raw,
+                        agent,
+                        directory,
+                        cost,
+                        tokens_input,
+                        tokens_output,
+                        tokens_reasoning,
+                        tokens_cache_read,
+                        tokens_cache_write,
+                        time_created,
+                        time_updated,
                     ) = match row {
                         Ok(r) => r,
                         Err(e) => return Err(SourceError::Unreadable(e.to_string())),
@@ -768,8 +810,8 @@ pub use opencode::OpenCodeSource;
 mod tests {
     use super::*;
     use crate::domain::record::{Record, TokenBreakdown};
-    use chrono::Utc;
 
+    #[test]
     fn registry_absent_source_returns_ok_empty() {
         struct AbsentSource;
         impl Source for AbsentSource {
@@ -828,14 +870,8 @@ mod tests {
             ClaudeSource::decode_project_name("-home-hunter-projects-modbox"),
             "/home/hunter/projects/modbox"
         );
-        assert_eq!(
-            ClaudeSource::decode_project_name("-single"),
-            "/single"
-        );
-        assert_eq!(
-            ClaudeSource::decode_project_name("no-prefix"),
-            "no/prefix"
-        );
+        assert_eq!(ClaudeSource::decode_project_name("-single"), "/single");
+        assert_eq!(ClaudeSource::decode_project_name("no-prefix"), "no/prefix");
     }
 
     #[test]
@@ -880,7 +916,10 @@ mod tests {
         assert_eq!(r.source, "omp");
         // C3: started_at prefers the session line's timestamp, not the first message.
         assert_eq!(r.started_at.to_rfc3339(), "2026-08-28T12:00:00+00:00");
-        assert_eq!(r.ended_at.unwrap().to_rfc3339(), "2026-08-28T12:02:00+00:00");
+        assert_eq!(
+            r.ended_at.unwrap().to_rfc3339(),
+            "2026-08-28T12:02:00+00:00"
+        );
         assert_eq!(r.session_id, "01aaa");
         assert_eq!(r.project, "/home/hunter/projects/omp-test");
         // C2: raw model value, not a synthetic provider/model label.
@@ -1001,8 +1040,13 @@ mod tests {
                 r#"{"id":"auto","providerID":"freellm"}"#,
                 "code",
                 0.25f64,
-                1000i64, 500i64, 300i64, 200i64, 50i64,
-                1_700_000_000_000i64, 1_700_000_000_100i64,
+                1000i64,
+                500i64,
+                300i64,
+                200i64,
+                50i64,
+                1_700_000_000_000i64,
+                1_700_000_000_100i64,
             ],
         )
         .unwrap();
@@ -1036,10 +1080,7 @@ mod tests {
         );
         assert_eq!(r.message_count, 3);
         assert!((r.cost.unwrap() - 0.25).abs() < 1e-9);
-        assert_eq!(
-            r.started_at.to_rfc3339(),
-            "2023-11-14T22:13:20+00:00"
-        );
+        assert_eq!(r.started_at.to_rfc3339(), "2023-11-14T22:13:20+00:00");
         assert_eq!(
             r.ended_at.unwrap().to_rfc3339(),
             "2023-11-14T22:13:20.100+00:00"
@@ -1099,7 +1140,11 @@ mod tests {
         };
         let src = KiloSource::new(vec![mk("a.db"), mk("b.db")]);
         let records = src.load().unwrap();
-        assert_eq!(records.len(), 1, "duplicate session ids across DBs must collapse");
+        assert_eq!(
+            records.len(),
+            1,
+            "duplicate session ids across DBs must collapse"
+        );
     }
 
     #[test]

@@ -1,21 +1,21 @@
 //! Integration tests driven via the real `usage --json` CLI binary.
 //! This is the single testing seam from the spec.
 
+use chrono::Utc;
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use chrono::Utc;
 
 /// Path to the release binary.
 fn bin() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_BIN_EXE_llmhelper"));
-    p
+    PathBuf::from(env!("CARGO_BIN_EXE_llmhelper"))
 }
 
 /// Build the fixture directory path.
 fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
 }
 
 /// Run `llmhelper usage --json` with fixture paths and parse the output.
@@ -26,7 +26,11 @@ fn run_usage_json(extra_args: &[&str]) -> serde_json::Value {
         "--claude-dir",
         fixture_dir().join("claude").to_str().unwrap(),
         "--opencode-db",
-        fixture_dir().join("opencode").join("opencode.db").to_str().unwrap(),
+        fixture_dir()
+            .join("opencode")
+            .join("opencode.db")
+            .to_str()
+            .unwrap(),
         "--omp-dir",
         fixture_dir().join("omp").to_str().unwrap(),
         "--kilo-db",
@@ -53,7 +57,11 @@ fn run_sessions_json(extra_args: &[&str]) -> serde_json::Value {
         "--claude-dir",
         fixture_dir().join("claude").to_str().unwrap(),
         "--opencode-db",
-        fixture_dir().join("opencode").join("opencode.db").to_str().unwrap(),
+        fixture_dir()
+            .join("opencode")
+            .join("opencode.db")
+            .to_str()
+            .unwrap(),
         "--omp-dir",
         fixture_dir().join("omp").to_str().unwrap(),
         "--kilo-db",
@@ -77,7 +85,10 @@ fn run_sessions_json(extra_args: &[&str]) -> serde_json::Value {
 fn json_output_total_session_count() {
     let json = run_usage_json(&[]);
     let sources = json["sources"].as_array().unwrap();
-    let total_records: usize = sources.iter().map(|s| s["records"].as_u64().unwrap() as usize).sum();
+    let total_records: usize = sources
+        .iter()
+        .map(|s| s["records"].as_u64().unwrap() as usize)
+        .sum();
     // Claude: 2 sessions (session-a + session-b)
     // OpenCode: 2 sessions (ses_fix_001 + ses_fix_002)
     // OMP: 1 session (01fixomp)
@@ -90,7 +101,11 @@ fn json_output_claude_cost_is_null() {
     let json = run_usage_json(&["--source", "claude"]);
     let groups = json["groups"].as_array().unwrap();
     for g in groups {
-        assert_eq!(g["cost"], serde_json::Value::Null, "Claude cost must be null");
+        assert_eq!(
+            g["cost"],
+            serde_json::Value::Null,
+            "Claude cost must be null"
+        );
     }
 }
 
@@ -194,7 +209,10 @@ fn json_output_group_by_model() {
     let bp = groups.iter().find(|g| g["key"] == "big-pickle").unwrap();
     assert_eq!(bp["sessions"], 1);
     // The envelope's `id` is the grouping key, not the JSON blob.
-    let kilo_auto = groups.iter().find(|g| g["key"] == "kilo-auto/free").unwrap();
+    let kilo_auto = groups
+        .iter()
+        .find(|g| g["key"] == "kilo-auto/free")
+        .unwrap();
     assert_eq!(kilo_auto["sessions"], 1);
     assert_eq!(kilo_auto["source"], "kilo");
 }
@@ -204,14 +222,20 @@ fn json_output_last_filter() {
     // --last 1d should include recent fixture sessions
     let json = run_usage_json(&["--last", "1d"]);
     let sources = json["sources"].as_array().unwrap();
-    let total: usize = sources.iter().map(|s| s["records"].as_u64().unwrap() as usize).sum();
+    let total: usize = sources
+        .iter()
+        .map(|s| s["records"].as_u64().unwrap() as usize)
+        .sum();
     // Fixture timestamps may be in the past; just verify it runs.
     let _ = total;
 
     // --last 100y should include everything
     let json = run_usage_json(&["--last", "36500d"]);
     let sources = json["sources"].as_array().unwrap();
-    let total_all: usize = sources.iter().map(|s| s["records"].as_u64().unwrap() as usize).sum();
+    let total_all: usize = sources
+        .iter()
+        .map(|s| s["records"].as_u64().unwrap() as usize)
+        .sum();
     assert_eq!(total_all, 7);
 }
 
@@ -229,7 +253,11 @@ fn csv_output_header() {
         "--claude-dir",
         fixture_dir().join("claude").to_str().unwrap(),
         "--opencode-db",
-        fixture_dir().join("opencode").join("opencode.db").to_str().unwrap(),
+        fixture_dir()
+            .join("opencode")
+            .join("opencode.db")
+            .to_str()
+            .unwrap(),
     ]);
     let output = cmd.output().expect("failed to run llmhelper");
     assert!(output.status.success());
@@ -249,7 +277,11 @@ fn cli_rejects_invalid_last_duration() {
         "--claude-dir",
         fixture_dir().join("claude").to_str().unwrap(),
         "--opencode-db",
-        fixture_dir().join("opencode").join("opencode.db").to_str().unwrap(),
+        fixture_dir()
+            .join("opencode")
+            .join("opencode.db")
+            .to_str()
+            .unwrap(),
     ]);
     let output = cmd.output().expect("failed to run llmhelper");
     assert!(!output.status.success(), "--last 7x should fail");
@@ -268,7 +300,14 @@ fn cli_rejects_json_and_csv_together() {
 #[test]
 fn cli_rejects_since_and_last_together() {
     let mut cmd = Command::new(bin());
-    cmd.args(["usage", "--json", "--since", "2025-01-01T00:00:00Z", "--last", "7d"]);
+    cmd.args([
+        "usage",
+        "--json",
+        "--since",
+        "2025-01-01T00:00:00Z",
+        "--last",
+        "7d",
+    ]);
     let output = cmd.output().expect("failed to run llmhelper");
     assert!(!output.status.success());
 }
@@ -289,7 +328,7 @@ fn cli_rejects_unknown_source() {
 /// Windows use `--last {window}s --prev {window}s`.
 fn run_diff_json(
     fixture_base: &std::path::Path,
-    window: u64,      // seconds for --last / --prev
+    window: u64, // seconds for --last / --prev
     extra_args: &[&str],
 ) -> serde_json::Value {
     // Ensure all three source dirs exist (even if empty) so discover_sources
@@ -313,8 +352,10 @@ fn run_diff_json(
     cmd.arg("--prev").arg(&dur);
     cmd.arg("--claude-dir").arg(claude_dir.to_str().unwrap());
     cmd.arg("--omp-dir").arg(omp_dir.to_str().unwrap());
-    cmd.arg("--opencode-db").arg(opencode_dir.join("opencode.db").to_str().unwrap());
-    cmd.arg("--kilo-db").arg(kilo_dir.join("kilo.db").to_str().unwrap());
+    cmd.arg("--opencode-db")
+        .arg(opencode_dir.join("opencode.db").to_str().unwrap());
+    cmd.arg("--kilo-db")
+        .arg(kilo_dir.join("kilo.db").to_str().unwrap());
     for arg in extra_args {
         cmd.arg(arg);
     }
@@ -352,7 +393,14 @@ fn diff_curr_ts() -> String {
         .to_string()
 }
 
-fn make_session(base: &std::path::Path, project_dir: &str, file: &str, ts: &str, input: u64, output: u64) {
+fn make_session(
+    base: &std::path::Path,
+    project_dir: &str,
+    file: &str,
+    ts: &str,
+    input: u64,
+    output: u64,
+) {
     let proj_dir = base.join("claude").join(project_dir);
     fs::create_dir_all(&proj_dir).unwrap();
     let obj = serde_json::json!({
@@ -373,28 +421,70 @@ fn make_session(base: &std::path::Path, project_dir: &str, file: &str, ts: &str,
 fn build_growth_fixture(base: &std::path::Path) {
     let prev_ts = diff_prev_ts();
     let curr_ts = diff_curr_ts();
-    make_session(base, "-home-hunter-proj-growth", "session-prev.jsonl", &prev_ts, 100, 50);
-    make_session(base, "-home-hunter-proj-growth", "session-curr.jsonl", &curr_ts, 200, 100);
+    make_session(
+        base,
+        "-home-hunter-proj-growth",
+        "session-prev.jsonl",
+        &prev_ts,
+        100,
+        50,
+    );
+    make_session(
+        base,
+        "-home-hunter-proj-growth",
+        "session-curr.jsonl",
+        &curr_ts,
+        200,
+        100,
+    );
 }
 
 /// A pair of Claude sessions with a token shrink.
 fn build_shrink_fixture(base: &std::path::Path) {
     let prev_ts = diff_prev_ts();
     let curr_ts = diff_curr_ts();
-    make_session(base, "-home-hunter-proj-shrink", "session-prev.jsonl", &prev_ts, 200, 100);
-    make_session(base, "-home-hunter-proj-shrink", "session-curr.jsonl", &curr_ts, 100, 50);
+    make_session(
+        base,
+        "-home-hunter-proj-shrink",
+        "session-prev.jsonl",
+        &prev_ts,
+        200,
+        100,
+    );
+    make_session(
+        base,
+        "-home-hunter-proj-shrink",
+        "session-curr.jsonl",
+        &curr_ts,
+        100,
+        50,
+    );
 }
 
 /// One Claude session in the current window only.
 fn build_new_fixture(base: &std::path::Path) {
     let curr_ts = diff_curr_ts();
-    make_session(base, "-home-hunter-proj-new", "session-curr.jsonl", &curr_ts, 50, 25);
+    make_session(
+        base,
+        "-home-hunter-proj-new",
+        "session-curr.jsonl",
+        &curr_ts,
+        50,
+        25,
+    );
 }
 
 /// One Claude session in the previous window only.
 fn build_removed_fixture(base: &std::path::Path) {
     let prev_ts = diff_prev_ts();
-    make_session(base, "-home-hunter-proj-removed", "session-prev.jsonl", &prev_ts, 50, 25);
+    make_session(
+        base,
+        "-home-hunter-proj-removed",
+        "session-prev.jsonl",
+        &prev_ts,
+        50,
+        25,
+    );
 }
 
 #[test]
@@ -480,7 +570,10 @@ fn diff_json_pct_none_when_prev_zero() {
     let json = run_diff_json(dir.path(), DIFF_WINDOW_SECS, &["--group-by", "project"]);
     let rows = json["rows"].as_array().unwrap();
     assert_eq!(rows[0]["presence"], "new");
-    assert!(rows[0]["delta"]["pct"]["input"].is_null(), "pct must be null when prev is zero");
+    assert!(
+        rows[0]["delta"]["pct"]["input"].is_null(),
+        "pct must be null when prev is zero"
+    );
 }
 
 #[test]
@@ -525,9 +618,12 @@ fn diff_csv_output_header() {
     cmd.args(["diff", "--csv"]);
     cmd.arg("--last").arg(format!("{}s", DIFF_WINDOW_SECS));
     cmd.arg("--prev").arg(format!("{}s", DIFF_WINDOW_SECS));
-    cmd.arg("--claude-dir").arg(dir.path().join("claude").to_str().unwrap());
-    cmd.arg("--omp-dir").arg(dir.path().join("omp").to_str().unwrap());
-    cmd.arg("--opencode-db").arg(opencode_dir.join("opencode.db").to_str().unwrap());
+    cmd.arg("--claude-dir")
+        .arg(dir.path().join("claude").to_str().unwrap());
+    cmd.arg("--omp-dir")
+        .arg(dir.path().join("omp").to_str().unwrap());
+    cmd.arg("--opencode-db")
+        .arg(opencode_dir.join("opencode.db").to_str().unwrap());
     let output = cmd.output().expect("failed to run llmhelper diff");
     assert!(
         output.status.success(),
@@ -550,7 +646,8 @@ fn diff_cli_rejects_invalid_last() {
 
     let mut cmd = Command::new(bin());
     cmd.args(["diff", "--last", "7x", "--prev", "7d"]);
-    cmd.arg("--claude-dir").arg(dir.path().join("claude").to_str().unwrap());
+    cmd.arg("--claude-dir")
+        .arg(dir.path().join("claude").to_str().unwrap());
     let output = cmd.output().expect("failed to run llmhelper diff");
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -564,7 +661,8 @@ fn diff_cli_rejects_invalid_prev() {
 
     let mut cmd = Command::new(bin());
     cmd.args(["diff", "--last", "7d", "--prev", "7x"]);
-    cmd.arg("--claude-dir").arg(dir.path().join("claude").to_str().unwrap());
+    cmd.arg("--claude-dir")
+        .arg(dir.path().join("claude").to_str().unwrap());
     let output = cmd.output().expect("failed to run llmhelper diff");
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -578,7 +676,8 @@ fn diff_cli_rejects_missing_prev() {
 
     let mut cmd = Command::new(bin());
     cmd.args(["diff", "--last", "7d"]);
-    cmd.arg("--claude-dir").arg(dir.path().join("claude").to_str().unwrap());
+    cmd.arg("--claude-dir")
+        .arg(dir.path().join("claude").to_str().unwrap());
     let output = cmd.output().expect("failed to run llmhelper diff");
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -592,7 +691,8 @@ fn diff_cli_rejects_missing_last() {
 
     let mut cmd = Command::new(bin());
     cmd.args(["diff", "--prev", "7d"]);
-    cmd.arg("--claude-dir").arg(dir.path().join("claude").to_str().unwrap());
+    cmd.arg("--claude-dir")
+        .arg(dir.path().join("claude").to_str().unwrap());
     let output = cmd.output().expect("failed to run llmhelper diff");
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -606,7 +706,8 @@ fn diff_cli_rejects_json_and_csv() {
 
     let mut cmd = Command::new(bin());
     cmd.args(["diff", "--json", "--csv", "--last", "7d", "--prev", "7d"]);
-    cmd.arg("--claude-dir").arg(dir.path().join("claude").to_str().unwrap());
+    cmd.arg("--claude-dir")
+        .arg(dir.path().join("claude").to_str().unwrap());
     let output = cmd.output().expect("failed to run llmhelper diff");
     assert!(!output.status.success());
 }
@@ -655,7 +756,9 @@ fn sessions_json_project_filter() {
     let arr = run_sessions_json(&["--project", "test"]);
     let sessions = arr.as_array().unwrap();
     assert!(!sessions.is_empty());
-    assert!(sessions.iter().all(|s| s["project"].as_str().unwrap().contains("test")));
+    assert!(sessions
+        .iter()
+        .all(|s| s["project"].as_str().unwrap().contains("test")));
 }
 
 #[test]
@@ -669,7 +772,10 @@ fn sessions_json_limit_offset() {
 fn sessions_json_detail() {
     // Find a known session id from fixtures
     let arr = run_sessions_json(&[]);
-    let first_id = arr.as_array().unwrap()[0]["session_id"].as_str().unwrap().to_string();
+    let first_id = arr.as_array().unwrap()[0]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let detail = run_sessions_json(&["--detail", &first_id]);
     assert!(detail.is_object());
     assert_eq!(detail["session_id"].as_str().unwrap(), first_id);
@@ -683,7 +789,10 @@ fn sessions_json_detail() {
 fn sessions_json_sort_desc() {
     let arr = run_sessions_json(&[]);
     let sessions = arr.as_array().unwrap();
-    let times: Vec<_> = sessions.iter().map(|s| s["started_at"].as_str().unwrap()).collect();
+    let times: Vec<_> = sessions
+        .iter()
+        .map(|s| s["started_at"].as_str().unwrap())
+        .collect();
     let mut sorted = times.clone();
     sorted.sort_by(|a, b| b.cmp(a));
     assert_eq!(times, sorted);

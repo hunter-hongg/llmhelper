@@ -1,11 +1,10 @@
-use ratatui::{
-    backend::CrosstermBackend,
-    widgets::TableState,
-};
+use ratatui::{backend::CrosstermBackend, widgets::TableState};
 use std::io;
 
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 
 use crate::aggregator::AggregateResult;
 use crate::domain::group::GroupBy;
@@ -107,7 +106,12 @@ impl TuiState {
         let Some(selected) = self.table_state.selected() else {
             return;
         };
-        let Some(group) = self.app.result.as_ref().and_then(|r| r.groups.get(selected)) else {
+        let Some(group) = self
+            .app
+            .result
+            .as_ref()
+            .and_then(|r| r.groups.get(selected))
+        else {
             return;
         };
         let records = records_for_group(&self.app.records, self.app.group_by, &group.key);
@@ -131,32 +135,68 @@ impl TuiState {
 
     pub fn select_next(&mut self) {
         let (selected, count) = if self.app.view == View::Detail {
-            (self.detail_state.selected(), self.app.detail.as_ref().map(|d| d.records.len()).unwrap_or(0))
+            (
+                self.detail_state.selected(),
+                self.app
+                    .detail
+                    .as_ref()
+                    .map(|d| d.records.len())
+                    .unwrap_or(0),
+            )
         } else {
-            (self.table_state.selected(), self.app.result.as_ref().map(|r| r.groups.len()).unwrap_or(0))
+            (
+                self.table_state.selected(),
+                self.app
+                    .result
+                    .as_ref()
+                    .map(|r| r.groups.len())
+                    .unwrap_or(0),
+            )
         };
         if count > 0 {
             let next = match selected {
                 Some(i) => std::cmp::min(i + 1, count - 1),
                 None => 0,
             };
-            let state = if self.app.view == View::Detail { &mut self.detail_state } else { &mut self.table_state };
+            let state = if self.app.view == View::Detail {
+                &mut self.detail_state
+            } else {
+                &mut self.table_state
+            };
             state.select(Some(next));
         }
     }
 
     pub fn select_previous(&mut self) {
         let (selected, count) = if self.app.view == View::Detail {
-            (self.detail_state.selected(), self.app.detail.as_ref().map(|d| d.records.len()).unwrap_or(0))
+            (
+                self.detail_state.selected(),
+                self.app
+                    .detail
+                    .as_ref()
+                    .map(|d| d.records.len())
+                    .unwrap_or(0),
+            )
         } else {
-            (self.table_state.selected(), self.app.result.as_ref().map(|r| r.groups.len()).unwrap_or(0))
+            (
+                self.table_state.selected(),
+                self.app
+                    .result
+                    .as_ref()
+                    .map(|r| r.groups.len())
+                    .unwrap_or(0),
+            )
         };
         if count > 0 {
             let previous = match selected {
                 Some(i) => std::cmp::max(i.saturating_sub(1), 0),
                 None => 0,
             };
-            let state = if self.app.view == View::Detail { &mut self.detail_state } else { &mut self.table_state };
+            let state = if self.app.view == View::Detail {
+                &mut self.detail_state
+            } else {
+                &mut self.table_state
+            };
             state.select(Some(previous));
         }
     }
@@ -170,7 +210,12 @@ impl TuiState {
     }
 
     fn sync_group_selection(&mut self) {
-        let count = self.app.result.as_ref().map(|r| r.groups.len()).unwrap_or(0);
+        let count = self
+            .app
+            .result
+            .as_ref()
+            .map(|r| r.groups.len())
+            .unwrap_or(0);
         if count == 0 {
             self.table_state.select(None);
             return;
@@ -180,7 +225,12 @@ impl TuiState {
     }
 
     fn sync_detail_selection(&mut self, selected: usize) {
-        let count = self.app.detail.as_ref().map(|d| d.records.len()).unwrap_or(0);
+        let count = self
+            .app
+            .detail
+            .as_ref()
+            .map(|d| d.records.len())
+            .unwrap_or(0);
         if count == 0 {
             self.detail_state.select(None);
             return;
@@ -271,7 +321,11 @@ mod tests {
         assert_eq!(detail.group_by, GroupBy::Source);
         assert_eq!(detail.key, "claude");
         assert_eq!(
-            detail.records.iter().map(|r| r.session_id.as_str()).collect::<Vec<_>>(),
+            detail
+                .records
+                .iter()
+                .map(|r| r.session_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["new", "old"]
         );
         assert_eq!(state.detail_state.selected(), Some(0));
@@ -330,7 +384,14 @@ mod tests {
         let now = Utc::now();
         let records = vec![
             record("oc", "opencode", "/p", "auto", now, Some(0.1)),
-            record("claude", "claude", "/p", "auto", now - Duration::hours(1), None),
+            record(
+                "claude",
+                "claude",
+                "/p",
+                "auto",
+                now - Duration::hours(1),
+                None,
+            ),
         ];
         let mut state = load_state(&records, GroupBy::Model);
         state.table_state.select(Some(0));

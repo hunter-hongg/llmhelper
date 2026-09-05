@@ -45,10 +45,22 @@ impl Config {
             }
         };
         Self {
-            claude_dir: parsed.source.as_ref().and_then(|s| s.claude.as_ref().and_then(|c| c.dir.clone())),
-            opencode_dbs: parsed.source.as_ref().and_then(|s| s.opencode.as_ref().and_then(|o| o.db.clone())),
-            omp_dir: parsed.source.as_ref().and_then(|s| s.omp.as_ref().and_then(|o| o.dir.clone())),
-            kilo_dbs: parsed.source.as_ref().and_then(|s| s.kilo.as_ref().and_then(|k| k.db.clone())),
+            claude_dir: parsed
+                .source
+                .as_ref()
+                .and_then(|s| s.claude.as_ref().and_then(|c| c.dir.clone())),
+            opencode_dbs: parsed
+                .source
+                .as_ref()
+                .and_then(|s| s.opencode.as_ref().and_then(|o| o.db.clone())),
+            omp_dir: parsed
+                .source
+                .as_ref()
+                .and_then(|s| s.omp.as_ref().and_then(|o| o.dir.clone())),
+            kilo_dbs: parsed
+                .source
+                .as_ref()
+                .and_then(|s| s.kilo.as_ref().and_then(|k| k.db.clone())),
             refresh_interval_seconds: parsed
                 .ui
                 .and_then(|u| u.refresh_interval_seconds)
@@ -116,7 +128,9 @@ mod tests {
     fn config_loads_from_file() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path, r#"
+        std::fs::write(
+            &config_path,
+            r#"
 [source.claude]
 dir = "/custom/claude"
 
@@ -131,28 +145,52 @@ db = ["/custom/kilo/kilo.db"]
 
 [ui]
 refresh_interval_seconds = 10
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         // Test the parser directly rather than relying on dirs crate behavior
         let content = std::fs::read_to_string(&config_path).unwrap();
         let parsed: ConfigTable = toml::from_str(&content).unwrap();
-            assert_eq!(
-                parsed.source.as_ref().and_then(|s| s.claude.as_ref().and_then(|c| c.dir.clone())).as_deref(),
-                Some(std::path::Path::new("/custom/claude"))
-            );
         assert_eq!(
-            parsed.source.as_ref().and_then(|s| s.opencode.as_ref().and_then(|o| o.db.clone())).unwrap().len(),
+            parsed
+                .source
+                .as_ref()
+                .and_then(|s| s.claude.as_ref().and_then(|c| c.dir.clone()))
+                .as_deref(),
+            Some(std::path::Path::new("/custom/claude"))
+        );
+        assert_eq!(
+            parsed
+                .source
+                .as_ref()
+                .and_then(|s| s.opencode.as_ref().and_then(|o| o.db.clone()))
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
-            parsed.source.as_ref().and_then(|s| s.omp.as_ref().and_then(|o| o.dir.clone())).as_deref(),
+            parsed
+                .source
+                .as_ref()
+                .and_then(|s| s.omp.as_ref().and_then(|o| o.dir.clone()))
+                .as_deref(),
             Some(std::path::Path::new("/custom/omp/sessions"))
         );
         assert_eq!(
-            parsed.source.as_ref().and_then(|s| s.kilo.as_ref().and_then(|k| k.db.clone())).unwrap().len(),
+            parsed
+                .source
+                .as_ref()
+                .and_then(|s| s.kilo.as_ref().and_then(|k| k.db.clone()))
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
-            parsed.ui.as_ref().and_then(|u| u.refresh_interval_seconds).unwrap(),
+            parsed
+                .ui
+                .as_ref()
+                .and_then(|u| u.refresh_interval_seconds)
+                .unwrap(),
             10
         );
     }

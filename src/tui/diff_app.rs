@@ -1,17 +1,14 @@
-use ratatui::{
-    backend::CrosstermBackend,
-    widgets::TableState,
-};
+use ratatui::{backend::CrosstermBackend, widgets::TableState};
 
-use std::io;
 use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use std::io;
 
 use crate::aggregator::AggregateResult;
-use crate::domain::group::GroupBy;
 use crate::diff::DiffRow;
+use crate::domain::group::GroupBy;
 use crate::source::SourceStatus;
 
 use chrono::{DateTime, Duration, Utc};
@@ -79,17 +76,29 @@ impl DiffApp {
     }
 
     pub fn prev_total_sessions(&self) -> usize {
-        self.prev_agg.as_ref().map(|a| a.grand_sessions).unwrap_or(0)
+        self.prev_agg
+            .as_ref()
+            .map(|a| a.grand_sessions)
+            .unwrap_or(0)
     }
 
     pub fn curr_total_sessions(&self) -> usize {
-        self.curr_agg.as_ref().map(|a| a.grand_sessions).unwrap_or(0)
+        self.curr_agg
+            .as_ref()
+            .map(|a| a.grand_sessions)
+            .unwrap_or(0)
     }
 }
 
 pub struct DiffTuiState {
     pub app: DiffApp,
     pub table_state: TableState,
+}
+
+impl Default for DiffTuiState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DiffTuiState {

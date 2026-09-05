@@ -74,7 +74,11 @@ impl AggregateResult {
             .into_iter()
             .map(|(key, e)| Group {
                 key,
-                source: if e.mixed_source { "mixed".to_string() } else { e.source },
+                source: if e.mixed_source {
+                    "mixed".to_string()
+                } else {
+                    e.source
+                },
                 sessions: e.sessions,
                 messages: e.messages,
                 tokens: e.tokens,

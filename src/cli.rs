@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
 use chrono::{DateTime, Utc};
+use clap::{Parser, ValueEnum};
 
 /// Main CLI entry point.
 #[derive(Parser, Debug)]
@@ -128,7 +128,9 @@ impl UsageArgs {
             Some(s) => s,
             None => return Ok(None),
         };
-        parse_duration(s).map_err(|e| anyhow::anyhow!("invalid --last {}", e)).map(Some)
+        parse_duration(s)
+            .map_err(|e| anyhow::anyhow!("invalid --last {}", e))
+            .map(Some)
     }
 
     /// Validate mutually-exclusive flag combinations.
@@ -144,29 +146,29 @@ impl UsageArgs {
 }
 
 /// Parse a duration string in `Nd`, `Nh`, `Nm`, or `Ns` form (e.g. `7d`, `24h`, `30m`, `86400s`).
+fn parse_numeric_prefix(s: &str, suffix: char) -> anyhow::Result<u64> {
+    let Some(rest) = s.strip_suffix(suffix) else {
+        anyhow::bail!("invalid duration '{}': missing suffix {}", s, suffix);
+    };
+    rest.parse()
+        .map_err(|e| anyhow::anyhow!("invalid duration '{}': {}", s, e))
+}
+
 pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
     if s.ends_with('d') {
-        let n: u64 = s[..s.len() - 1]
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid duration '{}': {}", s, e))?;
+        let n = parse_numeric_prefix(s, 'd')?;
         return Ok(Duration::from_secs(n * 24 * 3600));
     }
     if s.ends_with('h') {
-        let n: u64 = s[..s.len() - 1]
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid duration '{}': {}", s, e))?;
+        let n = parse_numeric_prefix(s, 'h')?;
         return Ok(Duration::from_secs(n * 3600));
     }
     if s.ends_with('m') {
-        let n: u64 = s[..s.len() - 1]
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid duration '{}': {}", s, e))?;
+        let n = parse_numeric_prefix(s, 'm')?;
         return Ok(Duration::from_secs(n * 60));
     }
     if s.ends_with('s') {
-        let n: u64 = s[..s.len() - 1]
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid duration '{}': {}", s, e))?;
+        let n = parse_numeric_prefix(s, 's')?;
         return Ok(Duration::from_secs(n));
     }
     Err(anyhow::anyhow!(
@@ -315,7 +317,9 @@ impl SessionsArgs {
             Some(s) => s,
             None => return Ok(None),
         };
-        parse_duration(s).map_err(|e| anyhow::anyhow!("invalid --last {}", e)).map(Some)
+        parse_duration(s)
+            .map_err(|e| anyhow::anyhow!("invalid --last {}", e))
+            .map(Some)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
