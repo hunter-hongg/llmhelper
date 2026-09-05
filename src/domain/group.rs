@@ -1,14 +1,9 @@
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub enum GroupBy {
+    #[default]
     Source,
     Project,
     Model,
-}
-
-impl Default for GroupBy {
-    fn default() -> Self {
-        Self::Source
-    }
 }
 
 impl GroupBy {

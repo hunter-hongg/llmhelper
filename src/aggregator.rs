@@ -29,15 +29,16 @@ pub struct AggregateResult {
 impl AggregateResult {
     /// Build an aggregate from raw records, a filter, and a grouping dimension.
     pub fn from_records(records: &[Record], filter: &Filter, group_by: GroupBy) -> Self {
-        let filtered: Vec<&Record> = filter.apply(records);
+        let filtered = filter.apply(records);
+        Self::from_filtered_refs(&filtered, group_by)
+    }
+
+    /// Build an aggregate from an already-filtered record slice.
+    pub fn from_filtered_refs(records: &[&Record], group_by: GroupBy) -> Self {
         let mut groups: BTreeMap<String, GroupEntry> = BTreeMap::new();
 
-        for r in &filtered {
-            let key = match group_by {
-                GroupBy::Source => r.source.clone(),
-                GroupBy::Project => r.project.clone(),
-                GroupBy::Model => r.model.clone(),
-            };
+        for r in records {
+            let key = r.key_for(group_by);
             let entry = groups.entry(key).or_insert_with(|| GroupEntry {
                 source: r.source.clone(),
                 mixed_source: false,
@@ -81,9 +82,9 @@ impl AggregateResult {
             })
             .collect();
 
-        let grand_tokens = TokenBreakdown::sum(&filtered);
-        let grand_messages: usize = filtered.iter().map(|r| r.message_count as usize).sum();
-        let grand_sessions = filtered.len();
+        let grand_tokens = TokenBreakdown::sum(records);
+        let grand_messages: usize = records.iter().map(|r| r.message_count as usize).sum();
+        let grand_sessions = records.len();
 
         Self {
             grand_totals: grand_tokens,

@@ -1,10 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub claude_dir: Option<PathBuf>,
     pub opencode_dbs: Option<Vec<PathBuf>>,
     pub omp_dir: Option<PathBuf>,
+    pub kilo_dbs: Option<Vec<PathBuf>>,
     pub refresh_interval_seconds: u64,
 }
 
@@ -14,6 +15,7 @@ impl Default for Config {
             claude_dir: None,
             opencode_dbs: None,
             omp_dir: None,
+            kilo_dbs: None,
             refresh_interval_seconds: 5,
         }
     }
@@ -46,6 +48,7 @@ impl Config {
             claude_dir: parsed.source.as_ref().and_then(|s| s.claude.as_ref().and_then(|c| c.dir.clone())),
             opencode_dbs: parsed.source.as_ref().and_then(|s| s.opencode.as_ref().and_then(|o| o.db.clone())),
             omp_dir: parsed.source.as_ref().and_then(|s| s.omp.as_ref().and_then(|o| o.dir.clone())),
+            kilo_dbs: parsed.source.as_ref().and_then(|s| s.kilo.as_ref().and_then(|k| k.db.clone())),
             refresh_interval_seconds: parsed
                 .ui
                 .and_then(|u| u.refresh_interval_seconds)
@@ -59,6 +62,7 @@ impl Config {
             claude_dir: cli.claude_dir.clone().or(self.claude_dir),
             opencode_dbs: cli.opencode_db.clone().or(self.opencode_dbs),
             omp_dir: cli.omp_dir.clone().or(self.omp_dir),
+            kilo_dbs: cli.kilo_db.clone().or(self.kilo_dbs),
             refresh_interval_seconds: self.refresh_interval_seconds,
         }
     }
@@ -75,6 +79,7 @@ struct SourceConfig {
     claude: Option<ClaudeSourceConfig>,
     opencode: Option<OpenCodeSourceConfig>,
     omp: Option<OmpSourceConfig>,
+    kilo: Option<KiloSourceConfig>,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -90,6 +95,11 @@ struct OpenCodeSourceConfig {
 #[derive(serde::Deserialize, Debug, Default)]
 struct OmpSourceConfig {
     dir: Option<PathBuf>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct KiloSourceConfig {
+    db: Option<Vec<PathBuf>>,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -116,23 +126,30 @@ db = ["/custom/opencode.db"]
 [source.omp]
 dir = "/custom/omp/sessions"
 
+[source.kilo]
+db = ["/custom/kilo/kilo.db"]
+
 [ui]
 refresh_interval_seconds = 10
 "#).unwrap();
         // Test the parser directly rather than relying on dirs crate behavior
         let content = std::fs::read_to_string(&config_path).unwrap();
         let parsed: ConfigTable = toml::from_str(&content).unwrap();
-        assert_eq!(
-            parsed.source.as_ref().and_then(|s| s.claude.as_ref().and_then(|c| c.dir.clone())).as_deref(),
-            Some(Path::new("/custom/claude"))
-        );
+            assert_eq!(
+                parsed.source.as_ref().and_then(|s| s.claude.as_ref().and_then(|c| c.dir.clone())).as_deref(),
+                Some(std::path::Path::new("/custom/claude"))
+            );
         assert_eq!(
             parsed.source.as_ref().and_then(|s| s.opencode.as_ref().and_then(|o| o.db.clone())).unwrap().len(),
             1
         );
         assert_eq!(
             parsed.source.as_ref().and_then(|s| s.omp.as_ref().and_then(|o| o.dir.clone())).as_deref(),
-            Some(Path::new("/custom/omp/sessions"))
+            Some(std::path::Path::new("/custom/omp/sessions"))
+        );
+        assert_eq!(
+            parsed.source.as_ref().and_then(|s| s.kilo.as_ref().and_then(|k| k.db.clone())).unwrap().len(),
+            1
         );
         assert_eq!(
             parsed.ui.as_ref().and_then(|u| u.refresh_interval_seconds).unwrap(),

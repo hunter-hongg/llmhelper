@@ -9,7 +9,7 @@ The token consumption and activity of a single agent session, broken into input,
 _Avoid_: stats, metrics, usage-data
 
 **Source**:
-One of the agent tools whose local files the CLI reads. The three known sources are Claude Code (transcript JSONL), OpenCode (SQLite), and OMP (per-session JSONL under `~/.omp/agent/sessions`). Each source has a distinct storage format and field coverage. Sources are auto-discovered at default paths and may be overridden by flags or a config file; reading all OpenCode DB variants and merging them is part of Source behavior.
+One of the agent tools whose local files the CLI reads. The four known sources are Claude Code (transcript JSONL), OpenCode (SQLite), OMP (per-session JSONL under `~/.omp/agent/sessions`), and Kilo Code (SQLite `kilo.db` under `~/.local/share/kilo`). Each source has a distinct storage format and field coverage. Sources are auto-discovered at default paths and may be overridden by flags or a config file; reading all OpenCode DB variants and merging them is part of Source behavior.
 _Avoid_: provider, backend, agent
 
 **Project**:

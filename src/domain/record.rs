@@ -1,5 +1,7 @@
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::domain::group::GroupBy;
 
 /// Five-part token accounting for a single Session.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -26,6 +28,25 @@ impl TokenBreakdown {
             acc.add(&r.tokens);
         }
         acc
+    }
+}
+
+impl Record {
+    /// The value that places this Session in the given grouping dimension.
+    pub fn key_for(&self, group_by: GroupBy) -> String {
+        match group_by {
+            GroupBy::Source => self.source.clone(),
+            GroupBy::Project => self.project.clone(),
+            GroupBy::Model => self.model.clone(),
+        }
+    }
+
+    pub fn matches_group(&self, group_by: GroupBy, key: &str) -> bool {
+        match group_by {
+            GroupBy::Source => self.source == key,
+            GroupBy::Project => self.project == key,
+            GroupBy::Model => self.model == key,
+        }
     }
 }
 

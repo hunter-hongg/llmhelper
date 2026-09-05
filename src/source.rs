@@ -83,6 +83,19 @@ fn parse_timestamp(ts: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+/// Extract the recorded model id from a JSON model envelope.
+/// OpenCode and Kilo Code both store `model` as `{"id":"auto","providerID":"freellm"}`
+/// rather than a plain string; the `id` is the value the tool recorded, so it is
+/// the grouping key. Non-envelope values are passed through raw.
+fn normalize_model(raw: &str) -> String {
+    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+            return id.to_string();
+        }
+    }
+    raw.to_string()
+}
+
 /// Recursively collect every `*.jsonl` file under `dir`. OMP nests subagent
 /// sessions one directory level deeper than the project directory.
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -340,14 +353,6 @@ mod opencode {
         pub fn new(dbs: Vec<PathBuf>) -> Self {
             Self { dbs }
         }
-        fn normalize_model(raw: &str) -> String {
-            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(raw) {
-                if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
-                    return id.to_string();
-                }
-            }
-            raw.to_string()
-        }
         fn ms_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
             Utc.timestamp_millis_opt(ms).single()
         }
@@ -437,7 +442,7 @@ mod opencode {
                         session_id: id,
                         source: "opencode".to_string(),
                         project: directory,
-                        model: Self::normalize_model(&model_raw),
+                                                model: normalize_model(&model_raw),
                         agent,
                         started_at,
                         ended_at,
@@ -617,7 +622,145 @@ mod omp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Kilo Code adapter
+// ---------------------------------------------------------------------------
+mod kilo {
+    use super::*;
+    use crate::domain::record::TokenBreakdown;
+    use chrono::{DateTime, TimeZone, Utc};
+    use rusqlite::Connection;
+
+    pub struct KiloSource {
+        dbs: Vec<PathBuf>,
+    }
+
+    impl KiloSource {
+        pub fn new(dbs: Vec<PathBuf>) -> Self {
+            Self { dbs }
+        }
+        fn ms_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
+            Utc.timestamp_millis_opt(ms).single()
+        }
+        /// Count `message` rows per session. Message counts are a separate
+        /// lookup because the `message` table may be absent from older schemas;
+        /// a failure there degrades to a zero count instead of failing the source.
+        fn message_counts(conn: &Connection, db_path: &Path) -> std::collections::HashMap<String, u32> {
+            let mut counts = std::collections::HashMap::new();
+            let mut stmt = match conn.prepare("SELECT session_id, COUNT(*) FROM message GROUP BY session_id") {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    eprintln!("warn: cannot count messages in {:?}: {}", db_path, e);
+                    return counts;
+                }
+            };
+            let rows = match stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            }) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    eprintln!("warn: cannot count messages in {:?}: {}", db_path, e);
+                    return counts;
+                }
+            };
+            for pair in rows.flatten() {
+                counts.insert(pair.0, pair.1);
+            }
+            counts
+        }
+    }
+
+    impl Source for KiloSource {
+        fn name(&self) -> &str { "kilo" }
+
+        fn load(&self) -> Result<Vec<Record>, SourceError> {
+            if self.dbs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut records = Vec::new();
+            for db_path in &self.dbs {
+                if !db_path.exists() {
+                    return Err(SourceError::Absent(db_path.to_string_lossy().to_string()));
+                }
+                let conn = match Connection::open(db_path) {
+                    Ok(c) => c,
+                    Err(e) => return Err(SourceError::Unreadable(e.to_string())),
+                };
+                let message_counts = Self::message_counts(&conn, db_path);
+                let mut stmt = match conn.prepare(
+                    "SELECT id, model, agent, directory, cost,
+                            tokens_input, tokens_output, tokens_reasoning,
+                            tokens_cache_read, tokens_cache_write,
+                            time_created, time_updated
+                     FROM session"
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return Err(SourceError::Unreadable(e.to_string())),
+                };
+                let rows = match stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, f64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                    ))
+                }) {
+                    Ok(r) => r,
+                    Err(e) => return Err(SourceError::Unreadable(e.to_string())),
+                };
+                for row in rows {
+                    let (
+                        id, model_raw, agent, directory, cost,
+                        tokens_input, tokens_output, tokens_reasoning,
+                        tokens_cache_read, tokens_cache_write,
+                        time_created, time_updated,
+                    ) = match row {
+                        Ok(r) => r,
+                        Err(e) => return Err(SourceError::Unreadable(e.to_string())),
+                    };
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    let started_at = match Self::ms_to_datetime(time_created) {
+                        Some(t) => t,
+                        None => continue, // skip rows with invalid timestamps
+                    };
+                    let message_count = message_counts.get(&id).copied().unwrap_or(0);
+                    records.push(Record {
+                        session_id: id,
+                        source: "kilo".to_string(),
+                        project: directory,
+                        model: normalize_model(&model_raw),
+                        agent,
+                        started_at,
+                        ended_at: Self::ms_to_datetime(time_updated),
+                        tokens: TokenBreakdown {
+                            input: tokens_input as u64,
+                            output: (tokens_output + tokens_reasoning) as u64,
+                            cache_read: tokens_cache_read as u64,
+                            cache_write: tokens_cache_write as u64,
+                        },
+                        message_count,
+                        cost: Some(cost),
+                    });
+                }
+            }
+            Ok(records)
+        }
+    }
+}
+
 pub use claude::ClaudeSource;
+pub use kilo::KiloSource;
 pub use omp::OmpSource;
 pub use opencode::OpenCodeSource;
 
@@ -810,5 +953,165 @@ mod tests {
         use super::omp::OmpSource;
         let src = OmpSource::new(PathBuf::from("/nonexistent-omp-12345"));
         assert!(matches!(src.load(), Err(SourceError::Absent(_))));
+    }
+
+    /// Open a temp file with a minimal Kilo Code schema (`session` + `message`).
+    fn open_kilo_db(path: &Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                 id text PRIMARY KEY,
+                 project_id text NOT NULL,
+                 directory text NOT NULL,
+                 cost real DEFAULT 0 NOT NULL,
+                 tokens_input integer DEFAULT 0 NOT NULL,
+                 tokens_output integer DEFAULT 0 NOT NULL,
+                 tokens_reasoning integer DEFAULT 0 NOT NULL,
+                 tokens_cache_read integer DEFAULT 0 NOT NULL,
+                 tokens_cache_write integer DEFAULT 0 NOT NULL,
+                 agent text,
+                 model text,
+                 time_created integer NOT NULL,
+                 time_updated integer NOT NULL);
+             CREATE TABLE message (
+                 id text PRIMARY KEY,
+                 session_id text NOT NULL,
+                 time_created integer NOT NULL,
+                 data text NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn kilo_loads_sessions_from_sqlite() {
+        use super::kilo::KiloSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("kilo.db");
+        let conn = open_kilo_db(&db);
+        conn.execute(
+            "INSERT INTO session (id, project_id, directory, model, agent, cost,
+                    tokens_input, tokens_output, tokens_reasoning,
+                    tokens_cache_read, tokens_cache_write, time_created, time_updated)
+             VALUES (?1, 'p1', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                "ses_fix_001",
+                "/home/hunter/repos/test",
+                // Real Kilo Code stores the model as a JSON envelope.
+                r#"{"id":"auto","providerID":"freellm"}"#,
+                "code",
+                0.25f64,
+                1000i64, 500i64, 300i64, 200i64, 50i64,
+                1_700_000_000_000i64, 1_700_000_000_100i64,
+            ],
+        )
+        .unwrap();
+        for n in 0..3 {
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created) VALUES (?1, 'ses_fix_001', ?2)",
+                rusqlite::params![format!("m{}", n), 1_700_000_000_000i64 + n],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let src = KiloSource::new(vec![db]);
+        let records = src.load().unwrap();
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r.source, "kilo");
+        assert_eq!(r.session_id, "ses_fix_001");
+        assert_eq!(r.project, "/home/hunter/repos/test");
+        // The envelope's `id` is the recorded model, not the whole JSON blob.
+        assert_eq!(r.model, "auto");
+        assert_eq!(r.agent.as_deref(), Some("code"));
+        assert_eq!(
+            r.tokens,
+            TokenBreakdown {
+                input: 1000,
+                output: 800, // 500 + 300 reasoning, folded in on load
+                cache_read: 200,
+                cache_write: 50,
+            }
+        );
+        assert_eq!(r.message_count, 3);
+        assert!((r.cost.unwrap() - 0.25).abs() < 1e-9);
+        assert_eq!(
+            r.started_at.to_rfc3339(),
+            "2023-11-14T22:13:20+00:00"
+        );
+        assert_eq!(
+            r.ended_at.unwrap().to_rfc3339(),
+            "2023-11-14T22:13:20.100+00:00"
+        );
+    }
+
+    #[test]
+    fn kilo_missing_message_table_counts_zero() {
+        use super::kilo::KiloSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("kilo.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                 id text PRIMARY KEY, project_id text NOT NULL, directory text NOT NULL,
+                 cost real DEFAULT 0 NOT NULL,
+                 tokens_input integer DEFAULT 0 NOT NULL, tokens_output integer DEFAULT 0 NOT NULL,
+                 tokens_reasoning integer DEFAULT 0 NOT NULL,
+                 tokens_cache_read integer DEFAULT 0 NOT NULL,
+                 tokens_cache_write integer DEFAULT 0 NOT NULL,
+                 agent text, model text,
+                 time_created integer NOT NULL, time_updated integer NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, directory, model, time_created, time_updated, tokens_input)
+             VALUES ('ses_x', 'p', '/p', 'raw-model', 1700000000000, 1700000000100, 7)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let src = KiloSource::new(vec![db]);
+        let records = src.load().unwrap();
+        assert_eq!(records.len(), 1);
+        // No `message` table: message_count degrades to zero, model passes through raw.
+        assert_eq!(records[0].message_count, 0);
+        assert_eq!(records[0].model, "raw-model");
+        assert_eq!(records[0].tokens.input, 7);
+    }
+
+    #[test]
+    fn kilo_dedupes_session_ids_across_dbs() {
+        use super::kilo::KiloSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str| {
+            let p = tmp.path().join(name);
+            let c = open_kilo_db(&p);
+            c.execute(
+                "INSERT INTO session (id, project_id, directory, model, time_created, time_updated)
+                 VALUES ('ses_dup', 'p', '/p', 'auto', 1700000000000, 1700000000100)",
+                [],
+            )
+            .unwrap();
+            drop(c);
+            p
+        };
+        let src = KiloSource::new(vec![mk("a.db"), mk("b.db")]);
+        let records = src.load().unwrap();
+        assert_eq!(records.len(), 1, "duplicate session ids across DBs must collapse");
+    }
+
+    #[test]
+    fn kilo_absent_db_errors() {
+        use super::kilo::KiloSource;
+        let src = KiloSource::new(vec![PathBuf::from("/nonexistent-kilo-12345/kilo.db")]);
+        assert!(matches!(src.load(), Err(SourceError::Absent(_))));
+    }
+
+    #[test]
+    fn kilo_no_dbs_returns_empty() {
+        use super::kilo::KiloSource;
+        assert!(KiloSource::new(vec![]).load().unwrap().is_empty());
     }
 }

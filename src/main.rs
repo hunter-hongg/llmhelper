@@ -10,18 +10,36 @@ use llmhelper::aggregator::AggregateResult;
 use llmhelper::cli::{Cli, Command, UsageArgs, DiffArgs, SessionsArgs};
 use llmhelper::config::Config;
 use llmhelper::domain::group::GroupBy;
+use llmhelper::domain::record::Record;
 use llmhelper::diff::compute_diff;
 use llmhelper::filter::Filter;
 use llmhelper::output::{
     OutputRenderer, render_diff_json, render_diff_csv, format_tokens,
 };
 use llmhelper::source::{ClaudeSource, KiloSource, OpenCodeSource, OmpSource, Registry, SourceStatus};
-use llmhelper::tui::{TerminalApp, DiffTuiApp};
+use llmhelper::tui::{TerminalApp, DiffTuiApp, SessionsTuiApp};
 
 /// Shared state between background refresh task and TUI main loop.
 struct TuiData {
+    records: Vec<Record>,
     result: Option<AggregateResult>,
     source_statuses: Vec<SourceStatus>,
+}
+
+fn load_usage_data(
+    registry: &Registry,
+    filter: &Filter,
+    group_by: GroupBy,
+) -> TuiData {
+    let (records, statuses) = registry.load_all();
+    let filtered: Vec<Record> = filter.apply(&records).into_iter().cloned().collect();
+    let filtered_refs: Vec<&Record> = filtered.iter().collect();
+    let agg = AggregateResult::from_filtered_refs(&filtered_refs, group_by);
+    TuiData {
+        records: filtered,
+        result: Some(agg),
+        source_statuses: statuses,
+    }
 }
 
 fn discover_sources(config: &Config) -> Registry {
@@ -132,16 +150,7 @@ fn run_tui(
         let mut tick = interval(Duration::from_secs(refresh_secs));
         loop {
             tick.tick().await;
-            let (records, statuses) = reg_for_task.load_all();
-            let agg = AggregateResult::from_records(
-                &records,
-                &filter_clone,
-                group_by_clone.lock().clone(),
-            );
-            let data = TuiData {
-                result: Some(agg),
-                source_statuses: statuses,
-            };
+            let data = load_usage_data(&reg_for_task, &filter_clone, *group_by_clone.lock());
             // Bounded channel(1): drop stale data if TUI is busy
             let _ = tx.send(data).await;
         }
@@ -149,20 +158,17 @@ fn run_tui(
 
     let mut tui = TerminalApp::new()?;
     tui.state.app.running = true;
-    tui.state.app.group_by = group_by.lock().clone();
+    tui.state.app.group_by = *group_by.lock();
 
     // Initial load
-    let (records, statuses) = reg_arc.load_all();
-    let agg = AggregateResult::from_records(&records, &filter, tui.state.app.group_by.clone());
-    tui.state.app.result = Some(agg);
-    tui.state.app.source_statuses = statuses;
+    let initial = load_usage_data(&reg_arc, &filter, tui.state.app.group_by);
+    tui.state.apply_data(initial.records, initial.result, initial.source_statuses);
 
     // Main loop: poll channel each frame for background updates
     while tui.state.app.running {
         // Check for background refresh data
         if let Ok(data) = rx.try_recv() {
-            tui.state.app.result = data.result;
-            tui.state.app.source_statuses = data.source_statuses;
+            tui.state.apply_data(data.records, data.result, data.source_statuses);
         }
 
         tui.terminal.draw(|frame| {
@@ -172,30 +178,32 @@ fn run_tui(
         if crossterm::event::poll(std::time::Duration::from_millis(200))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 match key.code {
-                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
+                    crossterm::event::KeyCode::Char('q') => {
                         tui.state.app.running = false;
                     }
+                    crossterm::event::KeyCode::Esc => {
+                        if tui.state.app.view == llmhelper::tui::View::Detail {
+                            tui.state.close_detail();
+                        } else {
+                            tui.state.app.running = false;
+                        }
+                    }
+                    crossterm::event::KeyCode::Enter => {
+                        if tui.state.app.view == llmhelper::tui::View::Groups {
+                            tui.state.open_detail();
+                        }
+                    }
                     crossterm::event::KeyCode::Char('r') => {
-                        let (records, statuses) = reg_arc.load_all();
-                        let agg = AggregateResult::from_records(
-                            &records,
-                            &filter,
-                            group_by.lock().clone(),
-                        );
-                        tui.state.app.result = Some(agg);
-                        tui.state.app.source_statuses = statuses;
+                        let data =
+                            load_usage_data(&reg_arc, &filter, *group_by.lock());
+                        tui.state.apply_data(data.records, data.result, data.source_statuses);
                     }
                     crossterm::event::KeyCode::Tab => {
-                        tui.state.app.cycle_group();
-                        *group_by.lock() = tui.state.app.group_by.clone();
-                        let (records, statuses) = reg_arc.load_all();
-                        let agg = AggregateResult::from_records(
-                            &records,
-                            &filter,
-                            tui.state.app.group_by.clone(),
-                        );
-                        tui.state.app.result = Some(agg);
-                        tui.state.app.source_statuses = statuses;
+                        tui.state.cycle_group();
+                        *group_by.lock() = tui.state.app.group_by;
+                        let data =
+                            load_usage_data(&reg_arc, &filter, tui.state.app.group_by);
+                        tui.state.apply_data(data.records, data.result, data.source_statuses);
                     }
                     crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
                         tui.state.select_next();
@@ -232,8 +240,8 @@ fn load_window_data(
 ) -> DiffTuiData {
     let loaded_at = chrono::Utc::now();
     let (records, statuses) = registry.load_all();
-    let prev_agg = AggregateResult::from_records(&records, prev_filter, group_by.clone());
-    let curr_agg = AggregateResult::from_records(&records, curr_filter, group_by.clone());
+    let prev_agg = AggregateResult::from_records(&records, prev_filter, *group_by);
+    let curr_agg = AggregateResult::from_records(&records, curr_filter, *group_by);
     let rows = compute_diff(&prev_agg, &curr_agg);
     DiffTuiData {
         prev_agg: Some(prev_agg),
@@ -331,7 +339,7 @@ fn run_diff_tui(
 
     let mut tui = DiffTuiApp::new()?;
     tui.state.app.running = true;
-    tui.state.app.group_by = group_by.lock().clone();
+    tui.state.app.group_by = *group_by.lock();
     tui.state.app.last_duration = Some(to_chrono(last_duration));
     tui.state.app.prev_duration = Some(to_chrono(prev_duration));
 
@@ -365,7 +373,7 @@ fn run_diff_tui(
                     crossterm::event::KeyCode::Char('r') | crossterm::event::KeyCode::Tab => {
                         if key.code == crossterm::event::KeyCode::Tab {
                             tui.state.app.cycle_group();
-                            *group_by.lock() = tui.state.app.group_by.clone();
+                            *group_by.lock() = tui.state.app.group_by;
                         }
                         let now = chrono::Utc::now();
                         let (prev_filter, curr_filter) =
@@ -395,20 +403,27 @@ fn run_diff_tui(
 
 fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
     args.validate()?;
-    let config = config_from_sessions_args(Config::load(), &args);
+    if args.detail.is_some() || args.json || args.csv {
+        run_sessions_non_tui(&args)
+    } else {
+        let config = config_from_sessions_args(Config::load(), &args);
+        let registry = discover_sources(&config);
+        let filter = build_filter_sessions(&args)?;
+        run_sessions_tui(registry, filter, config.refresh_interval_seconds)
+    }
+}
+
+fn run_sessions_non_tui(args: &SessionsArgs) -> anyhow::Result<()> {
+    let config = config_from_sessions_args(Config::load(), args);
     let registry = discover_sources(&config);
-    let filter = build_filter_sessions(&args)?;
+    let filter = build_filter_sessions(args)?;
     let (records, source_statuses) = registry.load_all();
     for status in &source_statuses {
         if let Some(err) = &status.error {
             eprintln!("warn: source {} error: {}", status.name, err);
         }
     }
-
-    // Filter
     let mut records: Vec<llmhelper::domain::record::Record> = filter.apply(&records).into_iter().cloned().collect();
-
-    // Detail mode: find before sorting/pagination
     if let Some(id) = args.detail.clone() {
         let rec = records.iter().find(|r| r.session_id == id).cloned().ok_or_else(|| anyhow::anyhow!("session id not found"))?;
         if args.json {
@@ -442,21 +457,14 @@ fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
             println!("ended_at: {:?}", rec.ended_at);
             println!("message_count: {}", rec.message_count);
             println!("tokens: input={}, output={}, cache_read={}, cache_write={}", rec.tokens.input, rec.tokens.output, rec.tokens.cache_read, rec.tokens.cache_write);
-            if let Some(cost) = rec.cost {
-                println!("cost: {:.6}", cost);
-            }
+            if let Some(cost) = rec.cost { println!("cost: {:.6}", cost); }
         }
         return Ok(());
     }
-
-    // Sort by started_at desc
     records.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-
-    // Pagination
     let offset = args.offset.unwrap_or(0);
     let limit = args.limit.unwrap_or(usize::MAX);
     let paginated: Vec<_> = records.into_iter().skip(offset).take(limit).collect();
-
     if args.json {
         let mut buf = Vec::new();
         serde_json::to_writer_pretty(&mut buf, &paginated)?;
@@ -507,6 +515,69 @@ fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_sessions_tui(registry: Registry, filter: Filter, refresh_secs: u64) -> anyhow::Result<()> {
+    let rt = Runtime::new()?;
+    let (tx, mut rx) = mpsc::channel::<(Vec<llmhelper::domain::record::Record>, Vec<SourceStatus>)>(1);
+    let reg_arc = Arc::new(registry);
+    let reg_for_task = reg_arc.clone();
+    let filter_clone = filter.clone();
+    rt.spawn(async move {
+        use tokio::time::{interval, Duration};
+        let mut tick = interval(Duration::from_secs(refresh_secs.max(1)));
+        loop {
+            tick.tick().await;
+            let (records, statuses) = reg_for_task.load_all();
+            let filtered: Vec<_> = filter_clone.apply(&records).into_iter().cloned().collect();
+            let mut sorted = filtered;
+            sorted.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+            let _ = tx.send((sorted, statuses)).await;
+        }
+    });
+    let mut tui = SessionsTuiApp::new()?;
+    tui.state.app.running = true;
+    let (records, statuses) = reg_arc.load_all();
+    let filtered: Vec<_> = filter.apply(&records).into_iter().cloned().collect();
+    let mut sorted = filtered;
+    sorted.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    tui.state.app.records = sorted;
+    tui.state.app.source_statuses = statuses;
+    while tui.state.app.running {
+        if let Ok((records, statuses)) = rx.try_recv() {
+            tui.state.app.records = records;
+            tui.state.app.source_statuses = statuses;
+        }
+        tui.terminal.draw(|frame| {
+            llmhelper::tui::sessions_render::render(frame, &mut tui.state);
+        })?;
+        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                match key.code {
+                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
+                        tui.state.app.running = false;
+                    }
+                    crossterm::event::KeyCode::Char('r') => {
+                        let (records, statuses) = reg_arc.load_all();
+                        let filtered: Vec<_> = filter.apply(&records).into_iter().cloned().collect();
+                        let mut sorted = filtered;
+                        sorted.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+                        tui.state.app.records = sorted;
+                        tui.state.app.source_statuses = statuses;
+                    }
+                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                        tui.state.select_next();
+                    }
+                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                        tui.state.select_previous();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    tui.exit()?;
+    Ok(())
+}
+
 fn run_usage(args: UsageArgs) -> anyhow::Result<()> {
     args.validate()?;
     let group_by: GroupBy = args.group_by.clone().into();
@@ -515,7 +586,7 @@ fn run_usage(args: UsageArgs) -> anyhow::Result<()> {
     let filter = build_filter(&args)?;
 
     let (records, source_statuses) = registry.load_all();
-    let agg = AggregateResult::from_records(&records, &filter, group_by.clone());
+    let agg = AggregateResult::from_records(&records, &filter, group_by);
 
     let renderer = OutputRenderer;
     if args.json {
@@ -551,8 +622,8 @@ fn run_diff(args: DiffArgs) -> anyhow::Result<()> {
 
     let (records, source_statuses) = registry.load_all();
 
-    let prev_agg = AggregateResult::from_records(&records, &prev_filter, group_by.clone());
-    let curr_agg = AggregateResult::from_records(&records, &curr_filter, group_by.clone());
+    let prev_agg = AggregateResult::from_records(&records, &prev_filter, group_by);
+    let curr_agg = AggregateResult::from_records(&records, &curr_filter, group_by);
 
     let rows = compute_diff(&prev_agg, &curr_agg);
 

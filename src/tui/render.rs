@@ -7,32 +7,33 @@ use ratatui::{
 };
 
 use crate::source::SourceStatus;
-use super::app::TuiState;
+use super::app::{App, TuiState, View};
 
 // ---------------------------------------------------------------------------
 // Palette — a calm dark theme so the data, not the chrome, draws the eye.
 // ---------------------------------------------------------------------------
-const BG: Color = Color::Rgb(15, 17, 23); // app background
-const SURFACE: Color = Color::Rgb(20, 23, 33); // raised panels / zebra stripe
-const HILITE: Color = Color::Rgb(38, 52, 74); // selected row
-const BORDER: Color = Color::Rgb(42, 47, 58); // panel borders
-const TITLE: Color = Color::Rgb(139, 149, 168); // block titles
-const TEXT: Color = Color::Rgb(201, 209, 217); // primary text
-const MUTED: Color = Color::Rgb(110, 118, 129); // secondary text
-const ACCENT: Color = Color::Rgb(86, 212, 221); // cyan — primary accent
-const ACCENT2: Color = Color::Rgb(199, 146, 234); // purple — grouping accent
-const GREEN: Color = Color::Rgb(126, 231, 135);
-const BLUE: Color = Color::Rgb(121, 192, 255);
-const YELLOW: Color = Color::Rgb(227, 179, 65);
-const RED: Color = Color::Rgb(255, 123, 114);
+pub(crate) const BG: Color = Color::Rgb(15, 17, 23); // app background
+pub(crate) const SURFACE: Color = Color::Rgb(20, 23, 33); // raised panels / zebra stripe
+pub(crate) const HILITE: Color = Color::Rgb(38, 52, 74); // selected row
+pub(crate) const BORDER: Color = Color::Rgb(42, 47, 58); // panel borders
+pub(crate) const TITLE: Color = Color::Rgb(139, 149, 168); // block titles
+pub(crate) const TEXT: Color = Color::Rgb(201, 209, 217); // primary text
+pub(crate) const MUTED: Color = Color::Rgb(110, 118, 129); // secondary text
+pub(crate) const ACCENT: Color = Color::Rgb(86, 212, 221); // cyan — primary accent
+pub(crate) const ACCENT2: Color = Color::Rgb(199, 146, 234); // purple — grouping accent
+pub(crate) const GREEN: Color = Color::Rgb(126, 231, 135);
+pub(crate) const BLUE: Color = Color::Rgb(121, 192, 255);
+pub(crate) const YELLOW: Color = Color::Rgb(227, 179, 65);
+pub(crate) const RED: Color = Color::Rgb(255, 123, 114);
 
 /// Per-source brand color used across the sources panel and the table's
 /// `Source` column so a group's origin is identifiable at a glance.
-fn source_color(name: &str) -> Color {
+pub(crate) fn source_color(name: &str) -> Color {
     match name {
         "claude" => Color::Rgb(255, 138, 76),
         "opencode" => BLUE,
         "omp" => GREEN,
+        "kilo" => YELLOW,
         "mixed" => MUTED,
         _ => MUTED,
     }
@@ -96,18 +97,26 @@ pub fn render(frame: &mut Frame, state: &mut TuiState) {
 
     frame.render_widget(render_header(state), chunks[0]);
     frame.render_widget(render_sources(&state.app.source_statuses), chunks[1]);
-    frame.render_widget(render_table(state), chunks[2]);
-    frame.render_widget(render_footer(), chunks[3]);
+    let table = match state.app.view {
+        View::Detail => render_detail_table(state),
+        View::Groups => render_table(state),
+    };
+    frame.render_stateful_widget(table, chunks[2], state.table_state_mut());
+    frame.render_widget(render_footer(&state.app), chunks[3]);
 }
 
 fn panel(block_title: &'static str) -> Block<'static> {
+    panel_with_title(format!(" {} ", block_title))
+}
+
+fn panel_with_title(title: String) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(BORDER))
         .style(Style::default().bg(BG))
         .title(Line::from(Span::styled(
-            format!(" {} ", block_title),
+            title,
             Style::default().fg(TITLE),
         )))
 }
@@ -190,13 +199,160 @@ fn render_sources(statuses: &[SourceStatus]) -> Paragraph<'_> {
     Paragraph::new(Line::from(spans)).block(panel("sources"))
 }
 
-fn render_footer() -> Paragraph<'static> {
-    let keys: &[(&str, &str)] = &[
-        ("Tab", "group"),
-        ("↑↓", "select"),
-        ("r", "refresh"),
-        ("q", "quit"),
+fn render_detail_table(state: &TuiState) -> Table<'static> {
+    let detail = match &state.app.detail {
+        Some(d) => d,
+        None => {
+            return Table::new(
+                vec![Row::new(vec![Cell::from(" No detail data. ")]).style(
+                    Style::default().fg(MUTED).bg(BG),
+                )],
+                vec![Constraint::Min(20)],
+            )
+            .header(Row::new(vec![Cell::from("")]))
+            .block(panel("detail"));
+        }
+    };
+
+    let block = panel_with_title(format!(
+        " {} ({} sessions) ",
+        detail.key,
+        detail.records.len()
+    ));
+    let headers = [
+        "Session", "Source", "Project", "Model", "Started", "Ended", "Messages", "Input",
+        "Output", "Cache R", "Cache W", "Cost",
     ];
+    let col_fg = [
+        ACCENT, ACCENT2, TEXT, TEXT, MUTED, MUTED, YELLOW, GREEN, BLUE, ACCENT, YELLOW, RED,
+    ];
+    let col_right = [
+        false, false, false, false, false, false, true, true, true, true, true, true,
+    ];
+    let header_cells: Vec<Cell> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let style = Style::default()
+                .fg(col_fg[i])
+                .add_modifier(Modifier::BOLD)
+                .bg(SURFACE);
+            let mut cell = Cell::new(*h).style(style);
+            if col_right[i] {
+                cell = Cell::from(Text::from(*h).alignment(Alignment::Right)).style(style);
+            }
+            cell
+        })
+        .collect();
+    let header_row = Row::new(header_cells).height(1);
+
+    let col_widths = [
+        Constraint::Min(18),
+        Constraint::Min(8),
+        Constraint::Min(18),
+        Constraint::Min(12),
+        Constraint::Min(14),
+        Constraint::Min(14),
+        Constraint::Min(8),
+        Constraint::Min(6),
+        Constraint::Min(6),
+        Constraint::Min(8),
+        Constraint::Min(8),
+        Constraint::Min(6),
+    ];
+
+    let selected = state.detail_state.selected();
+    let rows: Vec<Row> = detail
+        .records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let is_sel = Some(i) == selected;
+            let row_bg = if is_sel {
+                HILITE
+            } else if i % 2 == 1 {
+                SURFACE
+            } else {
+                BG
+            };
+            let style = |fg: Color| Style::default().fg(fg).bg(row_bg);
+            let ended = r
+                .ended_at
+                .map(|e| e.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let cost = r
+                .cost
+                .map(|c| format!("{:.4}", c))
+                .unwrap_or_else(|| "-".to_string());
+
+            let cells: Vec<Cell> = vec![
+                Cell::new(format!(
+                    "{} {}",
+                    if is_sel { "▶" } else { " " },
+                    r.session_id
+                )).style(
+                    Style::default()
+                        .fg(ACCENT)
+                        .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })
+                        .bg(row_bg),
+                ),
+                Cell::new(r.source.clone()).style(style(source_color(&r.source))),
+                Cell::new(r.project.chars().take(20).collect::<String>()).style(style(TEXT)),
+                Cell::new(r.model.chars().take(14).collect::<String>()).style(style(TEXT)),
+                Cell::new(r.started_at.format("%Y-%m-%d %H:%M").to_string()).style(style(MUTED)),
+                Cell::new(ended).style(style(MUTED)),
+                Cell::from(
+                    Text::from(r.message_count.to_string()).alignment(Alignment::Right),
+                )
+                .style(style(YELLOW)),
+                Cell::from(
+                    Text::from(format_tokens(r.tokens.input)).alignment(Alignment::Right),
+                )
+                .style(style(GREEN)),
+                Cell::from(
+                    Text::from(format_tokens(r.tokens.output)).alignment(Alignment::Right),
+                )
+                .style(style(BLUE)),
+                Cell::from(
+                    Text::from(cache_cell(&r.source, r.tokens.cache_read))
+                        .alignment(Alignment::Right),
+                )
+                .style(style(ACCENT)),
+                Cell::from(
+                    Text::from(cache_cell(&r.source, r.tokens.cache_write))
+                        .alignment(Alignment::Right),
+                )
+                .style(style(YELLOW)),
+                Cell::from(Text::from(cost).alignment(Alignment::Right)).style(style(RED)),
+            ];
+
+            Row::new(cells).height(1)
+        })
+        .collect();
+
+    Table::new(rows, col_widths)
+        .header(header_row)
+        .block(block)
+        .style(Style::default().bg(BG))
+}
+
+fn render_footer(app: &App) -> Paragraph<'_> {
+    let keys: &[(&str, &str)] = if app.view == View::Detail {
+        &[
+            ("↑↓", "select"),
+            ("r", "refresh"),
+            ("Esc", "back"),
+            ("q", "quit"),
+        ]
+    } else {
+        &[
+            ("Tab", "group"),
+            ("↑↓", "select"),
+            ("Enter", "detail"),
+            ("r", "refresh"),
+            ("q", "quit"),
+        ]
+    };
     let mut spans = Vec::new();
     for (k, label) in keys {
         spans.push(Span::styled(
