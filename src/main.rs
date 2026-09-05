@@ -7,7 +7,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use llmhelper::aggregator::AggregateResult;
 
-use llmhelper::cli::{Cli, Command, UsageArgs, DiffArgs};
+use llmhelper::cli::{Cli, Command, UsageArgs, DiffArgs, SessionsArgs};
 use llmhelper::config::Config;
 use llmhelper::domain::group::GroupBy;
 use llmhelper::diff::compute_diff;
@@ -15,13 +15,36 @@ use llmhelper::filter::Filter;
 use llmhelper::output::{
     OutputRenderer, render_diff_json, render_diff_csv,
 };
-use llmhelper::source::{ClaudeSource, OpenCodeSource, OmpSource, Registry, SourceStatus};
+use llmhelper::source::{ClaudeSource, KiloSource, OpenCodeSource, OmpSource, Registry, SourceStatus};
 use llmhelper::tui::{TerminalApp, DiffTuiApp};
 
 /// Shared state between background refresh task and TUI main loop.
 struct TuiData {
     result: Option<AggregateResult>,
     source_statuses: Vec<SourceStatus>,
+}
+
+fn format_tokens(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let (value, suffix) = if n < 1_000_000 {
+        (n as f64 / 1_000.0, "K")
+    } else if n < 1_000_000_000 {
+        (n as f64 / 1_000_000.0, "M")
+    } else {
+        (n as f64 / 1_000_000_000.0, "B")
+    };
+    let text = format!("{:.1}", value);
+    let text = text.strip_suffix(".0").unwrap_or(&text);
+    if text == "1000" {
+        return match suffix {
+            "K" => "1M".to_string(),
+            "M" => "1B".to_string(),
+            _ => "1000B".to_string(),
+        };
+    }
+    format!("{}{}", text, suffix)
 }
 
 fn discover_sources(config: &Config) -> Registry {
@@ -56,6 +79,18 @@ fn discover_sources(config: &Config) -> Registry {
                 .unwrap_or_default()
         });
     reg.register(Box::new(OmpSource::new(omp_dir)));
+    let kilo_db = config
+        .kilo_dbs
+        .clone()
+        .unwrap_or_else(|| {
+            vec![
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("kilo")
+                    .join("kilo.db"),
+            ]
+        });
+    reg.register(Box::new(KiloSource::new(kilo_db)));
     reg
 }
 
@@ -69,6 +104,28 @@ fn build_filter(args: &UsageArgs) -> anyhow::Result<Filter> {
         model: args.model.clone(),
         source: args.source.as_ref().map(|s| s.to_string()),
     })
+}
+
+fn build_filter_sessions(args: &SessionsArgs) -> anyhow::Result<Filter> {
+    let last = args.parse_last()?;
+    Ok(Filter {
+        since: args.since,
+        last,
+        until: None,
+        project: args.project.clone(),
+        model: args.model.clone(),
+        source: args.source.as_ref().map(|s| s.to_string()),
+    })
+}
+
+fn config_from_sessions_args(config: Config, args: &SessionsArgs) -> Config {
+    Config {
+        claude_dir: args.claude_dir.clone().or(config.claude_dir),
+        opencode_dbs: args.opencode_db.clone().or(config.opencode_dbs),
+        omp_dir: args.omp_dir.clone().or(config.omp_dir),
+        kilo_dbs: args.kilo_db.clone().or(config.kilo_dbs),
+        refresh_interval_seconds: config.refresh_interval_seconds,
+    }
 }
 
 fn run_tui(
@@ -183,20 +240,92 @@ struct DiffTuiData {
     curr_agg: Option<AggregateResult>,
     rows: Vec<llmhelper::diff::DiffRow>,
     source_statuses: Vec<SourceStatus>,
+    /// The `now` the window filters were built against. The header must be
+    /// derived from this instant — re-reading the clock after a background load
+    /// would describe a different window than the one that was actually filtered.
+    loaded_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Load all sources, aggregate both windows, and compute the diff rows.
+fn load_window_data(
+    registry: &Registry,
+    prev_filter: &Filter,
+    curr_filter: &Filter,
+    group_by: &GroupBy,
+) -> DiffTuiData {
+    let loaded_at = chrono::Utc::now();
+    let (records, statuses) = registry.load_all();
+    let prev_agg = AggregateResult::from_records(&records, prev_filter, group_by.clone());
+    let curr_agg = AggregateResult::from_records(&records, curr_filter, group_by.clone());
+    let rows = compute_diff(&prev_agg, &curr_agg);
+    DiffTuiData {
+        prev_agg: Some(prev_agg),
+        curr_agg: Some(curr_agg),
+        rows,
+        source_statuses: statuses,
+        loaded_at,
+    }
+}
+
+/// Merge freshly loaded window data into the app state and resync the header
+/// timestamps with the filters that produced it.
+fn apply_window_data(app: &mut llmhelper::tui::diff_app::DiffApp, data: DiffTuiData) {
+    app.prev_agg = data.prev_agg;
+    app.curr_agg = data.curr_agg;
+    app.rows = data.rows;
+    app.source_statuses = data.source_statuses;
+    app.refresh_windows(data.loaded_at);
+}
+
+/// Convert a CLI-parsed duration to `chrono::Duration` without dropping
+/// sub-second precision. `parse_duration` only accepts whole `Nd/Nh/Nm/Ns`, but
+/// the conversion must not silently truncate either.
+fn to_chrono(d: std::time::Duration) -> chrono::Duration {
+    chrono::Duration::milliseconds(d.as_millis() as i64)
+}
+
+/// Build the prev/curr filters for a fresh `now`: prev = [now-last-prev,
+/// now-last], curr = [now-last, now]. The non-temporal filters (project /
+/// model / source) are carried over from the CLI args.
+fn window_filters(
+    now: chrono::DateTime<chrono::Utc>,
+    last_duration: std::time::Duration,
+    prev_duration: std::time::Duration,
+    args: &DiffArgs,
+) -> (Filter, Filter) {
+    let prev_until = now - last_duration;
+    let curr_since = prev_until - prev_duration;
+    let non_temporal = |since: chrono::DateTime<chrono::Utc>,
+                        until: chrono::DateTime<chrono::Utc>|
+     -> Filter {
+        Filter {
+            since: Some(since),
+            until: Some(until),
+            project: args.project.clone(),
+            model: args.model.clone(),
+            source: args.source.as_ref().map(|s| s.to_string()),
+            ..Default::default()
+        }
+    };
+    (
+        non_temporal(curr_since, prev_until),
+        non_temporal(prev_until, now),
+    )
 }
 
 fn run_diff_tui(
     registry: Registry,
-    prev_filter: Filter,
-    curr_filter: Filter,
+    args: &DiffArgs,
     group_by: GroupBy,
-    window_prev_start: chrono::DateTime<chrono::Utc>,
-    window_prev_end: chrono::DateTime<chrono::Utc>,
-    window_curr_end: chrono::DateTime<chrono::Utc>,
+    last_duration: std::time::Duration,
+    prev_duration: std::time::Duration,
     refresh_secs: u64,
 ) -> anyhow::Result<()> {
     let rt = Runtime::new()?;
 
+    // The window *boundaries* slide with `now` on every refresh, so filters
+    // are rebuilt at each load from the fixed durations instead of being
+    // captured once at startup.
     let group_by = Arc::new(Mutex::new(group_by));
     let group_by_clone = group_by.clone();
 
@@ -204,24 +333,21 @@ fn run_diff_tui(
 
     let reg_arc = Arc::new(registry);
     let reg_for_task = reg_arc.clone();
-    let prev_filter_clone = prev_filter.clone();
-    let curr_filter_clone = curr_filter.clone();
+    let args_clone = args.clone();
     rt.spawn(async move {
         use tokio::time::{interval, Duration};
         let mut tick = interval(Duration::from_secs(refresh_secs));
         loop {
             tick.tick().await;
-            let (records, statuses) = reg_for_task.load_all();
-            let gb = group_by_clone.lock().clone();
-            let prev_agg = AggregateResult::from_records(&records, &prev_filter_clone, gb.clone());
-            let curr_agg = AggregateResult::from_records(&records, &curr_filter_clone, gb);
-            let rows = compute_diff(&prev_agg, &curr_agg);
-            let data = DiffTuiData {
-                prev_agg: Some(prev_agg),
-                curr_agg: Some(curr_agg),
-                rows,
-                source_statuses: statuses,
-            };
+            let now = chrono::Utc::now();
+            let (prev_filter, curr_filter) =
+                window_filters(now, last_duration, prev_duration, &args_clone);
+            let data = load_window_data(
+                &reg_for_task,
+                &prev_filter,
+                &curr_filter,
+                &group_by_clone.lock(),
+            );
             let _ = tx.send(data).await;
         }
     });
@@ -229,29 +355,24 @@ fn run_diff_tui(
     let mut tui = DiffTuiApp::new()?;
     tui.state.app.running = true;
     tui.state.app.group_by = group_by.lock().clone();
-    tui.state.app.window_prev_start = Some(window_prev_start);
-    tui.state.app.window_prev_end = Some(window_prev_end);
-    tui.state.app.window_curr_start = Some(window_prev_end);
-    tui.state.app.window_curr_end = Some(window_curr_end);
+    tui.state.app.last_duration = Some(to_chrono(last_duration));
+    tui.state.app.prev_duration = Some(to_chrono(prev_duration));
 
-    let (records, statuses) = reg_arc.load_all();
-    let gb = group_by.lock().clone();
-    let prev_agg = AggregateResult::from_records(&records, &prev_filter, gb.clone());
-    let curr_agg = AggregateResult::from_records(&records, &curr_filter, gb);
-    let rows = compute_diff(&prev_agg, &curr_agg);
-    tui.state.app.prev_agg = Some(prev_agg);
-    tui.state.app.curr_agg = Some(curr_agg);
-    tui.state.app.rows = rows;
-    tui.state.app.source_statuses = statuses;
+    let now = chrono::Utc::now();
+    let (prev_filter, curr_filter) = window_filters(now, last_duration, prev_duration, args);
+    let data = load_window_data(
+        &reg_arc,
+        &prev_filter,
+        &curr_filter,
+        &tui.state.app.group_by,
+    );
+    apply_window_data(&mut tui.state.app, data);
 
     let reg_arc_read = reg_arc;
 
     while tui.state.app.running {
         if let Ok(data) = rx.try_recv() {
-            tui.state.app.prev_agg = data.prev_agg;
-            tui.state.app.curr_agg = data.curr_agg;
-            tui.state.app.rows = data.rows;
-            tui.state.app.source_statuses = data.source_statuses;
+            apply_window_data(&mut tui.state.app, data);
         }
 
         tui.terminal.draw(|frame| {
@@ -264,29 +385,21 @@ fn run_diff_tui(
                     crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
                         tui.state.app.running = false;
                     }
-                    crossterm::event::KeyCode::Char('r') => {
-                        let gb = group_by.lock().clone();
-                        let (records, statuses) = reg_arc_read.load_all();
-                        let prev_agg = AggregateResult::from_records(&records, &prev_filter, gb.clone());
-                        let curr_agg = AggregateResult::from_records(&records, &curr_filter, gb);
-                        let rows = compute_diff(&prev_agg, &curr_agg);
-                        tui.state.app.prev_agg = Some(prev_agg);
-                        tui.state.app.curr_agg = Some(curr_agg);
-                        tui.state.app.rows = rows;
-                        tui.state.app.source_statuses = statuses;
-                    }
-                    crossterm::event::KeyCode::Tab => {
-                        tui.state.app.cycle_group();
-                        *group_by.lock() = tui.state.app.group_by.clone();
-                        let gb = tui.state.app.group_by.clone();
-                        let (records, statuses) = reg_arc_read.load_all();
-                        let prev_agg = AggregateResult::from_records(&records, &prev_filter, gb.clone());
-                        let curr_agg = AggregateResult::from_records(&records, &curr_filter, gb);
-                        let rows = compute_diff(&prev_agg, &curr_agg);
-                        tui.state.app.prev_agg = Some(prev_agg);
-                        tui.state.app.curr_agg = Some(curr_agg);
-                        tui.state.app.rows = rows;
-                        tui.state.app.source_statuses = statuses;
+                    crossterm::event::KeyCode::Char('r') | crossterm::event::KeyCode::Tab => {
+                        if key.code == crossterm::event::KeyCode::Tab {
+                            tui.state.app.cycle_group();
+                            *group_by.lock() = tui.state.app.group_by.clone();
+                        }
+                        let now = chrono::Utc::now();
+                        let (prev_filter, curr_filter) =
+                            window_filters(now, last_duration, prev_duration, args);
+                        let data = load_window_data(
+                            &reg_arc_read,
+                            &prev_filter,
+                            &curr_filter,
+                            &tui.state.app.group_by,
+                        );
+                        apply_window_data(&mut tui.state.app, data);
                     }
                     crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
                         tui.state.select_next();
@@ -300,6 +413,115 @@ fn run_diff_tui(
         }
     }
     tui.exit()?;
+    Ok(())
+}
+
+fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
+    args.validate()?;
+    let config = config_from_sessions_args(Config::load(), &args);
+    let registry = discover_sources(&config);
+    let filter = build_filter_sessions(&args)?;
+    let (records, _source_statuses) = registry.load_all();
+
+    // Filter
+    let mut records: Vec<llmhelper::domain::record::Record> = filter.apply(&records).into_iter().cloned().collect();
+
+    // Detail mode: find before sorting/pagination
+    if let Some(id) = args.detail.clone() {
+        let rec = records.iter().find(|r| r.session_id == id).cloned().ok_or_else(|| anyhow::anyhow!("session id not found"))?;
+        if args.json {
+            let mut buf = Vec::new();
+            serde_json::to_writer_pretty(&mut buf, &rec)?;
+            println!("{}", String::from_utf8(buf)?);
+        } else if args.csv {
+            let mut w = csv::Writer::from_writer(std::io::stdout());
+            w.write_record(&["session_id","source","project","model","started_at","ended_at","message_count","input","output","cache_read","cache_write","cost"])?;
+            w.write_record(&[
+                &rec.session_id,
+                &rec.source,
+                &rec.project,
+                &rec.model,
+                &rec.started_at.to_rfc3339(),
+                &rec.ended_at.map(|e| e.to_rfc3339()).unwrap_or_default(),
+                &rec.message_count.to_string(),
+                &rec.tokens.input.to_string(),
+                &rec.tokens.output.to_string(),
+                &rec.tokens.cache_read.to_string(),
+                &rec.tokens.cache_write.to_string(),
+                &rec.cost.map(|c| format!("{:.6}", c)).unwrap_or_default(),
+            ])?;
+            w.flush()?;
+        } else {
+            println!("session_id: {}", rec.session_id);
+            println!("source: {}", rec.source);
+            println!("project: {}", rec.project);
+            println!("model: {}", rec.model);
+            println!("started_at: {}", rec.started_at);
+            println!("ended_at: {:?}", rec.ended_at);
+            println!("message_count: {}", rec.message_count);
+            println!("tokens: input={}, output={}, cache_read={}, cache_write={}", rec.tokens.input, rec.tokens.output, rec.tokens.cache_read, rec.tokens.cache_write);
+            if let Some(cost) = rec.cost {
+                println!("cost: {:.6}", cost);
+            }
+        }
+        return Ok(());
+    }
+
+    // Sort by started_at desc
+    records.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+
+    // Pagination
+    let offset = args.offset.unwrap_or(0);
+    let limit = args.limit.unwrap_or(usize::MAX);
+    let paginated: Vec<_> = records.into_iter().skip(offset).take(limit).collect();
+
+    if args.json {
+        let mut buf = Vec::new();
+        serde_json::to_writer_pretty(&mut buf, &paginated)?;
+        println!("{}", String::from_utf8(buf)?);
+    } else if args.csv {
+        let mut w = csv::Writer::from_writer(std::io::stdout());
+        w.write_record(&["source","project","model","started_at","ended_at","messages","input","output","cache_read","cache_write","cost"])?;
+        for r in &paginated {
+            w.write_record(&[
+                &r.source,
+                &r.project,
+                &r.model,
+                &r.started_at.to_rfc3339(),
+                &r.ended_at.map(|e| e.to_rfc3339()).unwrap_or_default(),
+                &r.message_count.to_string(),
+                &r.tokens.input.to_string(),
+                &r.tokens.output.to_string(),
+                &r.tokens.cache_read.to_string(),
+                &r.tokens.cache_write.to_string(),
+                &r.cost.map(|c| format!("{:.6}", c)).unwrap_or_default(),
+            ])?;
+        }
+        w.flush()?;
+    } else {
+        let header = format!("{:<12} {:<30} {:<20} {:<20} {:<20} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "source","project","model","started_at","ended_at","messages","input","output","cache_read","cache_write","cost");
+        println!("{}", header);
+        println!("{}", "-".repeat(header.len()));
+        for r in &paginated {
+            let started = r.started_at.format("%Y-%m-%dT%H:%M:%S").to_string();
+            let ended = r.ended_at.map(|e| e.format("%Y-%m-%dT%H:%M:%S").to_string()).unwrap_or_default();
+            let cost_str = r.cost.map(|c| format!("{:.4}", c)).unwrap_or_default();
+            println!("{:<12} {:<30} {:<20} {:<20} {:<20} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}",
+                r.source,
+                r.project.chars().take(30).collect::<String>(),
+                r.model.chars().take(20).collect::<String>(),
+                started,
+                ended,
+                r.message_count,
+                format_tokens(r.tokens.input),
+                format_tokens(r.tokens.output),
+                format_tokens(r.tokens.cache_read),
+                format_tokens(r.tokens.cache_write),
+                cost_str
+            );
+        }
+    }
     Ok(())
 }
 
@@ -333,26 +555,11 @@ fn run_diff(args: DiffArgs) -> anyhow::Result<()> {
     let (last_duration, prev_duration) = args.parse_windows()?;
 
     let now = chrono::Utc::now();
-    let prev_until = now - last_duration;
-    let curr_since = prev_until - chrono::Duration::seconds(prev_duration.as_secs() as i64);
-
-    // Build filters for both windows
-    let prev_filter = Filter {
-        since: Some(curr_since),
-        until: Some(prev_until),
-        project: args.project.clone(),
-        model: args.model.clone(),
-        source: args.source.as_ref().map(|s| s.to_string()),
-        ..Default::default()
-    };
-    let curr_filter = Filter {
-        since: Some(prev_until),
-        until: Some(now),
-        project: args.project.clone(),
-        model: args.model.clone(),
-        source: args.source.as_ref().map(|s| s.to_string()),
-        ..Default::default()
-    };
+    let (prev_filter, curr_filter) = window_filters(now, last_duration, prev_duration, &args);
+    let prev_since = prev_filter.since.unwrap();
+    let prev_until = prev_filter.until.unwrap();
+    let curr_since = curr_filter.since.unwrap();
+    let curr_until = curr_filter.until.unwrap();
 
     let group_by: GroupBy = args.group_by.clone().into();
 
@@ -369,11 +576,11 @@ fn run_diff(args: DiffArgs) -> anyhow::Result<()> {
 
     // Render output
     if args.json {
-        render_diff_json(&rows, &source_statuses, group_by.label(), curr_since, prev_until, prev_until, now)?;
+        render_diff_json(&rows, &source_statuses, group_by.label(), prev_since, prev_until, curr_since, curr_until)?;
     } else if args.csv {
         render_diff_csv(&rows, &source_statuses, &prev_agg, &curr_agg)?;
     } else {
-        run_diff_tui(registry, prev_filter, curr_filter, group_by, curr_since, prev_until, now, config.refresh_interval_seconds)?;
+        run_diff_tui(registry, &args, group_by, last_duration, prev_duration, config.refresh_interval_seconds)?;
     }
 
     Ok(())
@@ -385,6 +592,7 @@ fn diff_args_to_usage_args(args: &DiffArgs) -> UsageArgs {
         claude_dir: args.claude_dir.clone(),
         opencode_db: args.opencode_db.clone(),
         omp_dir: args.omp_dir.clone(),
+        kilo_db: args.kilo_db.clone(),
         since: None,
         last: None,
         project: args.project.clone(),
@@ -401,5 +609,6 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Usage(args) => run_usage(args),
         Command::Diff(args) => run_diff(args),
+        Command::Sessions(args) => run_sessions(args),
     }
 }

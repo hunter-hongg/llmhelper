@@ -17,6 +17,8 @@ pub enum Command {
     Usage(UsageArgs),
     /// Compare token usage between two time windows.
     Diff(DiffArgs),
+    /// List individual Agent Sessions.
+    Sessions(SessionsArgs),
 }
 
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
@@ -53,6 +55,7 @@ pub enum SourceArg {
     Claude,
     Opencode,
     Omp,
+    Kilo,
 }
 
 impl std::fmt::Display for SourceArg {
@@ -61,6 +64,7 @@ impl std::fmt::Display for SourceArg {
             Self::Claude => write!(f, "claude"),
             Self::Opencode => write!(f, "opencode"),
             Self::Omp => write!(f, "omp"),
+            Self::Kilo => write!(f, "kilo"),
         }
     }
 }
@@ -78,6 +82,10 @@ pub struct UsageArgs {
     /// OMP sessions directory (defaults to ~/.omp/agent/sessions).
     #[arg(long = "omp-dir")]
     pub omp_dir: Option<std::path::PathBuf>,
+
+    /// Kilo Code database path(s). Can be specified multiple times.
+    #[arg(long = "kilo-db")]
+    pub kilo_db: Option<Vec<std::path::PathBuf>>,
 
     /// Only include sessions started at or after this RFC 3339 timestamp.
     #[arg(long = "since")]
@@ -189,6 +197,10 @@ pub struct DiffArgs {
     #[arg(long = "omp-dir")]
     pub omp_dir: Option<std::path::PathBuf>,
 
+    /// Kilo Code database path(s). Can be specified multiple times.
+    #[arg(long = "kilo-db")]
+    pub kilo_db: Option<Vec<std::path::PathBuf>>,
+
     /// Filter by project path substring.
     #[arg(long = "project")]
     pub project: Option<String>,
@@ -234,5 +246,88 @@ impl DiffArgs {
             None => anyhow::bail!("--prev is required"),
         };
         Ok((last, prev))
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct SessionsArgs {
+    /// Claude Code projects directory (defaults to ~/.claude/projects).
+    #[arg(long = "claude-dir")]
+    pub claude_dir: Option<std::path::PathBuf>,
+
+    /// OpenCode database path(s). Can be specified multiple times.
+    #[arg(long = "opencode-db")]
+    pub opencode_db: Option<Vec<std::path::PathBuf>>,
+
+    /// OMP sessions directory (defaults to ~/.omp/agent/sessions).
+    #[arg(long = "omp-dir")]
+    pub omp_dir: Option<std::path::PathBuf>,
+
+    /// Kilo Code database path(s). Can be specified multiple times.
+    #[arg(long = "kilo-db")]
+    pub kilo_db: Option<Vec<std::path::PathBuf>>,
+
+    /// Only include sessions started at or after this RFC 3339 timestamp.
+    #[arg(long = "since")]
+    pub since: Option<DateTime<Utc>>,
+
+    /// Only include sessions from the last N days/hours (e.g. "7d", "4h").
+    /// Mutually exclusive with --since.
+    #[arg(long = "last")]
+    pub last: Option<String>,
+
+    /// Filter by project path substring.
+    #[arg(long = "project")]
+    pub project: Option<String>,
+
+    /// Filter by model substring (case-insensitive).
+    #[arg(long = "model")]
+    pub model: Option<String>,
+
+    /// Filter by source name.
+    #[arg(long = "source")]
+    pub source: Option<SourceArg>,
+
+    /// Limit number of sessions listed.
+    #[arg(long = "limit")]
+    pub limit: Option<usize>,
+
+    /// Offset for pagination.
+    #[arg(long = "offset")]
+    pub offset: Option<usize>,
+
+    /// Show detail for a specific session id.
+    #[arg(long = "detail")]
+    pub detail: Option<String>,
+
+    /// Output as JSON instead of the terminal table.
+    #[arg(long = "json")]
+    pub json: bool,
+
+    /// Output as CSV instead of the terminal table.
+    #[arg(long = "csv")]
+    pub csv: bool,
+}
+
+impl SessionsArgs {
+    pub fn parse_last(&self) -> anyhow::Result<Option<Duration>> {
+        let s = match &self.last {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        parse_duration(s).map_err(|e| anyhow::anyhow!("invalid --last {}", e)).map(Some)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.json && self.csv {
+            anyhow::bail!("--json and --csv are mutually exclusive");
+        }
+        if self.since.is_some() && self.last.is_some() {
+            anyhow::bail!("--since and --last are mutually exclusive");
+        }
+        if self.detail.is_some() && (self.limit.is_some() || self.offset.is_some()) {
+            anyhow::bail!("--detail cannot be combined with --limit/--offset");
+        }
+        Ok(())
     }
 }
