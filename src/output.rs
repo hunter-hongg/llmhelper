@@ -314,7 +314,7 @@ fn i64_disp(v: i64) -> String {
 }
 
 /// Format a token count with magnitude-appropriate unit (K, M, B).
-fn format_tokens(n: u64) -> String {
+pub fn format_tokens(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();
     }

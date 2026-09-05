@@ -13,7 +13,7 @@ use llmhelper::domain::group::GroupBy;
 use llmhelper::diff::compute_diff;
 use llmhelper::filter::Filter;
 use llmhelper::output::{
-    OutputRenderer, render_diff_json, render_diff_csv,
+    OutputRenderer, render_diff_json, render_diff_csv, format_tokens,
 };
 use llmhelper::source::{ClaudeSource, KiloSource, OpenCodeSource, OmpSource, Registry, SourceStatus};
 use llmhelper::tui::{TerminalApp, DiffTuiApp};
@@ -22,29 +22,6 @@ use llmhelper::tui::{TerminalApp, DiffTuiApp};
 struct TuiData {
     result: Option<AggregateResult>,
     source_statuses: Vec<SourceStatus>,
-}
-
-fn format_tokens(n: u64) -> String {
-    if n < 1_000 {
-        return n.to_string();
-    }
-    let (value, suffix) = if n < 1_000_000 {
-        (n as f64 / 1_000.0, "K")
-    } else if n < 1_000_000_000 {
-        (n as f64 / 1_000_000.0, "M")
-    } else {
-        (n as f64 / 1_000_000_000.0, "B")
-    };
-    let text = format!("{:.1}", value);
-    let text = text.strip_suffix(".0").unwrap_or(&text);
-    if text == "1000" {
-        return match suffix {
-            "K" => "1M".to_string(),
-            "M" => "1B".to_string(),
-            _ => "1000B".to_string(),
-        };
-    }
-    format!("{}{}", text, suffix)
 }
 
 fn discover_sources(config: &Config) -> Registry {
@@ -421,7 +398,12 @@ fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
     let config = config_from_sessions_args(Config::load(), &args);
     let registry = discover_sources(&config);
     let filter = build_filter_sessions(&args)?;
-    let (records, _source_statuses) = registry.load_all();
+    let (records, source_statuses) = registry.load_all();
+    for status in &source_statuses {
+        if let Some(err) = &status.error {
+            eprintln!("warn: source {} error: {}", status.name, err);
+        }
+    }
 
     // Filter
     let mut records: Vec<llmhelper::domain::record::Record> = filter.apply(&records).into_iter().cloned().collect();

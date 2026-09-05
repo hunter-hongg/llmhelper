@@ -29,6 +29,8 @@ fn run_usage_json(extra_args: &[&str]) -> serde_json::Value {
         fixture_dir().join("opencode").join("opencode.db").to_str().unwrap(),
         "--omp-dir",
         fixture_dir().join("omp").to_str().unwrap(),
+        "--kilo-db",
+        fixture_dir().join("kilo").join("kilo.db").to_str().unwrap(),
     ]);
     for arg in extra_args {
         cmd.arg(arg);
@@ -44,6 +46,33 @@ fn run_usage_json(extra_args: &[&str]) -> serde_json::Value {
     serde_json::from_str(&stdout).unwrap()
 }
 
+fn run_sessions_json(extra_args: &[&str]) -> serde_json::Value {
+    let mut cmd = Command::new(bin());
+    cmd.args(["sessions", "--json"]);
+    cmd.args([
+        "--claude-dir",
+        fixture_dir().join("claude").to_str().unwrap(),
+        "--opencode-db",
+        fixture_dir().join("opencode").join("opencode.db").to_str().unwrap(),
+        "--omp-dir",
+        fixture_dir().join("omp").to_str().unwrap(),
+        "--kilo-db",
+        fixture_dir().join("kilo").join("kilo.db").to_str().unwrap(),
+    ]);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    let output = cmd.output().expect("failed to run llmhelper");
+    assert!(
+        output.status.success(),
+        "llmhelper sessions exited with {}: {:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    serde_json::from_str(&stdout).unwrap()
+}
+
 #[test]
 fn json_output_total_session_count() {
     let json = run_usage_json(&[]);
@@ -52,7 +81,8 @@ fn json_output_total_session_count() {
     // Claude: 2 sessions (session-a + session-b)
     // OpenCode: 2 sessions (ses_fix_001 + ses_fix_002)
     // OMP: 1 session (01fixomp)
-    assert_eq!(total_records, 5);
+    // Kilo: 2 sessions (ses_fix_kilo_001 + ses_fix_kilo_002)
+    assert_eq!(total_records, 7);
 }
 
 #[test]
@@ -84,6 +114,24 @@ fn json_output_omp_cost_present() {
 }
 
 #[test]
+fn json_output_kilo_cost_present() {
+    let json = run_usage_json(&["--source", "kilo"]);
+    let groups = json["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    let cost = groups[0]["cost"].as_f64();
+    assert!(cost.is_some(), "Kilo cost must be present");
+    assert!((cost.unwrap() - 1.5).abs() < 1e-9);
+}
+
+#[test]
+fn json_output_kilo_source_filter() {
+    let json = run_usage_json(&["--source", "kilo"]);
+    let groups = json["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["key"], "kilo");
+}
+
+#[test]
 fn json_output_token_sums_match_fixtures() {
     let json = run_usage_json(&[]);
     let groups = json["groups"].as_array().unwrap();
@@ -107,6 +155,17 @@ fn json_output_token_sums_match_fixtures() {
     assert_eq!(omp["tokens"]["cache_write"], 75);
     assert_eq!(omp["sessions"], 1);
     assert_eq!(omp["messages"], 2);
+
+    let kilo = groups.iter().find(|g| g["key"] == "kilo").unwrap();
+    assert_eq!(kilo["tokens"]["input"], 4000);
+    // output includes reasoning (1000) folded in.
+    assert_eq!(kilo["tokens"]["output"], 3500);
+    assert_eq!(kilo["tokens"]["cache_read"], 600);
+    assert_eq!(kilo["tokens"]["cache_write"], 100);
+    assert_eq!(kilo["sessions"], 2);
+    assert_eq!(kilo["messages"], 5);
+    // Kilo stores cost on the session row, so it must surface.
+    assert!((kilo["cost"].as_f64().unwrap() - 1.5).abs() < 1e-9);
 }
 
 #[test]
@@ -121,8 +180,8 @@ fn json_output_source_filter() {
 fn json_output_project_filter() {
     let json = run_usage_json(&["--project", "/home/hunter"]);
     let groups = json["groups"].as_array().unwrap();
-    // All three sources have projects under /home/hunter
-    assert_eq!(groups.len(), 3);
+    // All four sources have projects under /home/hunter
+    assert_eq!(groups.len(), 4);
 }
 
 #[test]
@@ -130,9 +189,14 @@ fn json_output_group_by_model() {
     let json = run_usage_json(&["--group-by", "model"]);
     let groups = json["groups"].as_array().unwrap();
     let auto = groups.iter().find(|g| g["key"] == "auto").unwrap();
-    assert_eq!(auto["sessions"], 2); // claude session-b + omp (both raw model "auto")
+    // claude session-b + omp + kilo (all record the routing alias "auto")
+    assert_eq!(auto["sessions"], 3);
     let bp = groups.iter().find(|g| g["key"] == "big-pickle").unwrap();
     assert_eq!(bp["sessions"], 1);
+    // The envelope's `id` is the grouping key, not the JSON blob.
+    let kilo_auto = groups.iter().find(|g| g["key"] == "kilo-auto/free").unwrap();
+    assert_eq!(kilo_auto["sessions"], 1);
+    assert_eq!(kilo_auto["source"], "kilo");
 }
 
 #[test]
@@ -148,7 +212,7 @@ fn json_output_last_filter() {
     let json = run_usage_json(&["--last", "36500d"]);
     let sources = json["sources"].as_array().unwrap();
     let total_all: usize = sources.iter().map(|s| s["records"].as_u64().unwrap() as usize).sum();
-    assert_eq!(total_all, 5);
+    assert_eq!(total_all, 7);
 }
 
 #[test]
@@ -234,10 +298,13 @@ fn run_diff_json(
     let claude_dir = fixture_base.join("claude");
     let omp_dir = fixture_base.join("omp");
     let opencode_dir = fixture_base.join("opencode");
+    let kilo_dir = fixture_base.join("kilo");
     fs::create_dir_all(&claude_dir).unwrap();
     fs::create_dir_all(&omp_dir).unwrap();
     fs::create_dir_all(&opencode_dir).unwrap();
+    fs::create_dir_all(&kilo_dir).unwrap();
     fs::write(opencode_dir.join("opencode.db"), "").unwrap(); // empty sqlite stub
+    fs::write(kilo_dir.join("kilo.db"), "").unwrap(); // empty sqlite stub
 
     let mut cmd = Command::new(bin());
     cmd.args(["diff", "--json"]);
@@ -247,6 +314,7 @@ fn run_diff_json(
     cmd.arg("--claude-dir").arg(claude_dir.to_str().unwrap());
     cmd.arg("--omp-dir").arg(omp_dir.to_str().unwrap());
     cmd.arg("--opencode-db").arg(opencode_dir.join("opencode.db").to_str().unwrap());
+    cmd.arg("--kilo-db").arg(kilo_dir.join("kilo.db").to_str().unwrap());
     for arg in extra_args {
         cmd.arg(arg);
     }
@@ -564,4 +632,59 @@ fn diff_json_all_windows_empty() {
     let json = run_diff_json(dir.path(), DIFF_WINDOW_SECS, &[]);
     let rows = json["rows"].as_array().unwrap();
     assert!(rows.is_empty());
+}
+
+#[test]
+fn sessions_json_total_count() {
+    let arr = run_sessions_json(&[]);
+    let sessions = arr.as_array().unwrap();
+    // 7 sessions across fixtures
+    assert_eq!(sessions.len(), 7);
+}
+
+#[test]
+fn sessions_json_source_filter() {
+    let arr = run_sessions_json(&["--source", "claude"]);
+    let sessions = arr.as_array().unwrap();
+    assert!(sessions.iter().all(|s| s["source"] == "claude"));
+    assert_eq!(sessions.len(), 2);
+}
+
+#[test]
+fn sessions_json_project_filter() {
+    let arr = run_sessions_json(&["--project", "test"]);
+    let sessions = arr.as_array().unwrap();
+    assert!(!sessions.is_empty());
+    assert!(sessions.iter().all(|s| s["project"].as_str().unwrap().contains("test")));
+}
+
+#[test]
+fn sessions_json_limit_offset() {
+    let arr = run_sessions_json(&["--limit", "2", "--offset", "1"]);
+    let sessions = arr.as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+}
+
+#[test]
+fn sessions_json_detail() {
+    // Find a known session id from fixtures
+    let arr = run_sessions_json(&[]);
+    let first_id = arr.as_array().unwrap()[0]["session_id"].as_str().unwrap().to_string();
+    let detail = run_sessions_json(&["--detail", &first_id]);
+    assert!(detail.is_object());
+    assert_eq!(detail["session_id"].as_str().unwrap(), first_id);
+    // Cost is null for claude
+    if detail["source"].as_str().unwrap() == "claude" {
+        assert_eq!(detail["cost"], serde_json::Value::Null);
+    }
+}
+
+#[test]
+fn sessions_json_sort_desc() {
+    let arr = run_sessions_json(&[]);
+    let sessions = arr.as_array().unwrap();
+    let times: Vec<_> = sessions.iter().map(|s| s["started_at"].as_str().unwrap()).collect();
+    let mut sorted = times.clone();
+    sorted.sort_by(|a, b| b.cmp(a));
+    assert_eq!(times, sorted);
 }
