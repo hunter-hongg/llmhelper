@@ -1,5 +1,5 @@
-use crate::tui::report_app::ReportTuiState;
 use crate::tui::render::{ACCENT, ACCENT2, BG, BORDER, MUTED, SURFACE, TEXT, TITLE};
+use crate::tui::report_app::ReportTuiState;
 use ratatui::{
     layout::{Constraint, Layout},
     style::{Modifier, Style},
@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 pub fn render(frame: &mut Frame, state: &mut ReportTuiState) {
     let area = frame.area();
@@ -74,7 +75,11 @@ fn styled_line(line: &str) -> Line<'static> {
         ));
     }
     if trimmed.starts_with('|') {
-        let fg = if trimmed.contains("---") { MUTED } else { TEXT };
+        let fg = if is_table_separator(line) {
+            MUTED
+        } else {
+            TEXT
+        };
         return Line::from(Span::styled(line.to_string(), Style::default().fg(fg)));
     }
     if trimmed.chars().all(|c| c == '-') && trimmed.contains('-') {
@@ -86,8 +91,118 @@ fn styled_line(line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), Style::default().fg(TEXT)))
 }
 
+/// A Markdown table delimiter row like `|---|---|`.
+fn is_table_separator(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with('|') && trimmed.contains("---")
+}
+
+/// A header row followed by a delimiter row opens a real Markdown table.
+fn opens_table(lines: &[String], index: usize) -> bool {
+    lines
+        .get(index)
+        .is_some_and(|l| l.trim_start().starts_with('|'))
+        && lines.get(index + 1).is_some_and(|l| is_table_separator(l))
+}
+
+/// Turn the raw document lines into styled lines, drawing table blocks as
+/// aligned tables instead of raw pipe rows. Output keeps one line per input
+/// line so scroll math stays 1:1. Pure function of the input.
+fn body_lines(lines: &[String]) -> Vec<Line<'static>> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if opens_table(lines, i) {
+            let mut end = i + 1;
+            while end < lines.len() && lines[end].trim_start().starts_with('|') {
+                end += 1;
+            }
+            out.extend(render_table_block(&lines[i..end]));
+            i = end;
+        } else {
+            out.push(styled_line(&lines[i]));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Split a table row into cells, trimming whitespace and unescaping `\|`.
+fn split_row(line: &str) -> Vec<String> {
+    const ESC: char = '\u{0}';
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    inner
+        .replace("\\|", &ESC.to_string())
+        .split('|')
+        .map(|cell| cell.trim().replace(ESC, "|"))
+        .collect()
+}
+
+/// Render header + delimiter + body rows as an aligned table: cells padded to
+/// the widest cell per column, `│` column separators, and a dim `┼` rule
+/// under the header. Pure function of the input.
+fn render_table_block(block: &[String]) -> Vec<Line<'static>> {
+    let mut rows: Vec<Vec<String>> = vec![split_row(&block[0])];
+    for line in block.iter().skip(2) {
+        rows.push(split_row(line));
+    }
+    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut widths = vec![0usize; ncols];
+    for row in &rows {
+        for (idx, cell) in row.iter().enumerate() {
+            widths[idx] = widths[idx].max(cell.width());
+        }
+    }
+
+    let mut out = Vec::with_capacity(block.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        let header = row_idx == 0;
+        let mut spans = Vec::new();
+        for (col, width) in widths.iter().enumerate() {
+            if col > 0 {
+                spans.push(Span::styled(" │ ".to_string(), Style::default().fg(BORDER)));
+            }
+            let cell = row.get(col).map(String::as_str).unwrap_or("");
+            let style = if header {
+                Style::default().fg(ACCENT2).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT)
+            };
+            spans.push(Span::styled(cell.to_string(), style));
+            let pad = width - cell.width();
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+        }
+        out.push(Line::from(spans));
+        if header {
+            // First/last segments cover "cell + one adjacent space" (w + 1);
+            // middle segments sit between two `┼` and must also cover the
+            // space on their right (w + 2), or every `┼` after the first
+            // drifts left of its `│` column by one char per junction.
+            let n = widths.len();
+            let rule = widths
+                .iter()
+                .enumerate()
+                .map(|(col, w)| {
+                    if col > 0 && col + 1 < n {
+                        "─".repeat(w + 2)
+                    } else {
+                        "─".repeat(w + 1)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("┼");
+            out.push(Line::from(Span::styled(rule, Style::default().fg(MUTED))));
+        }
+    }
+    out
+}
+
 fn render_body(state: &ReportTuiState) -> Paragraph<'static> {
-    let text = Text::from(state.lines.iter().map(|l| styled_line(l)).collect::<Vec<_>>());
+    let text = Text::from(body_lines(&state.lines));
     Paragraph::new(text)
         .block(panel("report"))
         .style(Style::default().bg(BG))
@@ -144,6 +259,10 @@ mod tests {
             .unwrap_or(false)
     }
 
+    fn plain(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
     #[test]
     fn level_one_heading_is_accent_bold() {
         assert_eq!(first_fg("# llmhelper report"), ACCENT);
@@ -177,6 +296,127 @@ mod tests {
     fn table_row_is_text() {
         assert_eq!(first_fg("| claude | 1 | 2 |"), TEXT);
         assert!(!is_bold("| claude | 1 | 2 |"));
+    }
+
+    #[test]
+    fn table_block_aligns_columns_under_box_rule() {
+        let lines = vec![
+            "| key | sessions |".to_string(),
+            "|---|---|".to_string(),
+            "| claude | 12 |".to_string(),
+            "| omp | 3 |".to_string(),
+        ];
+        let out = body_lines(&lines);
+        assert_eq!(out.len(), lines.len());
+        assert_eq!(plain(&out[0]), "key    │ sessions");
+        assert_eq!(plain(&out[1]), "───────┼─────────");
+        assert_eq!(plain(&out[2]), "claude │ 12      ");
+        assert_eq!(plain(&out[3]), "omp    │ 3       ");
+    }
+
+    #[test]
+    fn table_header_is_accent2_bold_and_rule_muted() {
+        let lines = vec![
+            "| key | n |".to_string(),
+            "|---|---|".to_string(),
+            "| a | 1 |".to_string(),
+        ];
+        let out = body_lines(&lines);
+        let header = &out[0].spans[0].style;
+        assert_eq!(header.fg, Some(ACCENT2));
+        assert!(header.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(out[1].spans[0].style.fg, Some(MUTED));
+        assert_eq!(out[2].spans[0].style.fg, Some(TEXT));
+    }
+
+    #[test]
+    fn table_cells_unescape_pipes() {
+        let lines = vec![
+            "| key | n |".to_string(),
+            "|---|---|".to_string(),
+            "| a\\|b | 1 |".to_string(),
+        ];
+        let out = body_lines(&lines);
+        assert_eq!(plain(&out[2]), "a|b │ 1");
+    }
+
+    #[test]
+    fn ragged_table_rows_pad_missing_cells() {
+        let lines = vec![
+            "| a | b | c |".to_string(),
+            "|---|---|---|".to_string(),
+            "| x | 1 |".to_string(),
+        ];
+        let out = body_lines(&lines);
+        assert_eq!(out.len(), 3);
+        assert_eq!(plain(&out[2]), "x │ 1 │  ");
+    }
+
+    #[test]
+    fn orphan_pipe_line_stays_raw() {
+        let lines = vec!["| just a line".to_string()];
+        let out = body_lines(&lines);
+        assert_eq!(plain(&out[0]), "| just a line");
+    }
+
+    #[test]
+    fn multiple_table_blocks_each_rendered() {
+        let lines = vec![
+            "## Totals".to_string(),
+            String::new(),
+            "| a | b |".to_string(),
+            "|---|---|".to_string(),
+            "| 1 | 2 |".to_string(),
+            String::new(),
+            "| c | d |".to_string(),
+            "|---|---|".to_string(),
+            "| 3 | 4 |".to_string(),
+        ];
+        let out = body_lines(&lines);
+        assert_eq!(out.len(), lines.len());
+        assert_eq!(plain(&out[2]), "a │ b");
+        assert_eq!(plain(&out[3]), "──┼──");
+        assert_eq!(plain(&out[6]), "c │ d");
+        assert_eq!(plain(&out[7]), "──┼──");
+    }
+
+    #[test]
+    fn rule_junctions_align_with_every_column_separator() {
+        let lines = vec![
+            "| key | sessions | messages |".to_string(),
+            "|---|---|---|".to_string(),
+            "| claude | 12 | 40 |".to_string(),
+        ];
+        let out = body_lines(&lines);
+        let header = plain(&out[0]);
+        let rule = plain(&out[1]);
+        assert_eq!(rule.chars().count(), header.chars().count());
+        for (idx, ch) in header.chars().enumerate() {
+            if ch == '│' {
+                assert_eq!(
+                    rule.chars().nth(idx),
+                    Some('┼'),
+                    "junction {} must sit under its │ at col {}",
+                    idx,
+                    idx
+                );
+            }
+        }
+        assert_eq!(rule, "───────┼──────────┼─────────");
+    }
+
+    #[test]
+    fn cjk_cells_align_by_display_width() {
+        let lines = vec![
+            "| key | n |".to_string(),
+            "|---|---|".to_string(),
+            "| 项目 | 1 |".to_string(),
+            "| ab | 2 |".to_string(),
+        ];
+        let out = body_lines(&lines);
+        // 项目 is display width 4, same column as ab (width 2): both pad to 4.
+        assert_eq!(plain(&out[2]), "项目 │ 1");
+        assert_eq!(plain(&out[3]), "ab   │ 2");
     }
 
     #[test]

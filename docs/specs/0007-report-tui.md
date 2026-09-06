@@ -46,6 +46,7 @@ This supersedes spec 0006's decision that stdout is the default destination; fro
 - Main entry: the `report` command builds the Markdown, then either writes it to the `--output` path (unchanged behavior, including the error message) or runs the report TUI.
 - Terminal setup/teardown (raw mode, alternate screen, cursor restore) follows the shared pattern used by the other TUI entry structs.
 - Key bindings: `↑`/`k` up one line, `↓`/`j` down one line, `PageUp`/`PageDown` half-page, `g`/`Home` top, `G`/`End` bottom, `q`/`Esc` quit. No other interactions.
+- Markdown tables are rendered as aligned blocks rather than raw pipe rows: a header row immediately followed by a `|---|` delimiter row opens a table block; cells are padded to the per-column display width (CJK-aware via `unicode-width`), separated by ` │ `, with a dim `┼`-joined rule under the header. `\|` inside cells is unescaped; ragged rows pad missing cells; a lone pipe line without a delimiter row stays raw. Output keeps one line per input line so scroll math stays 1:1. This supersedes the earlier out-of-scope note on table alignment.
 
 ## Testing Decisions
 
