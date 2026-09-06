@@ -19,6 +19,8 @@ pub enum Command {
     Diff(DiffArgs),
     /// List individual Agent Sessions.
     Sessions(SessionsArgs),
+    /// Render a shareable Markdown summary of filtered Usage.
+    Report(ReportArgs),
 }
 
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
@@ -331,6 +333,78 @@ impl SessionsArgs {
         }
         if self.detail.is_some() && (self.limit.is_some() || self.offset.is_some()) {
             anyhow::bail!("--detail cannot be combined with --limit/--offset");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ReportArgs {
+    /// Claude Code projects directory (defaults to ~/.claude/projects).
+    #[arg(long = "claude-dir")]
+    pub claude_dir: Option<std::path::PathBuf>,
+
+    /// OpenCode database path(s). Can be specified multiple times.
+    #[arg(long = "opencode-db")]
+    pub opencode_db: Option<Vec<std::path::PathBuf>>,
+
+    /// OMP sessions directory (defaults to ~/.omp/agent/sessions).
+    #[arg(long = "omp-dir")]
+    pub omp_dir: Option<std::path::PathBuf>,
+
+    /// Kilo Code database path(s). Can be specified multiple times.
+    #[arg(long = "kilo-db")]
+    pub kilo_db: Option<Vec<std::path::PathBuf>>,
+
+    /// Only include sessions started at or after this RFC 3339 timestamp.
+    #[arg(long = "since")]
+    pub since: Option<DateTime<Utc>>,
+
+    /// Only include sessions from the last N days/hours (e.g. "7d", "4h").
+    /// Mutually exclusive with --since.
+    #[arg(long = "last")]
+    pub last: Option<String>,
+
+    /// Filter by project path substring.
+    #[arg(long = "project")]
+    pub project: Option<String>,
+
+    /// Filter by model substring (case-insensitive).
+    #[arg(long = "model")]
+    pub model: Option<String>,
+
+    /// Filter by source name.
+    #[arg(long = "source")]
+    pub source: Option<SourceArg>,
+
+    /// Group output by this dimension: source, project, or model.
+    #[arg(long = "group-by", default_value_t)]
+    pub group_by: GroupByArg,
+
+    /// Show at most the n largest groups by input tokens (must be >= 1).
+    #[arg(long = "top")]
+    pub top: Option<usize>,
+}
+
+impl ReportArgs {
+    pub fn parse_last(&self) -> anyhow::Result<Option<Duration>> {
+        let s = match &self.last {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        parse_duration(s)
+            .map_err(|e| anyhow::anyhow!("invalid --last {}", e))
+            .map(Some)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.since.is_some() && self.last.is_some() {
+            anyhow::bail!("--since and --last are mutually exclusive");
+        }
+        if let Some(top) = self.top {
+            if top == 0 {
+                anyhow::bail!("--top must be at least 1");
+            }
         }
         Ok(())
     }

@@ -7,13 +7,14 @@ use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use llmhelper::cli::{Cli, Command, DiffArgs, SessionsArgs, UsageArgs};
+use llmhelper::cli::{Cli, Command, DiffArgs, ReportArgs, SessionsArgs, UsageArgs};
 use llmhelper::config::Config;
 use llmhelper::diff::compute_diff;
 use llmhelper::domain::group::GroupBy;
 use llmhelper::domain::record::Record;
 use llmhelper::filter::Filter;
 use llmhelper::output::{format_tokens, render_diff_csv, render_diff_json, OutputRenderer};
+use llmhelper::report::{render_report, ReportMeta};
 use llmhelper::source::{
     ClaudeSource, KiloSource, OmpSource, OpenCodeSource, Registry, SourceStatus,
 };
@@ -75,6 +76,20 @@ fn discover_sources(config: &Config) -> Registry {
 }
 
 fn build_filter(args: &UsageArgs) -> anyhow::Result<Filter> {
+    let last = args.parse_last()?;
+    Ok(Filter {
+        since: args.since,
+        last,
+        until: None,
+        project: args.project.clone(),
+        model: args.model.clone(),
+        source: args.source.as_ref().map(|s| s.to_string()),
+    })
+}
+
+/// Build the Filter for a `report` invocation. Same predicates as `usage`;
+/// a separate constructor because the args types differ.
+fn build_filter_report(args: &ReportArgs) -> anyhow::Result<Filter> {
     let last = args.parse_last()?;
     Ok(Filter {
         since: args.since,
@@ -717,11 +732,72 @@ fn diff_args_to_usage_args(args: &DiffArgs) -> UsageArgs {
     }
 }
 
+/// Clone config overrides from report args into a UsageArgs for config merging.
+fn report_args_to_usage_args(args: &ReportArgs) -> UsageArgs {
+    UsageArgs {
+        claude_dir: args.claude_dir.clone(),
+        opencode_db: args.opencode_db.clone(),
+        omp_dir: args.omp_dir.clone(),
+        kilo_db: args.kilo_db.clone(),
+        since: None,
+        last: None,
+        project: args.project.clone(),
+        model: args.model.clone(),
+        source: args.source.clone(),
+        group_by: args.group_by.clone(),
+        json: false,
+        csv: false,
+    }
+}
+
+/// Build the ReportMeta describing the invocation: window text and the
+/// non-temporal filters that were applied.
+fn report_meta(args: &ReportArgs) -> ReportMeta {
+    let window = if let Some(last) = &args.last {
+        format!("last {}", last)
+    } else if let Some(since) = args.since {
+        format!("since {}", since.to_rfc3339())
+    } else {
+        "all time".to_string()
+    };
+    let mut filters = Vec::new();
+    if let Some(p) = &args.project {
+        filters.push(("project".to_string(), p.clone()));
+    }
+    if let Some(m) = &args.model {
+        filters.push(("model".to_string(), m.clone()));
+    }
+    if let Some(s) = &args.source {
+        filters.push(("source".to_string(), s.to_string()));
+    }
+    ReportMeta {
+        generated_at: chrono::Utc::now(),
+        window,
+        group_by: args.group_by.to_string(),
+        filters,
+    }
+}
+
+fn run_report(args: ReportArgs) -> anyhow::Result<()> {
+    args.validate()?;
+    let group_by: GroupBy = args.group_by.clone().into();
+    let config = Config::load().merge(&report_args_to_usage_args(&args));
+    let registry = discover_sources(&config);
+    let filter = build_filter_report(&args)?;
+
+    let (records, source_statuses) = registry.load_all();
+    let agg = AggregateResult::from_records(&records, &filter, group_by);
+    let meta = report_meta(&args);
+    println!("{}", render_report(&agg, &meta, &source_statuses, args.top));
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Usage(args) => run_usage(args),
         Command::Diff(args) => run_diff(args),
         Command::Sessions(args) => run_sessions(args),
+        Command::Report(args) => run_report(args),
     }
 }

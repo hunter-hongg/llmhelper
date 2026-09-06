@@ -797,3 +797,163 @@ fn sessions_json_sort_desc() {
     sorted.sort_by(|a, b| b.cmp(a));
     assert_eq!(times, sorted);
 }
+
+// --- report integration tests ---
+
+fn run_report(extra_args: &[&str]) -> String {
+    let mut cmd = Command::new(bin());
+    cmd.args(["report"]);
+    cmd.args([
+        "--claude-dir",
+        fixture_dir().join("claude").to_str().unwrap(),
+        "--opencode-db",
+        fixture_dir()
+            .join("opencode")
+            .join("opencode.db")
+            .to_str()
+            .unwrap(),
+        "--omp-dir",
+        fixture_dir().join("omp").to_str().unwrap(),
+        "--kilo-db",
+        fixture_dir().join("kilo").join("kilo.db").to_str().unwrap(),
+    ]);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    let output = cmd.output().expect("failed to run llmhelper report");
+    assert!(
+        output.status.success(),
+        "llmhelper report exited with {}: {:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn report_markdown_structure() {
+    let out = run_report(&["--last", "30d"]);
+    assert!(out.starts_with("# llmhelper report\n"));
+    assert!(out.contains("## Totals"));
+    assert!(out.contains("## Cost by source"));
+    assert!(out.contains("## Usage by source"));
+    assert!(out.contains("## Sources"));
+    assert!(out.contains("| sessions | messages |"));
+    assert!(out.contains("| key | sessions | messages |"));
+}
+
+#[test]
+fn report_window_and_filter_echo() {
+    let out = run_report(&[
+        "--last",
+        "30d",
+        "--project",
+        "proj",
+        "--source",
+        "opencode",
+    ]);
+    assert!(out.contains("window: last 30d"));
+    assert!(out.contains("project=proj"));
+    assert!(out.contains("source=opencode"));
+}
+
+#[test]
+fn report_all_time_window_when_unbounded() {
+    let out = run_report(&[]);
+    assert!(out.contains("window: all time"));
+}
+
+#[test]
+fn report_top_collapses_groups() {
+    let full = run_report(&["--last", "30d"]);
+    assert!(!full.contains("(+ "), "no --top must show every group");
+    let capped = run_report(&["--last", "30d", "--top", "1"]);
+    assert!(capped.contains("(+ 3 more"));
+}
+
+#[test]
+fn report_cost_by_source_excludes_claude() {
+    let out = run_report(&["--last", "30d"]);
+    assert!(out.contains("## Cost by source"));
+    let cost_section = out.split("## Usage by").next().unwrap();
+    let cost_table = cost_section.split("## Cost by source").nth(1).unwrap();
+    assert!(cost_table.contains("opencode"));
+    assert!(cost_table.contains("omp"));
+    assert!(cost_table.contains("kilo"));
+    assert!(!cost_table.contains("claude"));
+}
+
+#[test]
+fn report_since_last_exclusive_errors() {
+    let mut cmd = Command::new(bin());
+    cmd.args(["report", "--since", "2026-01-01T00:00:00Z", "--last", "7d"]);
+    cmd.args([
+        "--claude-dir",
+        fixture_dir().join("claude").to_str().unwrap(),
+        "--opencode-db",
+        fixture_dir()
+            .join("opencode")
+            .join("opencode.db")
+            .to_str()
+            .unwrap(),
+        "--omp-dir",
+        fixture_dir().join("omp").to_str().unwrap(),
+        "--kilo-db",
+        fixture_dir().join("kilo").join("kilo.db").to_str().unwrap(),
+    ]);
+    let output = cmd.output().expect("failed to run llmhelper report");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("mutually exclusive"));
+}
+
+#[test]
+fn report_top_zero_errors() {
+    let mut cmd = Command::new(bin());
+    cmd.args(["report", "--top", "0"]);
+    cmd.args([
+        "--claude-dir",
+        fixture_dir().join("claude").to_str().unwrap(),
+        "--opencode-db",
+        fixture_dir()
+            .join("opencode")
+            .join("opencode.db")
+            .to_str().unwrap(),
+        "--omp-dir",
+        fixture_dir().join("omp").to_str().unwrap(),
+        "--kilo-db",
+        fixture_dir().join("kilo").join("kilo.db").to_str().unwrap(),
+    ]);
+    let output = cmd.output().expect("failed to run llmhelper report");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--top must be at least 1"));
+}
+
+#[test]
+fn report_group_by_model_heading() {
+    let out = run_report(&["--last", "30d", "--group-by", "model"]);
+    assert!(out.contains("## Usage by model"));
+}
+
+#[test]
+fn report_cost_by_source_order_is_deterministic() {
+    let out = run_report(&["--last", "30d"]);
+    // Cost table rows should list sources in alphabetical order for
+    // deterministic output across runs. We identify data rows as those
+    // whose last cell looks like a decimal cost (e.g. " 1.500000 ").
+    let lines: Vec<&str> = out.lines().collect();
+    let data_rows: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.starts_with("| ") && l.contains("0.") && l.ends_with(" |"))
+        .copied()
+        .collect();
+    assert!(!data_rows.is_empty(), "expected at least one cost row");
+    let sources: Vec<&str> = data_rows
+        .iter()
+        .map(|l| l.split('|').nth(1).map(|s| s.trim()).unwrap_or(""))
+        .collect();
+    let mut sorted = sources.clone();
+    sorted.sort();
+    assert_eq!(sources, sorted);
+}
