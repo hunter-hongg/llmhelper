@@ -775,6 +775,7 @@ fn report_meta(args: &ReportArgs) -> ReportMeta {
         window,
         group_by: args.group_by.to_string(),
         filters,
+        title: args.title.clone(),
     }
 }
 
@@ -788,7 +789,12 @@ fn run_report(args: ReportArgs) -> anyhow::Result<()> {
     let (records, source_statuses) = registry.load_all();
     let agg = AggregateResult::from_records(&records, &filter, group_by);
     let meta = report_meta(&args);
-    println!("{}", render_report(&agg, &meta, &source_statuses, args.top));
+    let markdown = render_report(&agg, &meta, &source_statuses, args.top);
+    match args.output {
+        Some(path) => std::fs::write(&path, markdown)
+            .map_err(|e| anyhow::anyhow!("failed to write report to {}: {}", path.display(), e))?,
+        None => println!("{}", markdown),
+    }
     Ok(())
 }
 

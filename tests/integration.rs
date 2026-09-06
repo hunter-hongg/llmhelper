@@ -843,6 +843,53 @@ fn report_markdown_structure() {
 }
 
 #[test]
+fn report_custom_title_heading() {
+    let out = run_report(&["--last", "30d", "--title", "Team weekly LLM usage"]);
+    assert!(out.starts_with("# Team weekly LLM usage\n"));
+}
+
+#[test]
+fn report_output_writes_file_and_keeps_stdout_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("report.md");
+    let out = run_report(&[
+        "--last",
+        "30d",
+        "--output",
+        path.to_str().unwrap(),
+    ]);
+    assert!(out.trim().is_empty(), "stdout must stay empty when --output is set");
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(contents.starts_with("# llmhelper report\n"));
+    assert!(contents.contains("## Totals"));
+    assert!(contents.contains("## Cost by source"));
+}
+
+#[test]
+fn report_output_unwritable_path_errors() {
+    let mut cmd = Command::new(bin());
+    cmd.args(["report", "--last", "30d", "--output", "/nonexistent-dir-xyz-llmhelper/report.md"]);
+    cmd.args([
+        "--claude-dir",
+        fixture_dir().join("claude").to_str().unwrap(),
+        "--opencode-db",
+        fixture_dir()
+            .join("opencode")
+            .join("opencode.db")
+            .to_str()
+            .unwrap(),
+        "--omp-dir",
+        fixture_dir().join("omp").to_str().unwrap(),
+        "--kilo-db",
+        fixture_dir().join("kilo").join("kilo.db").to_str().unwrap(),
+    ]);
+    let output = cmd.output().expect("failed to run llmhelper report");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to write report"));
+}
+
+#[test]
 fn report_window_and_filter_echo() {
     let out = run_report(&[
         "--last",

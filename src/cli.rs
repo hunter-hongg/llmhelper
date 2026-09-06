@@ -384,6 +384,14 @@ pub struct ReportArgs {
     /// Show at most the n largest groups by input tokens (must be >= 1).
     #[arg(long = "top")]
     pub top: Option<usize>,
+
+    /// Custom Markdown document title. Defaults to "llmhelper report".
+    #[arg(long = "title")]
+    pub title: Option<String>,
+
+    /// Write the rendered report to this file instead of stdout.
+    #[arg(long = "output")]
+    pub output: Option<std::path::PathBuf>,
 }
 
 impl ReportArgs {

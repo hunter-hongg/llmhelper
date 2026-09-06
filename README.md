@@ -32,8 +32,9 @@ Shareable Markdown summary.
 ```bash
 llmhelper report --last 7d --group-by project --top 10
 llmhelper report --since 2026-08-01 --source claude --model auto
+llmhelper report --last 7d --title "Team weekly LLM usage" --output weekly.md
 ```
-Output is Markdown to stdout, suitable for pasting into chat/PR/notes. Header includes generation time, window and applied filters. Totals, per-source Cost, and a grouped usage table are rendered. `--top n` truncates the groups table with a `(+ k more …)` summary line.
+Output is Markdown to stdout, suitable for pasting into chat/PR/notes. Header includes generation time, window and applied filters. Totals, per-source Cost, and a grouped usage table are rendered. `--top n` truncates the groups table with a `(+ k more …)` summary line. `--output <path>` writes the report to a file instead of stdout; `--title <string>` replaces the default `# llmhelper report` heading.
 
 Cost is source-scoped and never summed across sources.
 

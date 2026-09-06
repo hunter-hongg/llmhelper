@@ -14,6 +14,8 @@ pub struct ReportMeta {
     pub group_by: String,
     /// Applied non-temporal filters, echoed as (label, value) pairs.
     pub filters: Vec<(String, String)>,
+    /// Custom document title. Falls back to "llmhelper report" when absent.
+    pub title: Option<String>,
 }
 
 fn md_cell(s: &str) -> String {
@@ -34,7 +36,8 @@ pub fn render_report(
     let mut out = String::new();
 
     // --- Header ---
-    out.push_str("# llmhelper report\n\n");
+    let title = meta.title.as_deref().unwrap_or("llmhelper report");
+    out.push_str(&format!("# {}\n\n", md_cell(title)));
     out.push_str(&format!(
         "- generated: {}\n",
         meta.generated_at.format("%Y-%m-%dT%H:%M:%SZ")
@@ -188,6 +191,7 @@ mod tests {
             window: "last 7d".to_string(),
             group_by: "source".to_string(),
             filters: vec![("project".to_string(), "/proj/a".to_string())],
+            title: None,
         }
     }
 
@@ -225,12 +229,33 @@ mod tests {
     }
 
     #[test]
+    fn custom_title_replaces_default_heading() {
+        let m = ReportMeta {
+            title: Some("Team weekly LLM usage".to_string()),
+            ..meta()
+        };
+        let report = render_report(&agg_with(vec![]), &m, &[], None);
+        assert!(report.starts_with("# Team weekly LLM usage\n"));
+    }
+
+    #[test]
+    fn title_pipe_is_escaped() {
+        let m = ReportMeta {
+            title: Some("Team|Weekly".to_string()),
+            ..meta()
+        };
+        let report = render_report(&agg_with(vec![]), &m, &[], None);
+        assert!(report.starts_with("# Team\\|Weekly\n"));
+    }
+
+    #[test]
     fn no_filters_renders_none() {
         let m = ReportMeta {
             generated_at: Utc::now(),
             window: "all time".to_string(),
             group_by: "project".to_string(),
             filters: vec![],
+            title: None,
         };
         let report = render_report(&agg_with(vec![]), &m, &[], None);
         assert!(report.contains("filters: (none)"));
