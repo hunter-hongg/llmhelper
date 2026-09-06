@@ -18,7 +18,9 @@ use llmhelper::report::{render_report, ReportMeta};
 use llmhelper::source::{
     ClaudeSource, KiloSource, OmpSource, OpenCodeSource, Registry, SourceStatus,
 };
-use llmhelper::tui::{DiffTuiApp, SessionsData, SessionsTuiApp, SessionsView, TerminalApp};
+use llmhelper::tui::{
+    DiffTuiApp, ReportTuiApp, SessionsData, SessionsTuiApp, SessionsView, TerminalApp,
+};
 
 /// Shared state between background refresh task and TUI main loop.
 struct TuiData {
@@ -793,8 +795,47 @@ fn run_report(args: ReportArgs) -> anyhow::Result<()> {
     match args.output {
         Some(path) => std::fs::write(&path, markdown)
             .map_err(|e| anyhow::anyhow!("failed to write report to {}: {}", path.display(), e))?,
-        None => println!("{}", markdown),
+        None => run_report_tui(&markdown)?,
     }
+    Ok(())
+}
+
+/// Interactive viewer over the rendered report. The document is static, so
+/// unlike the other subcommand TUIs there is no background refresh loop.
+fn run_report_tui(markdown: &str) -> anyhow::Result<()> {
+    let mut tui = ReportTuiApp::new(markdown)?;
+    tui.state.running = true;
+    while tui.state.running {
+        tui.terminal.draw(|frame| {
+            llmhelper::tui::report_render::render(frame, &mut tui.state);
+        })?;
+
+        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                match key.code {
+                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
+                        tui.state.quit();
+                    }
+                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                        tui.state.scroll_down();
+                    }
+                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                        tui.state.scroll_up();
+                    }
+                    crossterm::event::KeyCode::PageDown => tui.state.page_down(),
+                    crossterm::event::KeyCode::PageUp => tui.state.page_up(),
+                    crossterm::event::KeyCode::Home | crossterm::event::KeyCode::Char('g') => {
+                        tui.state.scroll_top();
+                    }
+                    crossterm::event::KeyCode::End | crossterm::event::KeyCode::Char('G') => {
+                        tui.state.scroll_bottom();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    tui.exit()?;
     Ok(())
 }
 

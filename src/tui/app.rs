@@ -1,10 +1,4 @@
-use ratatui::{backend::CrosstermBackend, widgets::TableState};
-use std::io;
-
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use ratatui::widgets::TableState;
 
 use crate::aggregator::AggregateResult;
 use crate::domain::group::GroupBy;
@@ -241,28 +235,20 @@ impl TuiState {
 }
 
 pub struct TerminalApp {
-    pub terminal: ratatui::Terminal<CrosstermBackend<io::Stdout>>,
+    pub terminal: super::terminal::StdoutTerminal,
     pub state: TuiState,
 }
 
 impl TerminalApp {
     pub fn new() -> anyhow::Result<Self> {
-        let mut stdout = io::stdout();
-        enable_raw_mode()?;
-        execute!(stdout, EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = ratatui::Terminal::new(backend)?;
         Ok(Self {
-            terminal,
+            terminal: super::terminal::enter()?,
             state: TuiState::default(),
         })
     }
 
     pub fn exit(&mut self) -> anyhow::Result<()> {
-        disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
-        self.terminal.show_cursor()?;
-        Ok(())
+        super::terminal::exit(&mut self.terminal)
     }
 }
 

@@ -1,11 +1,6 @@
 use crate::domain::record::Record;
 use crate::source::SourceStatus;
-use crossterm::{
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{backend::CrosstermBackend, widgets::TableState};
-use std::io;
+use ratatui::widgets::TableState;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum SessionsView {
@@ -155,27 +150,19 @@ impl SessionsTuiState {
 }
 
 pub struct SessionsTuiApp {
-    pub terminal: ratatui::Terminal<CrosstermBackend<io::Stdout>>,
+    pub terminal: super::terminal::StdoutTerminal,
     pub state: SessionsTuiState,
 }
 
 impl SessionsTuiApp {
     pub fn new() -> anyhow::Result<Self> {
-        let mut stdout = io::stdout();
-        enable_raw_mode()?;
-        execute!(stdout, EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = ratatui::Terminal::new(backend)?;
         Ok(Self {
-            terminal,
+            terminal: super::terminal::enter()?,
             state: SessionsTuiState::new(),
         })
     }
     pub fn exit(&mut self) -> anyhow::Result<()> {
-        disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
-        self.terminal.show_cursor()?;
-        Ok(())
+        super::terminal::exit(&mut self.terminal)
     }
 }
 

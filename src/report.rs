@@ -22,6 +22,12 @@ fn md_cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
+/// Marker opening a truncation note like `_(+ 2 more — 300 input tokens)_`.
+/// Shared with the report TUI's styling so the note shape lives in one place.
+pub fn is_truncation_note(line: &str) -> bool {
+    line.starts_with("_(") && line.ends_with(")_")
+}
+
 fn cost_cell(cost: Option<f64>) -> String {
     cost.map(|c| format!("{:.6}", c)).unwrap_or_else(|| "—".to_string())
 }
@@ -364,5 +370,12 @@ mod tests {
         let agg = agg_with(vec![group("a|b", "claude", 100, None)]);
         let report = render_report(&agg, &meta(), &[], None);
         assert!(report.contains("| a\\|b |"));
+    }
+
+    #[test]
+    fn truncation_note_shape_is_recognized() {
+        assert!(is_truncation_note("_(+ 2 more — 300 input tokens)_"));
+        assert!(!is_truncation_note("plain text"));
+        assert!(!is_truncation_note("_(unclosed"));
     }
 }

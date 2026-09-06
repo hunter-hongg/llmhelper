@@ -800,10 +800,9 @@ fn sessions_json_sort_desc() {
 
 // --- report integration tests ---
 
-fn run_report(extra_args: &[&str]) -> String {
-    let mut cmd = Command::new(bin());
-    cmd.args(["report"]);
-    cmd.args([
+// Fixture source overrides shared by every report invocation.
+fn report_source_flags() -> Vec<String> {
+    [
         "--claude-dir",
         fixture_dir().join("claude").to_str().unwrap(),
         "--opencode-db",
@@ -816,7 +815,27 @@ fn run_report(extra_args: &[&str]) -> String {
         fixture_dir().join("omp").to_str().unwrap(),
         "--kilo-db",
         fixture_dir().join("kilo").join("kilo.db").to_str().unwrap(),
-    ]);
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+// The report TUI is the default when `--output` is absent, so content
+// assertions go through a temp file destination; stdout must stay empty.
+fn run_report(extra_args: &[&str]) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("report.md");
+    run_report_to(&path, extra_args);
+    std::fs::read_to_string(&path).unwrap()
+}
+
+fn run_report_to(path: &std::path::Path, extra_args: &[&str]) {
+    let mut cmd = Command::new(bin());
+    cmd.arg("report").arg("--output").arg(path);
+    for flag in report_source_flags() {
+        cmd.arg(flag);
+    }
     for arg in extra_args {
         cmd.arg(arg);
     }
@@ -827,7 +846,10 @@ fn run_report(extra_args: &[&str]) -> String {
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8(output.stdout).unwrap()
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "report must not write to stdout when --output is given"
+    );
 }
 
 #[test]
@@ -852,13 +874,7 @@ fn report_custom_title_heading() {
 fn report_output_writes_file_and_keeps_stdout_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("report.md");
-    let out = run_report(&[
-        "--last",
-        "30d",
-        "--output",
-        path.to_str().unwrap(),
-    ]);
-    assert!(out.trim().is_empty(), "stdout must stay empty when --output is set");
+    run_report_to(&path, &["--last", "30d"]);
     let contents = std::fs::read_to_string(&path).unwrap();
     assert!(contents.starts_with("# llmhelper report\n"));
     assert!(contents.contains("## Totals"));
