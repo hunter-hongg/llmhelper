@@ -6,5 +6,6 @@ pub mod domain;
 pub mod filter;
 pub mod output;
 pub mod report;
+pub mod request;
 pub mod source;
 pub mod tui;

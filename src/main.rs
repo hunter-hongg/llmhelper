@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use llmhelper::cli::{Cli, Command, DiffArgs, ReportArgs, SessionsArgs, UsageArgs};
+use llmhelper::cli::{Cli, Command, DiffArgs, ReportArgs, RequestArgs, SessionsArgs, UsageArgs};
 use llmhelper::config::Config;
 use llmhelper::diff::compute_diff;
 use llmhelper::domain::group::GroupBy;
@@ -18,8 +18,10 @@ use llmhelper::report::{render_report, ReportMeta};
 use llmhelper::source::{
     ClaudeSource, KiloSource, OmpSource, OpenCodeSource, Registry, SourceStatus,
 };
+use llmhelper::tui::scroll::Scrollable;
 use llmhelper::tui::{
-    DiffTuiApp, ReportTuiApp, SessionsData, SessionsTuiApp, SessionsView, TerminalApp,
+    DiffTuiApp, ReportTuiApp, RequestMeta, RequestTuiApp, SessionsData, SessionsTuiApp,
+    SessionsView, TerminalApp,
 };
 
 /// Shared state between background refresh task and TUI main loop.
@@ -122,6 +124,10 @@ fn config_from_sessions_args(config: Config, args: &SessionsArgs) -> Config {
         omp_dir: args.omp_dir.clone().or(config.omp_dir),
         kilo_dbs: args.kilo_db.clone().or(config.kilo_dbs),
         refresh_interval_seconds: config.refresh_interval_seconds,
+        request_base_url: config.request_base_url,
+        request_api_key: config.request_api_key,
+        request_default_model: config.request_default_model,
+        request_timeout_seconds: config.request_timeout_seconds,
     }
 }
 
@@ -839,6 +845,139 @@ fn run_report_tui(markdown: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Extract the host portion of a base URL for TUI display: the API key is
+/// never shown and the path is dropped, leaving only the endpoint identity.
+fn extract_host(base_url: &str) -> String {
+    base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or(base_url)
+        .to_string()
+}
+
+/// Assemble the message list for the request from `--messages` (JSON file)
+/// or `--prompt` (single user turn). Neither is a hard error at this layer:
+/// the caller decides whether an empty list is allowed.
+fn request_messages(args: &RequestArgs) -> anyhow::Result<Vec<serde_json::Value>> {
+    if let Some(messages_path) = &args.messages {
+        llmhelper::request::load_messages_file(messages_path)
+    } else if let Some(prompt) = &args.prompt {
+        Ok(vec![serde_json::json!({
+            "role": "user",
+            "content": prompt
+        })])
+    } else {
+        Ok(vec![])
+    }
+}
+
+fn run_request(args: RequestArgs) -> anyhow::Result<()> {
+    args.validate()?;
+    let config = Config::load();
+    let settings = llmhelper::request::RequestSettings::resolve(&args, &config)?;
+
+    let messages = request_messages(&args)?;
+    if messages.is_empty() {
+        anyhow::bail!("provide a prompt via --prompt or --messages (TUI input is not supported yet)");
+    }
+
+    let payload = llmhelper::request::build_payload(
+        &settings.model,
+        &messages,
+        args.temperature,
+        args.top_p,
+        args.max_tokens,
+        &args.stop,
+    );
+
+    let start = std::time::Instant::now();
+    let rt = Runtime::new()?;
+    let response = match rt.block_on(llmhelper::request::send_chat_completion(
+        &settings,
+        &payload,
+    )) {
+        Ok(resp) => resp,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let duration_ms = start.elapsed().as_millis();
+
+    if args.json {
+        let mut buf = Vec::new();
+        serde_json::to_writer_pretty(&mut buf, &response.raw)?;
+        println!("{}", String::from_utf8(buf)?);
+        Ok(())
+    } else if args.text {
+        match &response.assistant_content {
+            Some(content) => {
+                println!("{}", content);
+                Ok(())
+            }
+            None => anyhow::bail!("response contains no assistant content"),
+        }
+    } else {
+        let host = extract_host(&settings.base_url);
+        let usage_tokens = response
+            .usage
+            .as_ref()
+            .and_then(|u| u.get("total_tokens").and_then(|v| v.as_u64()));
+        let body_text = response.assistant_content.as_deref().unwrap_or("");
+        run_request_tui(
+            &RequestMeta {
+                model: settings.model.clone(),
+                host,
+                duration_ms,
+                usage_tokens,
+            },
+            body_text,
+        )
+    }
+}
+
+/// Interactive viewer over a completed request response, mirroring the
+/// report TUI: static body, scroll keys, no background refresh.
+fn run_request_tui(meta: &RequestMeta, body: &str) -> anyhow::Result<()> {
+    let mut tui = RequestTuiApp::new(meta.clone(), body)?;
+    tui.state.running = true;
+    while tui.state.running {
+        tui.terminal.draw(|frame| {
+            llmhelper::tui::request_render::render(frame, &mut tui.state);
+        })?;
+
+        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                match key.code {
+                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
+                        tui.state.quit();
+                    }
+                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                        tui.state.scroll_down();
+                    }
+                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                        tui.state.scroll_up();
+                    }
+                    crossterm::event::KeyCode::PageDown => tui.state.page_down(),
+                    crossterm::event::KeyCode::PageUp => tui.state.page_up(),
+                    crossterm::event::KeyCode::Home | crossterm::event::KeyCode::Char('g') => {
+                        tui.state.scroll_top();
+                    }
+                    crossterm::event::KeyCode::End | crossterm::event::KeyCode::Char('G') => {
+                        tui.state.scroll_bottom();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    tui.exit()?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -846,5 +985,6 @@ fn main() -> anyhow::Result<()> {
         Command::Diff(args) => run_diff(args),
         Command::Sessions(args) => run_sessions(args),
         Command::Report(args) => run_report(args),
+        Command::Request(args) => run_request(args),
     }
 }

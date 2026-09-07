@@ -21,6 +21,8 @@ pub enum Command {
     Sessions(SessionsArgs),
     /// Render a shareable Markdown summary of filtered Usage.
     Report(ReportArgs),
+    /// Send request to OpenAI compatible endpoint.
+    Request(RequestArgs),
 }
 
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
@@ -413,6 +415,44 @@ impl ReportArgs {
             if top == 0 {
                 anyhow::bail!("--top must be at least 1");
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Parser, Debug, Clone, Default)]
+pub struct RequestArgs {
+    #[arg(long = "base-url")]
+    pub base_url: Option<String>,
+    #[arg(long = "api-key")]
+    pub api_key: Option<String>,
+    #[arg(long = "model")]
+    pub model: Option<String>,
+    #[arg(long = "messages")]
+    pub messages: Option<std::path::PathBuf>,
+    #[arg(long = "prompt")]
+    pub prompt: Option<String>,
+    #[arg(long = "json")]
+    pub json: bool,
+    #[arg(long = "text")]
+    pub text: bool,
+    #[arg(long = "temperature")]
+    pub temperature: Option<f32>,
+    #[arg(long = "top-p")]
+    pub top_p: Option<f32>,
+    #[arg(long = "max-tokens")]
+    pub max_tokens: Option<u32>,
+    #[arg(long = "stop")]
+    pub stop: Vec<String>,
+}
+
+impl RequestArgs {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.json && self.text {
+            anyhow::bail!("--json and --text are mutually exclusive");
+        }
+        if self.messages.is_some() && self.prompt.is_some() {
+            anyhow::bail!("--messages and --prompt are mutually exclusive");
         }
         Ok(())
     }

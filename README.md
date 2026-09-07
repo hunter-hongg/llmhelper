@@ -40,6 +40,22 @@ With `--output <path>` the report is written to the file instead (stdout stays e
 
 Cost is source-scoped and never summed across sources.
 
+### request
+Send an OpenAI-compatible Chat Completions request with TUI or CLI output.
+```bash
+# Interactive TUI viewer (default)
+llmhelper request --base-url https://api.example.com --model gpt-4 --prompt "Hello"
+
+# JSON output
+llmhelper request --base-url https://api.example.com --api-key $KEY --model gpt-4 \
+  --messages messages.json --json
+
+# Plain text output (only assistant content)
+llmhelper request --base-url https://api.example.com --model gpt-4 --prompt "Hi" --text
+```
+
+Flags: `--base-url` (required unless in config), `--api-key` (env `LLMHELPER_API_KEY` fallback), `--model` (required), `--messages <path>` (JSON array of `{role, content}`), `--prompt <string>` (single user turn), `--json` prints full response, `--text` prints only assistant message content, `--temperature`, `--top-p`, `--max-tokens`, `--stop` (repeatable). Configuration via `[request]` section in `~/.config/llmhelper/config.toml`.
+
 ## Sources
 
 - claude – transcript JSONL

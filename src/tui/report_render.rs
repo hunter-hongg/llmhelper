@@ -1,10 +1,12 @@
-use crate::tui::render::{ACCENT, ACCENT2, BG, BORDER, MUTED, SURFACE, TEXT, TITLE};
+use crate::tui::render::{ACCENT, ACCENT2, BG, BORDER, MUTED, TEXT, TITLE};
 use crate::tui::report_app::ReportTuiState;
+use crate::tui::scroll::Scrollable;
+use crate::tui::viewer::{panel, render_footer};
 use ratatui::{
     layout::{Constraint, Layout},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -26,18 +28,6 @@ pub fn render(frame: &mut Frame, state: &mut ReportTuiState) {
     frame.render_widget(render_footer(), chunks[2]);
 }
 
-fn panel(block_title: &'static str) -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(BG))
-        .title(Line::from(Span::styled(
-            format!(" {} ", block_title),
-            Style::default().fg(TITLE),
-        )))
-}
-
 fn render_header(state: &ReportTuiState) -> Paragraph<'_> {
     let indicator = scroll_indicator(state);
     Paragraph::new(Line::from(vec![
@@ -56,8 +46,8 @@ fn scroll_indicator(state: &ReportTuiState) -> String {
     if state.lines.is_empty() {
         return "empty".to_string();
     }
-    let first = state.scroll + 1;
-    let last = (state.scroll + state.viewport_height.max(1)).min(state.lines.len());
+    let first = state.scroll() + 1;
+    let last = (state.scroll() + state.viewport_height().max(1)).min(state.lines.len());
     format!("lines {}-{} of {}", first, last, state.lines.len())
 }
 
@@ -206,36 +196,7 @@ fn render_body(state: &ReportTuiState) -> Paragraph<'static> {
     Paragraph::new(text)
         .block(panel("report"))
         .style(Style::default().bg(BG))
-        .scroll((state.scroll as u16, 0))
-}
-
-fn render_footer() -> Paragraph<'static> {
-    let keys: &[(&str, &str)] = &[
-        ("↑↓", "scroll"),
-        ("PgUp/PgDn", "page"),
-        ("g/G", "top/bottom"),
-        ("q", "quit"),
-    ];
-    let mut spans = Vec::new();
-    for (k, label) in keys {
-        spans.push(Span::styled(
-            format!(" {} ", k),
-            Style::default()
-                .fg(ACCENT)
-                .bg(SURFACE)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            format!("{}    ", label),
-            Style::default().fg(MUTED),
-        ));
-    }
-    Paragraph::new(Line::from(spans)).block(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(BORDER))
-            .style(Style::default().bg(BG)),
-    )
+        .scroll((state.scroll() as u16, 0))
 }
 
 #[cfg(test)]

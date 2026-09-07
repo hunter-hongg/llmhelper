@@ -7,6 +7,10 @@ pub struct Config {
     pub omp_dir: Option<PathBuf>,
     pub kilo_dbs: Option<Vec<PathBuf>>,
     pub refresh_interval_seconds: u64,
+    pub request_base_url: Option<String>,
+    pub request_api_key: Option<String>,
+    pub request_default_model: Option<String>,
+    pub request_timeout_seconds: Option<u64>,
 }
 
 impl Default for Config {
@@ -17,6 +21,10 @@ impl Default for Config {
             omp_dir: None,
             kilo_dbs: None,
             refresh_interval_seconds: 5,
+            request_base_url: None,
+            request_api_key: None,
+            request_default_model: None,
+            request_timeout_seconds: None,
         }
     }
 }
@@ -65,6 +73,10 @@ impl Config {
                 .ui
                 .and_then(|u| u.refresh_interval_seconds)
                 .unwrap_or(5),
+            request_base_url: parsed.request.as_ref().and_then(|r| r.base_url.clone()),
+            request_api_key: parsed.request.as_ref().and_then(|r| r.api_key.clone()),
+            request_default_model: parsed.request.as_ref().and_then(|r| r.default_model.clone()),
+            request_timeout_seconds: parsed.request.as_ref().and_then(|r| r.timeout_seconds),
         }
     }
 
@@ -76,6 +88,10 @@ impl Config {
             omp_dir: cli.omp_dir.clone().or(self.omp_dir),
             kilo_dbs: cli.kilo_db.clone().or(self.kilo_dbs),
             refresh_interval_seconds: self.refresh_interval_seconds,
+            request_base_url: self.request_base_url,
+            request_api_key: self.request_api_key,
+            request_default_model: self.request_default_model,
+            request_timeout_seconds: self.request_timeout_seconds,
         }
     }
 }
@@ -84,6 +100,7 @@ impl Config {
 struct ConfigTable {
     source: Option<SourceConfig>,
     ui: Option<UiConfig>,
+    request: Option<RequestConfig>,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -117,6 +134,14 @@ struct KiloSourceConfig {
 #[derive(serde::Deserialize, Debug, Default)]
 struct UiConfig {
     refresh_interval_seconds: Option<u64>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct RequestConfig {
+    base_url: Option<String>,
+    api_key: Option<String>,
+    default_model: Option<String>,
+    timeout_seconds: Option<u64>,
 }
 
 #[cfg(test)]
