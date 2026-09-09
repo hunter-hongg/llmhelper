@@ -436,6 +436,8 @@ pub struct RequestArgs {
     pub json: bool,
     #[arg(long = "text")]
     pub text: bool,
+    #[arg(long = "stream")]
+    pub stream: bool,
     #[arg(long = "temperature")]
     pub temperature: Option<f32>,
     #[arg(long = "top-p")]

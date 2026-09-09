@@ -46,9 +46,18 @@ fn start_server(status: &str, body: &str) -> (std::net::SocketAddr, std::thread:
                 }
             }
         }
-        let resp = format!("HTTP/1.1 {}\r\nContent-Type: application/json\r\n\r\n", status);
+        let request_line = req.lines().next().unwrap_or("");
+        let path = request_line.split_whitespace().nth(1).unwrap_or("");
+        let (status_line, content_type, payload) = if path == "/v1/chat/completions" {
+            (status.as_str(), "application/json", body.as_str())
+        } else {
+            ("200 OK", "text/html", HTML_FALLBACK_BODY)
+        };
+        let resp = format!(
+            "HTTP/1.1 {}\r\nContent-Type: {}\r\n\r\n{}",
+            status_line, content_type, payload
+        );
         let _ = stream.write_all(resp.as_bytes());
-        let _ = stream.write_all(body.as_bytes());
         let _ = stream.flush();
         req
     });
@@ -71,6 +80,11 @@ fn content_length(headers: &str) -> Option<usize> {
 }
 
 const OK_BODY: &str = r#"{"id":"chatcmpl-test","model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"Hello back"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+
+/// SPA fallback served for any path other than `/v1/chat/completions`,
+/// mirroring the real OpenAI-compatible frontend behaviour that made a
+/// wrong endpoint path surface as 200 + HTML instead of a JSON body.
+const HTML_FALLBACK_BODY: &str = "<!doctype html>\n<html lang=\"en\"><body>frontend</body></html>\n";
 
 fn base_args(addr: &std::net::SocketAddr) -> Vec<String> {
     vec![
@@ -308,4 +322,43 @@ timeout_seconds = 5
     let received = body_of(&req);
     assert_eq!(received["model"].as_str().unwrap(), "cfg-model");
     assert!(req.contains("authorization: Bearer cfg-key"));
+}
+
+#[test]
+fn request_posts_to_v1_chat_completions_endpoint() {
+    let (addr, handle) = start_server("200 OK", OK_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    let output = run_with_args(&args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let req = handle.join().unwrap();
+    let request_line = req.lines().next().unwrap_or("");
+    assert_eq!(request_line, "POST /v1/chat/completions HTTP/1.1");
+}
+
+#[test]
+fn request_stream_text_prints_deltas() {
+    let (addr, handle) = start_server(
+        "200 OK",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\ndata: [DONE]\n\n",
+    );
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--stream".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    let output = run_with_args(&args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello\n");
+    let _req = handle.join().unwrap();
 }

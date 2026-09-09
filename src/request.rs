@@ -28,6 +28,7 @@ pub fn build_payload(
     top_p: Option<f32>,
     max_tokens: Option<u32>,
     stop: &[String],
+    stream: bool,
 ) -> Value {
     let mut payload = serde_json::Map::new();
     payload.insert(
@@ -59,6 +60,12 @@ pub fn build_payload(
                     .collect(),
             ),
         );
+    }
+    if stream {
+        payload.insert("stream".to_string(), serde_json::Value::Bool(true));
+        let mut stream_options = serde_json::Map::new();
+        stream_options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+        payload.insert("stream_options".to_string(), serde_json::Value::Object(stream_options));
     }
     serde_json::Value::Object(payload)
 }
@@ -118,7 +125,7 @@ pub async fn send_chat_completion(
     settings: &RequestSettings,
     payload: &Value,
 ) -> anyhow::Result<RequestResponse> {
-    let endpoint = format!("{}/chat/completions", settings.base_url);
+    let endpoint = format!("{}/v1/chat/completions", settings.base_url);
     let mut req = reqwest::Client::builder()
         .timeout(settings.timeout)
         .build()?
@@ -146,6 +153,85 @@ pub async fn send_chat_completion(
     }
     let raw: Value = serde_json::from_str(&body).context("failed to parse response JSON")?;
     Ok(parse_response(status_code, raw))
+}
+
+#[derive(Debug)]
+pub struct StreamResponse {
+    pub status: u16,
+    pub usage: Option<Value>,
+    pub content: String,
+}
+
+/// Stream a Chat Completions request, feeding each parsed SSE event to `on_event`.
+/// The function returns the final HTTP status, the last usage object seen, and the
+/// concatenated content accumulated from all `delta.content` events.
+pub async fn send_chat_completion_stream<F>(
+    settings: &RequestSettings,
+    payload: &Value,
+    mut on_event: F,
+) -> anyhow::Result<StreamResponse>
+where
+    F: FnMut(Value),
+{
+    use futures_util::StreamExt;
+    let endpoint = format!("{}/v1/chat/completions", settings.base_url);
+    let client = reqwest::Client::builder()
+        .connect_timeout(settings.timeout)
+        .build()?;
+    let mut req = client
+        .post(&endpoint)
+        .header("Content-Type", "application/json")
+        .json(payload);
+    if let Some(key) = &settings.api_key {
+        req = req.header("Authorization", format!("Bearer {}", key));
+    }
+    let resp = req.send().await.context("failed to send request to OpenAI-compatible endpoint")?;
+    let status_code = resp.status().as_u16();
+    if !(200..300).contains(&status_code) {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("HTTP {}: {}", status_code, body.chars().take(500).collect::<String>());
+    }
+    let mut stream = resp.bytes_stream();
+    let mut parser = SseParser::new();
+    let mut content = String::new();
+    let mut usage = None;
+    loop {
+        let maybe_chunk = stream.next().await;
+        match maybe_chunk {
+            Some(Ok(chunk)) => {
+                let text = String::from_utf8_lossy(&chunk);
+                let events = parser.feed(&text);
+                for event in events {
+                    on_event(event.clone());
+                    if let Some(delta) = extract_delta_content(&event) {
+                        content.push_str(&delta);
+                    }
+                    if let Some(u) = extract_stream_usage(&event) {
+                        usage = Some(u);
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                bail!("stream interrupted: {}", e);
+            }
+            None => break,
+        }
+    }
+    let final_events = parser.finish();
+    for event in final_events {
+        on_event(event.clone());
+        if let Some(delta) = extract_delta_content(&event) {
+            content.push_str(&delta);
+        }
+        if let Some(u) = extract_stream_usage(&event) {
+            usage = Some(u);
+        }
+    }
+    Ok(StreamResponse {
+        status: status_code,
+        usage,
+        content,
+    })
 }
 
 /// Extract `usage` and the first assistant content from a Chat
@@ -189,6 +275,94 @@ pub fn load_messages_file(path: &std::path::Path) -> anyhow::Result<Vec<Value>> 
     Ok(messages)
 }
 
+#[derive(Debug, Default)]
+pub struct SseParser {
+    buffer: String,
+    pending_data: Option<String>,
+}
+
+impl SseParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn feed(&mut self, chunk: &str) -> Vec<Value> {
+        self.buffer.push_str(chunk);
+        let mut events = Vec::new();
+        while let Some(pos) = self.buffer.find('\n') {
+            let line_raw = self.buffer[..pos].to_string();
+            self.buffer = self.buffer[pos + 1..].to_string();
+            let line = line_raw.trim_end_matches('\r');
+            self.process_line(line, &mut events);
+        }
+        events
+    }
+
+    pub fn finish(mut self) -> Vec<Value> {
+        let mut events = Vec::new();
+        if !self.buffer.is_empty() {
+            let line = self.buffer.trim_end_matches('\r').to_string();
+            self.buffer.clear();
+            self.process_line(&line, &mut events);
+        }
+        self.flush_event(&mut events);
+        events
+    }
+
+    fn process_line(&mut self, line: &str, events: &mut Vec<Value>) {
+        if line.is_empty() {
+            self.flush_event(events);
+            return;
+        }
+        if line.starts_with(':') {
+            return;
+        }
+        if let Some(colon) = line.find(": ") {
+            let field = &line[..colon];
+            let value = &line[colon + 2..];
+            if field == "data" {
+                match &mut self.pending_data {
+                    Some(existing) => {
+                        existing.push('\n');
+                        existing.push_str(value);
+                    }
+                    None => {
+                        self.pending_data = Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    fn flush_event(&mut self, events: &mut Vec<Value>) {
+        if let Some(data) = self.pending_data.take() {
+            if data.trim() == "[DONE]" {
+                return;
+            }
+            if !data.trim().is_empty() {
+                if let Ok(val) = serde_json::from_str::<Value>(&data) {
+                    events.push(val);
+                }
+            }
+        }
+    }
+}
+
+pub fn extract_delta_content(event: &Value) -> Option<String> {
+    event
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(|content| content.as_str())
+        .map(str::to_string)
+}
+
+pub fn extract_stream_usage(event: &Value) -> Option<Value> {
+    event.get("usage").cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,7 +374,7 @@ mod tests {
 
     #[test]
     fn build_payload_includes_model_and_messages() {
-        let payload = build_payload("gpt-4", &[user_msg("Hello")], None, None, None, &[]);
+        let payload = build_payload("gpt-4", &[user_msg("Hello")], None, None, None, &[], false);
         assert_eq!(payload["model"].as_str().unwrap(), "gpt-4");
         assert_eq!(payload["messages"], json!([{"role": "user", "content": "Hello"}]));
     }
@@ -214,6 +388,7 @@ mod tests {
             Some(0.95),
             Some(100),
             &["<stop>".to_string()],
+            false,
         );
         let temp = payload["temperature"].as_f64().unwrap();
         let top_p = payload["top_p"].as_f64().unwrap();
@@ -226,7 +401,7 @@ mod tests {
 
     #[test]
     fn build_payload_omits_absent_sampling_params() {
-        let payload = build_payload("gpt-4", &[user_msg("Hello")], None, None, None, &[]);
+        let payload = build_payload("gpt-4", &[user_msg("Hello")], None, None, None, &[], false);
         for key in ["temperature", "top_p", "max_tokens", "stop"] {
             assert!(payload.get(key).is_none(), "{} should be omitted", key);
         }
@@ -241,6 +416,7 @@ mod tests {
             None,
             None,
             &["<stop1>".to_string(), "<stop2>".to_string()],
+            false,
         );
         let stop_arr = payload["stop"].as_array().unwrap();
         assert_eq!(stop_arr.len(), 2);
@@ -361,5 +537,86 @@ mod tests {
         let s = RequestSettings::resolve(&RequestArgs::default(), &config).unwrap();
         std::env::remove_var("LLMHELPER_API_KEY");
         assert_eq!(s.api_key.as_deref(), Some("env-key"));
+    }
+
+    #[test]
+    fn sse_parser_parses_simple_event() {
+        let mut parser = SseParser::new();
+        let data = r#"data: {"choices":[{"delta":{"content":"hi"}}]}
+
+"#;
+        let events = parser.feed(data);
+        assert_eq!(events.len(), 1);
+        assert_eq!(extract_delta_content(&events[0]), Some("hi".to_string()));
+    }
+
+    #[test]
+    fn sse_parser_joins_multiline_data() {
+        let mut parser = SseParser::new();
+        let data = "data: {\"a\":1}\n\n";
+        let events = parser.feed(data);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["a"].as_u64().unwrap(), 1);
+
+        let data2 = "data: {\"b\":2}\n\n";
+        let events2 = parser.feed(data2);
+        assert_eq!(events2.len(), 1);
+        assert_eq!(events2[0]["b"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn sse_parser_ignores_comments_and_empty_lines() {
+        let mut parser = SseParser::new();
+        let data = ": ping\n\ndata: {\"x\":1}\n\n";
+        let events = parser.feed(data);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["x"].as_u64().unwrap(), 1);
+    }
+
+    #[test]
+    fn sse_parser_skips_done_sentinel() {
+        let mut parser = SseParser::new();
+        let data = "data: [DONE]\n\n";
+        let events = parser.feed(data);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn sse_parser_handles_partial_chunk_boundaries() {
+        let mut parser = SseParser::new();
+        let part1 = "data: {\"choices\":[{\"delta\":{\"content\":\"hel";
+        let part2 = "lo\"}}]}\n\n";
+        let e1 = parser.feed(part1);
+        assert!(e1.is_empty());
+        let e2 = parser.feed(part2);
+        assert_eq!(e2.len(), 1);
+        assert_eq!(extract_delta_content(&e2[0]), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn extract_delta_content_returns_none_for_missing() {
+        let v = json!({});
+        assert_eq!(extract_delta_content(&v), None);
+    }
+
+    #[test]
+    fn extract_stream_usage_returns_usage() {
+        let v = json!({"usage": {"total_tokens": 10}});
+        let usage = extract_stream_usage(&v).unwrap();
+        assert_eq!(usage["total_tokens"].as_u64().unwrap(), 10);
+    }
+
+    #[test]
+    fn build_payload_includes_stream_fields_when_streaming() {
+        let payload = build_payload("m", &[], None, None, None, &[], true);
+        assert!(payload["stream"].as_bool().unwrap());
+        assert!(payload["stream_options"]["include_usage"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn build_payload_omits_stream_fields_when_not_streaming() {
+        let payload = build_payload("m", &[], None, None, None, &[], false);
+        assert!(payload.get("stream").is_none());
+        assert!(payload.get("stream_options").is_none());
     }
 }

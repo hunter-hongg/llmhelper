@@ -39,7 +39,7 @@ fn render_header(state: &RequestTuiState) -> Paragraph<'_> {
 /// endpoint is the host only, so the API key can never reach the TUI.
 fn header_line(state: &RequestTuiState) -> Line<'static> {
     let meta = &state.meta;
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled("llmhelper", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw("  request"),
         Span::raw("  "),
@@ -62,7 +62,19 @@ fn header_line(state: &RequestTuiState) -> Line<'static> {
             format!("tokens: {}", usage_text(meta.usage_tokens)),
             Style::default().fg(MUTED),
         ),
-    ])
+    ];
+    match meta.stream_state {
+        crate::tui::request_app::StreamState::Live => {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled("stream: live", Style::default().fg(ACCENT)));
+        }
+        crate::tui::request_app::StreamState::Done => {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled("stream: done", Style::default().fg(MUTED)));
+        }
+        crate::tui::request_app::StreamState::Off => {}
+    }
+    Line::from(spans)
 }
 
 /// Token count for the header, dimmed dash when the provider omitted usage.
@@ -89,6 +101,7 @@ mod tests {
                 host: "api.example.com".to_string(),
                 duration_ms: 1234,
                 usage_tokens: usage,
+                stream_state: crate::tui::request_app::StreamState::Off,
             },
             "hello",
         )

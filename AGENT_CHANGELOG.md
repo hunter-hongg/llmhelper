@@ -56,4 +56,12 @@
 
 - 实现 `report` TUI 交互查看器（默认输出方式变更）：按 spec `docs/specs/0007-report-tui.md` 与 `.scratch/report-tui/issues/` 两张 ticket，`report` 不带 `--output` 时不再向 stdout 打印 Markdown，而是进入 TUI 渲染报告——复用纯函数 `render_report` 生成的同一份 Markdown，静态文档滚动查看（无后台刷新，`r` 不提供）：`↑↓/j k` 逐行、`PgUp/PgDn` 半页、`g/Home`/`G/End` 顶部/底部，滚动范围按视口高度 clamp 到文档边界，header 显示 `lines X-Y of N` 指示器（空文档显示 `empty`），Markdown 按行着色（# 一级标题 ACCENT 加粗、深级标题 ACCENT2 加粗、表格行 TEXT、分隔行/横线/`(+ k more…)` 折叠注 MUTED）；`--output <path>` 行为不变（落盘、stdout 为空）。新增 `ReportTuiState`（含 13 个 state 单元测试：clamp、空文档、零视口、`quit()` 转换）与纯函数 `styled_line`（8 个单元测试）；8 个报告内容集成测试改经 `--output` 临时文件断言（`run_report_to`/`report_source_flags` 抽出公共 harness）。代码审查（双轴）修复：抽出 `tui::terminal::enter/exit` 消除四个 TUI 入口结构体的 raw-mode/alternate-screen 重复；`is_truncation_note` 共享折叠注形状避免魔法字符串漂移；深级标题改用 ACCENT2；补横线着色分支；spec 修订 story 7 指示器措辞与折叠注/空文档两条实现决策。PTY 80×24 与 130×30 smoke（`.scratch/report_tui_smoke.py`，含 PTY resize 强制全帧重绘以规避 ratatui diff 流断言陷阱）。`cargo test` 97 lib + 52 integration 全通过，`cargo clippy --all-targets -- -D warnings` 通过。commit `64907b8`。
 
-- 会话总结：`report` 默认进入 TUI 渲染报告（`--output` 落盘不变），静态滚动查看器 + 行着色 + 滚动指示器，抽出共享 `tui::terminal`；经代码审查修复重复与样式偏差。测试 94 → 97 lib 全通过。commit `64907b8`。
+- 会话总结：`report` 默认进入 TUI 渲染报告（`--output` 落盘不变），静态滚动查看器 + 行着色 + 滚动指示器，抽出共享 `tui::terminal`；经代码审查修复重复与样式偏差。测试 94 → 97 lib 全通过。commit `64907b8`.
+
+## 2026-09-08
+
+- 为 `request` 子命令加入 SSE 流式支持：新增 `--stream` 标志，payload 增加 `stream: true` 与 `stream_options.include_usage`，实现纯 SSE 解析器 `SseParser` 及 `extract_delta_content`/`extract_stream_usage` 工具函数；新增 `send_chat_completion_stream`，支持回调逐事件处理。CLI 增加 `--stream` 模式，`--text --stream` 实时打印增量，`--json --stream` 以 NDJSON 输出原始事件；TUI 流式查看器实时渲染文本，header 显示 `stream: live/done`、`time` 实时递增、token 使用更新，并实现 auto-follow 尾部、滚动上下切换 follow 行为。新增 SSE 解析单元测试 7 项、构建 payload 流式字段测试、流式状态单元测试；`cargo test` 133 lib + 52 integration + 9 request 全通过。Spec 写入 `docs/specs/0009-request-stream.md`。commit `a300252`.
+
+## 2026-09-09
+
+- 修复 `request` 端点路径 bug：`send_chat_completion` 与 `send_chat_completion_stream` 此前 POST 到 `{base}/chat/completions`，网关（如 freellmapi）对该路径返回 200 + SPA HTML 前端页而非 JSON，导致 `serde_json::from_str` 统一报 "failed to parse response JSON"（与 prompt 内容/语言无关）。两处端点统一改为 `{base}/v1/chat/completions`。集成测试夹具升级为按请求路径路由：非 `/v1/chat/completions` 返回 `text/html` 兜底页（复刻真实网关行为，此前夹具对任意路径回 JSON 掩盖了该 bug），新增请求行路径断言回归测试与 `--stream --text` 集成测试，`tests/request.rs` 9 → 11 全通过。同步修正 `docs/specs/0008-request.md` 的端点路径。注：此修复曾在 2026-09-08 会话中做过但仅存在于未提交工作区、未进任何 commit 而丢失，本次重新应用。HTTP 401（Invalid API key）为服务端凭据问题，curl 直连 `/v1/chat/completions` 可复现，与本次解析 bug 无关。

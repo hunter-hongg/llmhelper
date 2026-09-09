@@ -2,6 +2,14 @@ use crate::tui::scroll::Scrollable;
 
 /// Header metadata for the request viewer, kept apart from the response body
 /// so the render layer never has to touch the raw response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamState {
+    #[default]
+    Off,
+    Live,
+    Done,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RequestMeta {
     pub model: String,
@@ -10,6 +18,7 @@ pub struct RequestMeta {
     pub host: String,
     pub duration_ms: u128,
     pub usage_tokens: Option<u64>,
+    pub stream_state: StreamState,
 }
 
 #[derive(Debug, Default)]
@@ -19,12 +28,15 @@ pub struct RequestTuiState {
     pub scroll: usize,
     pub viewport_height: usize,
     pub meta: RequestMeta,
+    pub follow: bool,
 }
 
 impl RequestTuiState {
     pub fn new(meta: RequestMeta, body: &str) -> Self {
-        let body_lines: Vec<String> = if body.trim().is_empty() {
+        let body_lines: Vec<String> = if body.trim().is_empty() && !matches!(meta.stream_state, StreamState::Live) {
             vec!["(empty response)".to_string()]
+        } else if body.trim().is_empty() && matches!(meta.stream_state, StreamState::Live) {
+            vec!["".to_string()]
         } else {
             body.lines().map(str::to_string).collect()
         };
@@ -33,7 +45,8 @@ impl RequestTuiState {
             body_lines,
             scroll: 0,
             viewport_height: 0,
-            meta,
+            meta: meta.clone(),
+            follow: matches!(meta.stream_state, StreamState::Live),
         }
     }
 
@@ -88,6 +101,7 @@ mod tests {
             host: "api.example.com".to_string(),
             duration_ms: 1200,
             usage_tokens: Some(30),
+            stream_state: StreamState::Off,
         };
         let mut state =
             RequestTuiState::new(meta, &"x\n".repeat(body_lines));
@@ -117,6 +131,7 @@ mod tests {
             host: "h".to_string(),
             duration_ms: 0,
             usage_tokens: None,
+            stream_state: StreamState::Off,
         };
         let state = RequestTuiState::new(meta, "   ");
         assert_eq!(state.body_lines, vec!["(empty response)".to_string()]);

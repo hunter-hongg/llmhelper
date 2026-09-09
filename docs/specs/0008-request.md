@@ -39,7 +39,7 @@ Add a new subcommand `llmhelper request` that sends an OpenAI-compatible Chat Co
   - `--temperature`, `--top-p`, `--max-tokens`, `--stop` (repeatable)
   - `--config` discovery via `Config::load` extended with a `[request]` section
 - New `src/request.rs` module:
-  - `RequestClient` with `reqwest` (blocking or async via tokio) to POST `/chat/completions` following OpenAI schema.
+  - `RequestClient` with `reqwest` (blocking or async via tokio) to POST `/v1/chat/completions` following OpenAI schema.
   - `RequestArgs` parsed via `clap` derives; JSON messages parsed with `serde_json::Value` for flexibility.
   - Pure function `build_payload` for unit testing.
   - `RequestResponse` struct holding status code, headers, usage, and content; serializable for `--json`.

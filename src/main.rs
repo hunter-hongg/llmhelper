@@ -891,52 +891,183 @@ fn run_request(args: RequestArgs) -> anyhow::Result<()> {
         args.top_p,
         args.max_tokens,
         &args.stop,
+        args.stream,
     );
 
-    let start = std::time::Instant::now();
     let rt = Runtime::new()?;
-    let response = match rt.block_on(llmhelper::request::send_chat_completion(
-        &settings,
-        &payload,
-    )) {
-        Ok(resp) => resp,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        }
-    };
-    let duration_ms = start.elapsed().as_millis();
 
-    if args.json {
-        let mut buf = Vec::new();
-        serde_json::to_writer_pretty(&mut buf, &response.raw)?;
-        println!("{}", String::from_utf8(buf)?);
-        Ok(())
-    } else if args.text {
-        match &response.assistant_content {
-            Some(content) => {
-                println!("{}", content);
-                Ok(())
-            }
-            None => anyhow::bail!("response contains no assistant content"),
+    if args.stream {
+        if args.json {
+            rt.block_on(run_request_stream_json(&settings, &payload))?;
+        } else if args.text {
+            rt.block_on(run_request_stream_text(&settings, &payload))?;
+        } else {
+            run_request_stream_tui(&settings, &payload, rt)?;
         }
+        Ok(())
     } else {
-        let host = extract_host(&settings.base_url);
-        let usage_tokens = response
-            .usage
-            .as_ref()
-            .and_then(|u| u.get("total_tokens").and_then(|v| v.as_u64()));
-        let body_text = response.assistant_content.as_deref().unwrap_or("");
-        run_request_tui(
-            &RequestMeta {
-                model: settings.model.clone(),
-                host,
-                duration_ms,
-                usage_tokens,
-            },
-            body_text,
-        )
+        let start = std::time::Instant::now();
+        let response = match rt.block_on(llmhelper::request::send_chat_completion(
+            &settings,
+            &payload,
+        )) {
+            Ok(resp) => resp,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let duration_ms = start.elapsed().as_millis();
+
+        if args.json {
+            let mut buf = Vec::new();
+            serde_json::to_writer_pretty(&mut buf, &response.raw)?;
+            println!("{}", String::from_utf8(buf)?);
+            Ok(())
+        } else if args.text {
+            match &response.assistant_content {
+                Some(content) => {
+                    println!("{}", content);
+                    Ok(())
+                }
+                None => anyhow::bail!("response contains no assistant content"),
+            }
+        } else {
+            let host = extract_host(&settings.base_url);
+            let usage_tokens = response
+                .usage
+                .as_ref()
+                .and_then(|u| u.get("total_tokens").and_then(|v| v.as_u64()));
+            let body_text = response.assistant_content.as_deref().unwrap_or("");
+            run_request_tui(
+                &RequestMeta {
+                    model: settings.model.clone(),
+                    host,
+                    duration_ms,
+                    usage_tokens,
+                    stream_state: llmhelper::tui::request_app::StreamState::Off,
+                },
+                body_text,
+            )
+        }
     }
+}
+
+async fn run_request_stream_json(settings: &llmhelper::request::RequestSettings, payload: &serde_json::Value) -> anyhow::Result<()> {
+    let mut first = true;
+    let _ = llmhelper::request::send_chat_completion_stream(settings, payload, |event| {
+        if first {
+            first = false;
+        }
+        let line = serde_json::to_string(&event).unwrap_or_default();
+        println!("{}", line);
+    })
+    .await?;
+    Ok(())
+}
+
+async fn run_request_stream_text(settings: &llmhelper::request::RequestSettings, payload: &serde_json::Value) -> anyhow::Result<()> {
+    let mut content = String::new();
+    let _res = llmhelper::request::send_chat_completion_stream(settings, payload, |event| {
+        if let Some(delta) = llmhelper::request::extract_delta_content(&event) {
+            print!("{}", delta);
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            content.push_str(&delta);
+        }
+    })
+    .await?;
+    if content.is_empty() {
+        anyhow::bail!("stream produced no assistant content");
+    }
+    println!();
+    Ok(())
+}
+
+fn run_request_stream_tui(settings: &llmhelper::request::RequestSettings, payload: &serde_json::Value, rt: Runtime) -> anyhow::Result<()> {
+    let host = extract_host(&settings.base_url);
+    let meta = RequestMeta {
+        model: settings.model.clone(),
+        host,
+        duration_ms: 0,
+        usage_tokens: None,
+        stream_state: llmhelper::tui::request_app::StreamState::Live,
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1024);
+    let settings_clone = settings.clone();
+    let payload_clone = payload.clone();
+    rt.spawn(async move {
+        let _ = llmhelper::request::send_chat_completion_stream(&settings_clone, &payload_clone, |event| {
+            let _ = tx.try_send(event);
+        })
+        .await;
+    });
+    let mut tui = RequestTuiApp::new(meta, "")?;
+    tui.state.running = true;
+    let start = std::time::Instant::now();
+    while tui.state.running {
+        if let Ok(event) = rx.try_recv() {
+            if let Some(delta) = llmhelper::request::extract_delta_content(&event) {
+                if tui.state.body_lines.is_empty() {
+                    tui.state.body_lines.push(String::new());
+                }
+                if let Some(l) = tui.state.body_lines.last_mut() {
+                    l.push_str(&delta);
+                }
+                if tui.state.body_lines.last().is_some_and(|l| l.ends_with('\n')) {
+                    tui.state.body_lines.push(String::new());
+                }
+            }
+            if let Some(usage) = llmhelper::request::extract_stream_usage(&event) {
+                if let Some(total) = usage.get("total_tokens").and_then(|v| v.as_u64()) {
+                    tui.state.meta.usage_tokens = Some(total);
+                }
+            }
+            if tui.state.follow {
+                let max_scroll = tui.state.content_length().saturating_sub(tui.state.viewport_height());
+                tui.state.set_scroll(max_scroll);
+            }
+        }
+        tui.state.meta.duration_ms = start.elapsed().as_millis();
+        tui.terminal.draw(|frame| {
+            llmhelper::tui::request_render::render(frame, &mut tui.state);
+        })?;
+        if rx.is_closed() {
+            tui.state.meta.stream_state = llmhelper::tui::request_app::StreamState::Done;
+        }
+        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                match key.code {
+                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
+                        tui.state.quit();
+                    }
+                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                        tui.state.scroll_down();
+                    }
+                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                        tui.state.scroll_up();
+                        tui.state.follow = false;
+                    }
+                    crossterm::event::KeyCode::PageDown => tui.state.page_down(),
+                    crossterm::event::KeyCode::PageUp => {
+                        tui.state.page_up();
+                        tui.state.follow = false;
+                    }
+                    crossterm::event::KeyCode::Home | crossterm::event::KeyCode::Char('g') => {
+                        tui.state.scroll_top();
+                        tui.state.follow = false;
+                    }
+                    crossterm::event::KeyCode::End | crossterm::event::KeyCode::Char('G') => {
+                        tui.state.scroll_bottom();
+                        tui.state.follow = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    tui.exit()?;
+    Ok(())
 }
 
 /// Interactive viewer over a completed request response, mirroring the
