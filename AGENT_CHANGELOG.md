@@ -72,7 +72,7 @@
 
 - 测试：lib 140 → 183（新增 search 引擎 ~20 项、adapter 消息提取 ~10 项含跨库去重回归、filter 4 项、TUI state 17 项含初始 selection 回归）；integration 52 → 71（19 项 search：全 Source 可达、过滤后计数、排序、snippet 截断、limit、大小写、role/source/project/since 过滤、工具输出与 synthetic 行不可检索且 Source 仍报 ok、临时空库的诚实零消息、csv/text 输出、四条 CLI 校验错误）。tmux 130×36/140×36 PTY smoke：列表、`Enter` 详情、`Esc`、方向键、`r` 刷新、零命中态、`q` 退出全通过。`cargo test` 183 lib + 71 integration + 11 request 全通过，`cargo clippy --all-targets -- -D warnings` 通过。未做：list/detail 骨架与 sessions 的第二份复制（`ListDetailState<T>` 抽象）、OMP 单次遍历同时产出 record 与 message，均为后续项。
 
-- 会话总结：`llmhelper` 新增 `search` 全文检索子命令（四个 Source 全部可检索，共 12,743 条消息语料），纯引擎 + TUI/JSON/CSV/text 四种输出；经双轴代码审查修复跨库去重正确性、过滤后语料计数、TUI 首次 `Enter` 无反应等 6 项，删除三处重复函数，spec 0010 三处断言修正。测试 192 → 265 全通过。
+- 会话总结：`llmhelper` 新增 `search` 全文检索子命令（四个 Source 全部可检索，共 12,743 条消息语料），纯引擎 + TUI/JSON/CSV/text 四种输出；经双轴代码审查修复跨库去重正确性、过滤后语料计数、TUI 首次 `Enter` 无反应等 6 项，删除三处重复函数，spec 0010 三处断言修正。测试 192 → 265 全通过。commit `6f17c16`.
 
 ## 2026-09-09
 
