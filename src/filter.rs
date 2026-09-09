@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
+use crate::domain::message::Message;
 use crate::domain::record::Record;
 
 /// Pre-aggregation filters applied to a record set.
@@ -36,34 +37,60 @@ impl Filter {
 
     /// Check whether a single record satisfies this filter.
     pub fn matches(&self, r: &Record) -> bool {
+        self.matches_at(Some(r.started_at), &r.source, &r.project, &r.model)
+    }
+
+    /// Check whether a single message satisfies this filter.
+    ///
+    /// Records always have a timestamp; messages may not. A message without a
+    /// timestamp fails any time predicate rather than passing through, so a
+    /// scoped search cannot silently include unscoped content.
+    pub fn matches_message(&self, m: &Message) -> bool {
+        self.matches_at(
+            m.timestamp,
+            &m.source,
+            &m.project,
+            m.model.as_deref().unwrap_or(""),
+        )
+    }
+
+    /// Shared predicate body for records and messages. Both must be filtered by
+    /// exactly the same rules, so neither method may drift from this one.
+    fn matches_at(
+        &self,
+        at: Option<DateTime<Utc>>,
+        source: &str,
+        project: &str,
+        model: &str,
+    ) -> bool {
         if let Some(since) = self.since {
-            if r.started_at < since {
+            if at.is_none_or(|t| t < since) {
                 return false;
             }
         }
         if let Some(window) = self.last {
             let cutoff = Utc::now() - window;
-            if r.started_at < cutoff {
+            if at.is_none_or(|t| t < cutoff) {
                 return false;
             }
         }
         if let Some(until) = self.until {
-            if r.started_at > until {
+            if at.is_none_or(|t| t > until) {
                 return false;
             }
         }
         if let Some(proj) = &self.project {
-            if !r.project.contains(proj.as_str()) {
+            if !project.contains(proj.as_str()) {
                 return false;
             }
         }
-        if let Some(model) = &self.model {
-            if !r.model.to_lowercase().contains(&model.to_lowercase()) {
+        if let Some(filter_model) = &self.model {
+            if !model.to_lowercase().contains(&filter_model.to_lowercase()) {
                 return false;
             }
         }
         if let Some(src) = &self.source {
-            if r.source != *src {
+            if source != *src {
                 return false;
             }
         }
@@ -168,5 +195,87 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(f.apply(&r).len(), 1);
+    }
+
+    fn message(
+        source: &str,
+        project: &str,
+        model: Option<&str>,
+        timestamp: Option<DateTime<Utc>>,
+    ) -> Message {
+        Message {
+            source: source.to_string(),
+            session_id: "s1".to_string(),
+            project: project.to_string(),
+            model: model.map(str::to_string),
+            role: "assistant".to_string(),
+            timestamp,
+            text: "body".to_string(),
+        }
+    }
+
+    #[test]
+    fn message_filter_matches_record_filter() {
+        // Same shape as `rec`, but as a message: every predicate that admits a
+        // record must admit the equivalent message and vice versa.
+        let f = Filter {
+            since: Some(Utc::now() - chrono::Duration::days(7)),
+            project: Some("proj".to_string()),
+            model: Some("big".to_string()),
+            source: Some("claude".to_string()),
+            ..Default::default()
+        };
+        let now = Utc::now();
+        let m = message("claude", "/home/user/proj-x", Some("Big-Pickle"), Some(now));
+        let r = rec("claude", "/home/user/proj-x", "Big-Pickle", now);
+        assert!(f.matches(&r));
+        assert!(f.matches_message(&m));
+    }
+
+    #[test]
+    fn message_filter_rejects_the_same_shape_records_are_rejected() {
+        let f = Filter {
+            project: Some("proj".to_string()),
+            ..Default::default()
+        };
+        assert!(!f.matches_message(&message("a", "/other/y", None, None)));
+    }
+
+    #[test]
+    fn message_filter_drops_untimestamped_messages_on_time_filters() {
+        let since_f = Filter {
+            since: Some(Utc::now() - chrono::Duration::days(7)),
+            ..Default::default()
+        };
+        assert!(!since_f.matches_message(&message("a", "/p", None, None)));
+        assert!(since_f.matches_message(&message("a", "/p", None, Some(Utc::now()))));
+
+        let last_f = Filter {
+            last: Some(Duration::from_secs(3600)),
+            ..Default::default()
+        };
+        assert!(!last_f.matches_message(&message("a", "/p", None, None)));
+
+        let until_f = Filter {
+            until: Some(Utc::now()),
+            ..Default::default()
+        };
+        assert!(!until_f.matches_message(&message("a", "/p", None, None)));
+    }
+
+    #[test]
+    fn message_filter_without_time_filters_admits_untimestamped_messages() {
+        let f = Filter {
+            project: Some("proj".to_string()),
+            ..Default::default()
+        };
+        assert!(f.matches_message(&message("a", "/p/proj", None, None)));
+        // A message with no recorded model cannot satisfy a model filter.
+        let model_f = Filter {
+            model: Some("auto".to_string()),
+            ..Default::default()
+        };
+        assert!(!model_f.matches_message(&message("a", "/p", None, None)));
+        assert!(model_f.matches_message(&message("a", "/p", Some("auto"), None)));
     }
 }

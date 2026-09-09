@@ -7,16 +7,20 @@ use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use llmhelper::cli::{Cli, Command, DiffArgs, ReportArgs, RequestArgs, SessionsArgs, UsageArgs};
+use llmhelper::cli::{
+    Cli, Command, DiffArgs, ReportArgs, RequestArgs, SearchArgs, SessionsArgs, UsageArgs,
+};
 use llmhelper::config::Config;
 use llmhelper::diff::compute_diff;
 use llmhelper::domain::group::GroupBy;
+use llmhelper::domain::message::Message;
 use llmhelper::domain::record::Record;
 use llmhelper::filter::Filter;
 use llmhelper::output::{format_tokens, render_diff_csv, render_diff_json, OutputRenderer};
 use llmhelper::report::{render_report, ReportMeta};
+use llmhelper::search::{search, SearchHit, SearchOptions};
 use llmhelper::source::{
-    ClaudeSource, KiloSource, OmpSource, OpenCodeSource, Registry, SourceStatus,
+    ClaudeSource, KiloSource, MessageStatus, OmpSource, OpenCodeSource, Registry, SourceStatus,
 };
 use llmhelper::tui::scroll::Scrollable;
 use llmhelper::tui::{
@@ -646,6 +650,270 @@ fn run_sessions_tui(registry: Registry, filter: Filter, refresh_secs: u64) -> an
     Ok(())
 }
 
+/// Load messages, apply the filter, and run the search. The per-Source
+/// message counts describe the corpus the search actually searched, so they
+/// are recomputed after the filter instead of echoing the raw load.
+fn load_search_data(
+    registry: &Registry,
+    filter: &Filter,
+    options: &SearchOptions,
+) -> (Vec<SearchHit>, Vec<MessageStatus>) {
+    let (messages, statuses) = registry.load_messages_all();
+    let scoped: Vec<Message> = messages
+        .iter()
+        .filter(|m| filter.matches_message(m))
+        .cloned()
+        .collect();
+    (
+        search(&scoped, options),
+        scoped_message_statuses(&scoped, &statuses),
+    )
+}
+
+/// Report post-filter message counts while keeping the load errors of sources
+/// that never loaded at all.
+fn scoped_message_statuses(scoped: &[Message], statuses: &[MessageStatus]) -> Vec<MessageStatus> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for m in scoped {
+        *counts.entry(m.source.clone()).or_insert(0) += 1;
+    }
+    statuses
+        .iter()
+        .map(|s| MessageStatus {
+            name: s.name.clone(),
+            message_count: counts.get(&s.name).copied().unwrap_or(0),
+            error: s.error.clone(),
+        })
+        .collect()
+}
+
+fn config_from_search_args(config: Config, args: &SearchArgs) -> Config {
+    Config {
+        claude_dir: args.claude_dir.clone().or(config.claude_dir),
+        opencode_dbs: args.opencode_db.clone().or(config.opencode_dbs),
+        omp_dir: args.omp_dir.clone().or(config.omp_dir),
+        kilo_dbs: args.kilo_db.clone().or(config.kilo_dbs),
+        refresh_interval_seconds: config.refresh_interval_seconds,
+        request_base_url: config.request_base_url,
+        request_api_key: config.request_api_key,
+        request_default_model: config.request_default_model,
+        request_timeout_seconds: config.request_timeout_seconds,
+    }
+}
+
+fn build_filter_search(args: &SearchArgs) -> anyhow::Result<Filter> {
+    let last = args.parse_last()?;
+    Ok(Filter {
+        since: args.since,
+        last,
+        until: None,
+        project: args.project.clone(),
+        model: args.model.clone(),
+        source: args.source.as_ref().map(|s| s.to_string()),
+    })
+}
+
+fn search_options(args: &SearchArgs) -> SearchOptions {
+    SearchOptions {
+        query: args.query.trim().to_string(),
+        case_sensitive: args.case_sensitive,
+        role: args.role.clone(),
+        context: args.context,
+        limit: args.limit,
+    }
+}
+
+/// The active non-query filters as one line for the TUI header. Default
+/// values are omitted so an unscoped search stays quiet.
+fn search_filter_summary(args: &SearchArgs) -> String {
+    let mut parts = Vec::new();
+    if let Some(p) = &args.project {
+        parts.push(format!("project:{p}"));
+    }
+    if let Some(m) = &args.model {
+        parts.push(format!("model:{m}"));
+    }
+    if let Some(s) = &args.source {
+        parts.push(format!("source:{s}"));
+    }
+    if let Some(s) = args.since {
+        parts.push(format!("since:{}", s.format("%Y-%m-%d %H:%M:%SZ")));
+    }
+    if let Some(w) = &args.last {
+        parts.push(format!("last:{w}"));
+    }
+    if args.context != llmhelper::search::DEFAULT_CONTEXT {
+        parts.push(format!("context:{}", args.context));
+    }
+    if args.limit != llmhelper::search::DEFAULT_LIMIT {
+        parts.push(format!("limit:{}", args.limit));
+    }
+    parts.join("  ")
+}
+
+/// Per-Source message counts as JSON, so a reader can tell how much of the
+/// corpus a search actually covered.
+fn message_sources_json(statuses: &[MessageStatus]) -> Vec<serde_json::Value> {
+    statuses
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "messages": s.message_count,
+                "status": s
+                    .error
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "ok".to_string()),
+            })
+        })
+        .collect()
+}
+
+fn run_search(args: SearchArgs) -> anyhow::Result<()> {
+    args.validate()?;
+    let options = search_options(&args);
+    if args.json || args.csv || args.text {
+        return run_search_non_tui(&args, &options);
+    }
+    let config = config_from_search_args(Config::load(), &args);
+    let registry = discover_sources(&config);
+    let filter = build_filter_search(&args)?;
+    let filter_summary = search_filter_summary(&args);
+    run_search_tui(registry, filter, options, filter_summary)
+}
+
+fn run_search_non_tui(args: &SearchArgs, options: &SearchOptions) -> anyhow::Result<()> {
+    let config = config_from_search_args(Config::load(), args);
+    let registry = discover_sources(&config);
+    let filter = build_filter_search(args)?;
+    let (hits, statuses) = load_search_data(&registry, &filter, options);
+    for status in &statuses {
+        if let Some(err) = &status.error {
+            eprintln!("warn: source {} error: {}", status.name, err);
+        }
+    }
+    if args.json {
+        let payload = serde_json::json!({
+            "query": options.query,
+            "case_sensitive": options.case_sensitive,
+            "role": options.role,
+            "context": options.context,
+            "limit": options.limit,
+            "hits": hits,
+            "sources": message_sources_json(&statuses),
+        });
+        let mut buf = Vec::new();
+        serde_json::to_writer_pretty(&mut buf, &payload)?;
+        println!("{}", String::from_utf8(buf)?);
+        return Ok(());
+    }
+    if args.csv {
+        let mut w = csv::Writer::from_writer(std::io::stdout());
+        w.write_record([
+            "source",
+            "session_id",
+            "project",
+            "model",
+            "role",
+            "timestamp",
+            "matches",
+            "snippet",
+        ])?;
+        for h in &hits {
+            w.write_record([
+                &h.source,
+                &h.session_id,
+                &h.project,
+                h.model.as_deref().unwrap_or(""),
+                &h.role,
+                &h.timestamp.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                &h.matches.to_string(),
+                &h.snippet,
+            ])?;
+        }
+        w.flush()?;
+        return Ok(());
+    }
+    if hits.is_empty() {
+        println!("No matches for {:?}", options.query);
+        return Ok(());
+    }
+    for (i, h) in hits.iter().enumerate() {
+        let time = h
+            .timestamp
+            .map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!("[{}] {} {}", i + 1, h.matches, h.snippet);
+        println!("      {} {} {} {}", h.source, h.role, time, h.session_id);
+    }
+    Ok(())
+}
+
+fn run_search_tui(
+    registry: Registry,
+    filter: Filter,
+    options: SearchOptions,
+    filter_summary: String,
+) -> anyhow::Result<()> {
+    let load = |registry: &Registry| -> llmhelper::tui::search_app::SearchData {
+        let (hits, message_statuses) = load_search_data(registry, &filter, &options);
+        llmhelper::tui::search_app::SearchData {
+            hits,
+            message_statuses,
+        }
+    };
+    let mut tui = llmhelper::tui::search_app::SearchTuiApp::new(
+        options.query.clone(),
+        options.case_sensitive,
+        options.role.clone(),
+        filter_summary,
+        load(&registry),
+    )?;
+    tui.state.app.running = true;
+    let reg_arc = Arc::new(registry);
+    while tui.state.app.running {
+        tui.terminal.draw(|frame| {
+            llmhelper::tui::search_render::render(frame, &mut tui.state);
+        })?;
+        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                match key.code {
+                    crossterm::event::KeyCode::Char('q') => tui.state.quit(),
+                    crossterm::event::KeyCode::Esc => {
+                        if tui.state.app.view == llmhelper::tui::search_app::SearchView::Detail {
+                            tui.state.close_detail();
+                        } else {
+                            tui.state.quit();
+                        }
+                    }
+                    crossterm::event::KeyCode::Enter => tui.state.open_detail(),
+                    crossterm::event::KeyCode::Char('r') => {
+                        tui.state.apply_data(load(&reg_arc));
+                    }
+                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                        tui.state.select_next();
+                    }
+                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                        tui.state.select_previous();
+                    }
+                    crossterm::event::KeyCode::Home | crossterm::event::KeyCode::Char('g') => {
+                        tui.state.select_first();
+                    }
+                    crossterm::event::KeyCode::End | crossterm::event::KeyCode::Char('G') => {
+                        tui.state.select_last();
+                    }
+                    crossterm::event::KeyCode::PageDown => tui.state.page_down(),
+                    crossterm::event::KeyCode::PageUp => tui.state.page_up(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    tui.exit()?;
+    Ok(())
+}
+
 fn run_usage(args: UsageArgs) -> anyhow::Result<()> {
     args.validate()?;
     let group_by: GroupBy = args.group_by.clone().into();
@@ -1117,5 +1385,6 @@ fn main() -> anyhow::Result<()> {
         Command::Sessions(args) => run_sessions(args),
         Command::Report(args) => run_report(args),
         Command::Request(args) => run_request(args),
+        Command::Search(args) => run_search(args),
     }
 }

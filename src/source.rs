@@ -2,8 +2,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use rusqlite::Connection;
+
+use crate::domain::message::Message;
 use crate::domain::record::{Record, TokenBreakdown};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceError {
@@ -29,9 +32,27 @@ pub struct SourceStatus {
 
 pub type SourceStatuses = Vec<SourceStatus>;
 
+/// Per-Source status for a message read. Kept separate from `SourceStatus` so
+/// the record-reading commands are unaffected by adding a second read path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageStatus {
+    pub name: String,
+    pub message_count: usize,
+    pub error: Option<SourceError>,
+}
+
+pub type MessageStatuses = Vec<MessageStatus>;
+
 pub trait Source: Send + Sync {
     fn name(&self) -> &str;
     fn load(&self) -> Result<Vec<Record>, SourceError>;
+
+    /// Load per-message text for this Source. The default returns an empty set
+    /// so a Source that stores no message text degrades to an honest empty
+    /// result instead of requiring a special case at every call site.
+    fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
+        Ok(Vec::new())
+    }
 }
 
 pub struct Registry {
@@ -78,6 +99,31 @@ impl Registry {
         }
         (records, statuses)
     }
+    pub fn load_messages_all(&self) -> (Vec<Message>, MessageStatuses) {
+        let mut messages = Vec::new();
+        let mut statuses = Vec::new();
+        for (name, src) in &self.sources {
+            match src.load_messages() {
+                Ok(batch) => {
+                    let count = batch.len();
+                    messages.extend(batch);
+                    statuses.push(MessageStatus {
+                        name: name.clone(),
+                        message_count: count,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    statuses.push(MessageStatus {
+                        name: name.clone(),
+                        message_count: 0,
+                        error: Some(e),
+                    });
+                }
+            }
+        }
+        (messages, statuses)
+    }
     pub fn source_names(&self) -> Vec<&str> {
         self.sources.keys().map(|s| s.as_str()).collect()
     }
@@ -103,6 +149,194 @@ fn normalize_model(raw: &str) -> String {
     raw.to_string()
 }
 
+/// Convert millisecond epoch to UTC. Shared by the SQLite sources.
+fn ms_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
+    Utc.timestamp_millis_opt(ms).single()
+}
+
+/// Extract searchable text from a JSONL `message.content` value.
+///
+/// Both JSONL sources use the same block vocabulary: a plain string, or a list
+/// of blocks keyed by `type`. `text` blocks carry `.text`; `thinking` blocks
+/// carry `.thinking` and are tagged with the `thinking` role so the corpus keeps
+/// model-internal text separate from conversation without a source-specific
+/// field. `tool_use`, `toolCall`, `tool_result`, and `image` blocks hold tool
+/// plumbing or binary data and are excluded from the corpus.
+fn content_texts(
+    content: Option<&serde_json::Value>,
+    fallback_role: &str,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(v) = content else {
+        return out;
+    };
+    if let Some(s) = v.as_str() {
+        let t = s.trim();
+        if !t.is_empty() {
+            out.push((fallback_role.to_string(), t.to_string()));
+        }
+        return out;
+    }
+    if let Some(arr) = v.as_array() {
+        for b in arr {
+            let bt = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let raw = match bt {
+                "text" => b.get("text").and_then(|t| t.as_str()),
+                "thinking" => b.get("thinking").and_then(|t| t.as_str()),
+                _ => None,
+            };
+            if let Some(t) = raw {
+                let t = t.trim();
+                if !t.is_empty() {
+                    let role = if bt == "thinking" {
+                        "thinking"
+                    } else {
+                        fallback_role
+                    };
+                    out.push((role.to_string(), t.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Merge per-DB message batches, keeping only the first database that contains
+/// a given session id — mirroring the dedup `load` applies to records. A
+/// session claimed by an earlier database is dropped wholesale from later ones,
+/// so a session split across databases cannot yield duplicate messages.
+fn merge_message_batches(
+    seen: &mut std::collections::HashSet<String>,
+    batch: Vec<Message>,
+) -> Vec<Message> {
+    // Session ids newly claimed by this batch. Every message belongs to its
+    // session, so a claimed session keeps all of its messages and a session
+    // already claimed elsewhere keeps none.
+    let claimed: std::collections::HashSet<String> = batch
+        .iter()
+        .filter(|m| seen.insert(m.session_id.clone()))
+        .map(|m| m.session_id.clone())
+        .collect();
+    batch
+        .into_iter()
+        .filter(|m| claimed.contains(&m.session_id))
+        .collect()
+}
+
+/// Read searchable messages from every database of a SQLite Source, skipping
+/// absent paths and deduping sessions across databases.
+fn load_sqlite_messages_all(dbs: &[PathBuf], source: &str) -> Vec<Message> {
+    if dbs.is_empty() {
+        return Vec::new();
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut messages = Vec::new();
+    for db_path in dbs {
+        // A configured path that does not exist is skipped rather than failing
+        // the Source, matching `load`'s tolerance for the variant databases.
+        if !db_path.exists() {
+            continue;
+        }
+        let batch = match load_sqlite_messages(db_path, source) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("warn: cannot read messages from {:?}: {}", db_path, e);
+                continue;
+            }
+        };
+        messages.extend(merge_message_batches(&mut seen, batch));
+    }
+    messages
+}
+
+/// Read searchable messages from the `part` table of one SQLite database.
+///
+/// OpenCode and Kilo Code share an identical `session`/`message`/`part` schema,
+/// so a single query serves both. Each `part.data` row is a JSON object whose
+/// `type` selects its shape: `text` and `reasoning` both carry `.text` and are
+/// the only part types with readable prose. Parts flagged `synthetic` or
+/// `ignored` are excluded, matching the filter Kilo Code applies in its own
+/// `recall_part_search_idx`.
+fn load_sqlite_messages(db_path: &Path, source: &str) -> Result<Vec<Message>, SourceError> {
+    if !db_path.exists() {
+        return Err(SourceError::Absent(db_path.to_string_lossy().to_string()));
+    }
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => return Err(SourceError::Unreadable(e.to_string())),
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT m.session_id, m.data, p.data, p.time_created, s.directory, s.model
+         FROM part p
+         JOIN message m ON m.id = p.message_id
+         JOIN session s ON s.id = m.session_id
+         WHERE json_valid(p.data)
+           AND json_extract(p.data, '$.type') IN ('text', 'reasoning')
+           AND coalesce(json_extract(p.data, '$.synthetic'), 0) = 0
+           AND coalesce(json_extract(p.data, '$.ignored'), 0) = 0
+         ORDER BY p.time_created, p.id",
+    ) {
+        Ok(s) => s,
+        // A missing `part` or `message` table is an older schema, not a broken
+        // database. The Source still reports records, so this degrades to an
+        // empty message set rather than failing the whole Source.
+        Err(_) => return Ok(Vec::new()),
+    };
+    let rows = match stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            // `model` is nullable in the real schema; binding NULL to String
+            // would drop the row silently.
+            row.get::<_, Option<String>>(5)?,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => return Err(SourceError::Unreadable(e.to_string())),
+    };
+    let mut messages = Vec::new();
+    for row in rows.flatten() {
+        let (session_id, msg_data, part_data, time_created, directory, model_raw) = row;
+        let Some(part) = serde_json::from_str::<serde_json::Value>(&part_data).ok() else {
+            continue;
+        };
+        let is_reasoning = part.get("type").and_then(|t| t.as_str()) == Some("reasoning");
+        let Some(text) = part
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        else {
+            continue;
+        };
+        // Reasoning is model-internal text; tag it so it stays separable from
+        // conversation without a source-specific field.
+        let role = if is_reasoning {
+            "thinking".to_string()
+        } else {
+            serde_json::from_str::<serde_json::Value>(&msg_data)
+                .ok()
+                .and_then(|v| v.get("role").and_then(|r| r.as_str()).map(str::to_string))
+                .unwrap_or_else(|| "assistant".to_string())
+        };
+        let model = model_raw.as_deref().map(normalize_model);
+        let model = model.filter(|m| !m.is_empty());
+        messages.push(Message {
+            source: source.to_string(),
+            session_id,
+            project: directory,
+            model,
+            role,
+            timestamp: ms_to_datetime(time_created),
+            text: text.to_string(),
+        });
+    }
+    Ok(messages)
+}
+
 /// Recursively collect every `*.jsonl` file under `dir`. OMP nests subagent
 /// sessions one directory level deeper than the project directory.
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -124,6 +358,10 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
+
+/// One OMP message collected before the session envelope is resolved:
+/// `(timestamp, model, role, text)`.
+type MessageEvent = (Option<DateTime<Utc>>, Option<String>, String, String);
 
 /// Build a normalized `Record` from collected assistant events for one session.
 /// `session_started_at`, when known, wins over the first message timestamp.
@@ -184,6 +422,7 @@ mod claude {
     struct MessageInner {
         model: Option<String>,
         usage: Option<Usage>,
+        content: Option<serde_json::Value>,
     }
 
     /// Real Claude Code transcripts nest reasoning + cache-creation under
@@ -343,6 +582,74 @@ mod claude {
             }
             Ok(records)
         }
+
+        fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
+            if !self.project_dir.exists() {
+                return Err(SourceError::Absent(
+                    self.project_dir.to_string_lossy().to_string(),
+                ));
+            }
+            let mut messages = Vec::new();
+            let entries = match self.project_dir.read_dir() {
+                Ok(e) => e,
+                Err(e) => return Err(SourceError::Unreadable(e.to_string())),
+            };
+            for entry in entries.filter_map(|e| e.ok()) {
+                let dir = entry.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let project = Self::decode_project_name(
+                    dir.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+                );
+                let mut files = Vec::new();
+                collect_jsonl(&dir, &mut files);
+                for p in files {
+                    let content = match std::fs::read_to_string(&p) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("warn: cannot read {:?}: {}", p, e);
+                            continue;
+                        }
+                    };
+                    let session_id = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    for line in content.lines().filter(|l| !l.trim().is_empty()) {
+                        let line: Line = match serde_json::from_str(line) {
+                            Ok(l) => l,
+                            Err(_) => continue,
+                        };
+                        let Some(m) = line.message.as_ref() else {
+                            continue;
+                        };
+                        // `user` and `assistant` are the conversation turns.
+                        // Every other line type is harness bookkeeping.
+                        let role = match line.line_type.as_deref() {
+                            Some("user") => "user",
+                            Some("assistant") => "assistant",
+                            _ => continue,
+                        };
+                        let ts = line.timestamp.as_deref().and_then(parse_timestamp);
+                        let model = m.model.clone();
+                        for (msg_role, text) in content_texts(m.content.as_ref(), role) {
+                            messages.push(Message {
+                                source: "claude".to_string(),
+                                session_id: session_id.clone(),
+                                project: project.clone(),
+                                model: model.clone(),
+                                role: msg_role,
+                                timestamp: ts,
+                                text,
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(messages)
+        }
     }
 }
 
@@ -353,7 +660,6 @@ mod claude {
 mod opencode {
     use super::*;
     use crate::domain::record::{Record, TokenBreakdown};
-    use chrono::{DateTime, TimeZone, Utc};
     use rusqlite::Connection;
 
     pub struct OpenCodeSource {
@@ -363,9 +669,6 @@ mod opencode {
     impl OpenCodeSource {
         pub fn new(dbs: Vec<PathBuf>) -> Self {
             Self { dbs }
-        }
-        fn ms_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
-            Utc.timestamp_millis_opt(ms).single()
         }
     }
 
@@ -407,7 +710,9 @@ mod opencode {
                 let rows = match stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        // `model` is nullable in the real schema; a NULL model
+                        // must not drop the whole record.
+                        row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
@@ -452,16 +757,19 @@ mod opencode {
                     if !seen.insert(id.clone()) {
                         continue;
                     }
-                    let started_at = match Self::ms_to_datetime(time_created) {
+                    let started_at = match ms_to_datetime(time_created) {
                         Some(t) => t,
                         None => continue, // skip rows with invalid timestamps
                     };
-                    let ended_at = Self::ms_to_datetime(time_updated);
+                    let ended_at = ms_to_datetime(time_updated);
                     records.push(Record {
                         session_id: id,
                         source: "opencode".to_string(),
                         project: directory,
-                        model: normalize_model(&model_raw),
+                        model: model_raw
+                            .as_deref()
+                            .map(normalize_model)
+                            .unwrap_or_default(),
                         agent,
                         started_at,
                         ended_at,
@@ -477,6 +785,10 @@ mod opencode {
                 }
             }
             Ok(records)
+        }
+
+        fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
+            Ok(load_sqlite_messages_all(&self.dbs, "opencode"))
         }
     }
 }
@@ -497,6 +809,12 @@ mod omp {
         id: Option<String>,
         #[serde(default)]
         cwd: Option<String>,
+        /// Populated on `type == "custom_message"` lines, which carry their
+        /// text at the top level rather than under `message`.
+        #[serde(rename = "customType")]
+        custom_type: Option<String>,
+        #[serde(default)]
+        content: Option<serde_json::Value>,
         #[serde(default)]
         message: Option<MessageInner>,
     }
@@ -508,6 +826,7 @@ mod omp {
         #[allow(dead_code)]
         provider: Option<String>,
         usage: Option<Usage>,
+        content: Option<serde_json::Value>,
     }
 
     #[derive(serde::Deserialize, Debug, Default, Clone)]
@@ -646,6 +965,102 @@ mod omp {
             }
             Ok(records)
         }
+
+        fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
+            if !self.sessions_dir.exists() {
+                return Err(SourceError::Absent(
+                    self.sessions_dir.to_string_lossy().to_string(),
+                ));
+            }
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+            let mut messages = Vec::new();
+            let mut files = Vec::new();
+            collect_jsonl(&self.sessions_dir, &mut files);
+            for p in files {
+                let content = match std::fs::read_to_string(&p) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("warn: cannot read {:?}: {}", p, e);
+                        continue;
+                    }
+                };
+                let decoded_project = p
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|n| Self::decode_dir_name(n, &home));
+                let mut session_id: Option<String> = None;
+                let mut session_cwd: Option<String> = None;
+                // (timestamp, model, role, text) — resolved against the session
+                // envelope after the loop, matching how `load` builds a record.
+                let mut events: Vec<MessageEvent> = Vec::new();
+                for line in content.lines().filter(|l| !l.trim().is_empty()) {
+                    let line: Line = match serde_json::from_str(line) {
+                        Ok(l) => l,
+                        Err(_) => continue,
+                    };
+                    let ts = line.timestamp.as_deref().and_then(parse_timestamp);
+                    match line.line_type.as_deref() {
+                        Some("session") => {
+                            session_id = session_id.or(line.id);
+                            session_cwd = session_cwd.or(line.cwd);
+                        }
+                        Some("message") => {
+                            let Some(m) = line.message else {
+                                continue;
+                            };
+                            // Tool and shell output are machine dumps, not
+                            // conversation, and dominate the corpus by volume.
+                            match m.role.as_deref() {
+                                Some("toolResult") | Some("bashExecution") => continue,
+                                _ => {}
+                            }
+                            let Some(role) = m.role.clone() else {
+                                continue;
+                            };
+                            let model = m.model.clone();
+                            for (msg_role, text) in content_texts(m.content.as_ref(), &role) {
+                                events.push((ts, model.clone(), msg_role, text));
+                            }
+                        }
+                        Some("custom_message") => {
+                            let Some(v) = line.content.as_ref() else {
+                                continue;
+                            };
+                            let role = line
+                                .custom_type
+                                .clone()
+                                .unwrap_or_else(|| "custom".to_string());
+                            for (msg_role, text) in content_texts(Some(v), &role) {
+                                events.push((ts, None, msg_role, text));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let project = session_cwd
+                    .or_else(|| decoded_project.clone())
+                    .unwrap_or_else(|| "/unknown".to_string());
+                let sid = session_id.unwrap_or_else(|| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string()
+                });
+                for (ts, model, role, text) in events {
+                    messages.push(Message {
+                        source: "omp".to_string(),
+                        session_id: sid.clone(),
+                        project: project.clone(),
+                        model,
+                        role,
+                        timestamp: ts,
+                        text,
+                    });
+                }
+            }
+            Ok(messages)
+        }
     }
 }
 
@@ -655,7 +1070,6 @@ mod omp {
 mod kilo {
     use super::*;
     use crate::domain::record::TokenBreakdown;
-    use chrono::{DateTime, TimeZone, Utc};
     use rusqlite::Connection;
 
     pub struct KiloSource {
@@ -665,9 +1079,6 @@ mod kilo {
     impl KiloSource {
         pub fn new(dbs: Vec<PathBuf>) -> Self {
             Self { dbs }
-        }
-        fn ms_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
-            Utc.timestamp_millis_opt(ms).single()
         }
         /// Count `message` rows per session. Message counts are a separate
         /// lookup because the `message` table may be absent from older schemas;
@@ -735,7 +1146,9 @@ mod kilo {
                 let rows = match stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        // `model` is nullable in the real schema; a NULL model
+                        // must not drop the whole record.
+                        row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, f64>(4)?,
@@ -772,7 +1185,7 @@ mod kilo {
                     if !seen.insert(id.clone()) {
                         continue;
                     }
-                    let started_at = match Self::ms_to_datetime(time_created) {
+                    let started_at = match ms_to_datetime(time_created) {
                         Some(t) => t,
                         None => continue, // skip rows with invalid timestamps
                     };
@@ -781,10 +1194,13 @@ mod kilo {
                         session_id: id,
                         source: "kilo".to_string(),
                         project: directory,
-                        model: normalize_model(&model_raw),
+                        model: model_raw
+                            .as_deref()
+                            .map(normalize_model)
+                            .unwrap_or_default(),
                         agent,
                         started_at,
-                        ended_at: Self::ms_to_datetime(time_updated),
+                        ended_at: ms_to_datetime(time_updated),
                         tokens: TokenBreakdown {
                             input: tokens_input as u64,
                             output: (tokens_output + tokens_reasoning) as u64,
@@ -797,6 +1213,10 @@ mod kilo {
                 }
             }
             Ok(records)
+        }
+
+        fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
+            Ok(load_sqlite_messages_all(&self.dbs, "kilo"))
         }
     }
 }
@@ -1148,6 +1568,32 @@ mod tests {
     }
 
     #[test]
+    fn kilo_null_model_does_not_drop_the_record() {
+        use super::kilo::KiloSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("kilo.db");
+        let conn = open_kilo_db(&db);
+        conn.execute(
+            "INSERT INTO session (id, project_id, directory, time_created, time_updated, tokens_input)
+             VALUES ('ses_nomodel', 'p', '/p', 1700000000000, 1700000000100, 4)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let src = KiloSource::new(vec![db]);
+        let records = src.load().unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "a NULL model must not silently drop a session"
+        );
+        assert_eq!(records[0].model, "");
+        // And the message read must behave the same way.
+        assert!(src.load_messages().unwrap().is_empty());
+    }
+
+    #[test]
     fn kilo_absent_db_errors() {
         use super::kilo::KiloSource;
         let src = KiloSource::new(vec![PathBuf::from("/nonexistent-kilo-12345/kilo.db")]);
@@ -1158,5 +1604,327 @@ mod tests {
     fn kilo_no_dbs_returns_empty() {
         use super::kilo::KiloSource;
         assert!(KiloSource::new(vec![]).load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn claude_loads_messages_with_roles_and_drops_tool_blocks() {
+        use super::claude::ClaudeSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("-home-hunter-projects-test");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("session-x.jsonl"),
+            r#"{"type":"user","timestamp":"2026-08-28T12:00:00.000Z","message":{"role":"user","content":"hello there"}}
+{"type":"user","timestamp":"2026-08-28T12:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"FILE DUMP"},{"type":"text","text":"and more"}]}}
+{"type":"assistant","timestamp":"2026-08-28T12:00:02.000Z","message":{"model":"auto","content":[{"type":"thinking","thinking":"inner monologue"},{"type":"tool_use","id":"t2","name":"Read","input":{}},{"type":"text","text":"the answer is forty two"}]}}
+{"type":"system","timestamp":"2026-08-28T12:00:03.000Z","message":{"role":"system","content":[{"type":"text","text":"harness bookkeeping line"}]}}
+"#,
+        )
+        .unwrap();
+        let src = ClaudeSource::new(tmp.path().to_path_buf());
+        let messages = src.load_messages().unwrap();
+        let got: Vec<(&str, &str)> = messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("user", "hello there"),
+                ("user", "and more"),
+                ("thinking", "inner monologue"),
+                ("assistant", "the answer is forty two"),
+            ]
+        );
+        assert!(messages.iter().all(|m| m.session_id == "session-x.jsonl"));
+        assert!(messages
+            .iter()
+            .all(|m| m.project == "/home/hunter/projects/test"));
+        assert!(messages.iter().all(|m| m.source == "claude"));
+        // Model comes from the assistant line that carried it; user lines have none.
+        assert_eq!(messages[0].model, None);
+        assert_eq!(messages[2].model.as_deref(), Some("auto"));
+        assert!(messages.iter().all(|m| m.timestamp.is_some()));
+    }
+
+    #[test]
+    fn omp_loads_messages_and_drops_tool_output() {
+        use super::omp::OmpSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let proj = root.join("-projects-omp-test");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("2026-08-28T12-00-00-000Z_01aaa.jsonl"),
+            r#"{"type":"session","id":"01aaa","timestamp":"2026-08-28T12:00:00.000Z","cwd":"/home/hunter/projects/omp-test"}
+{"type":"message","id":"m0","timestamp":"2026-08-28T12:00:10.000Z","message":{"role":"user","model":"auto","content":[{"type":"text","text":"question one"}]}}
+{"type":"message","id":"m1","timestamp":"2026-08-28T12:00:20.000Z","message":{"role":"assistant","model":"auto","content":[{"type":"thinking","thinking":"pondering"},{"type":"toolCall","name":"bash","arguments":{}},{"type":"text","text":"answer one"}]}}
+{"type":"message","id":"m2","timestamp":"2026-08-28T12:00:30.000Z","message":{"role":"toolResult","model":"auto","content":[{"type":"text","text":"HIDDEN TOOL OUTPUT"}]}}
+{"type":"custom_message","id":"mc1","timestamp":"2026-08-28T12:00:40.000Z","customType":"mid-run-todo-nudge","content":"todo reminder body"}
+"#,
+        )
+        .unwrap();
+        let src = OmpSource::new(root);
+        let messages = src.load_messages().unwrap();
+        let got: Vec<(&str, &str)> = messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("user", "question one"),
+                ("thinking", "pondering"),
+                ("assistant", "answer one"),
+                ("mid-run-todo-nudge", "todo reminder body"),
+            ]
+        );
+        assert!(messages.iter().all(|m| m.session_id == "01aaa"));
+        assert!(messages
+            .iter()
+            .all(|m| m.project == "/home/hunter/projects/omp-test"));
+        assert!(messages.iter().all(|m| m.source == "omp"));
+        assert!(!messages.iter().any(|m| m.text.contains("HIDDEN")));
+        assert_eq!(messages[0].model.as_deref(), Some("auto"));
+        // custom_message lines carry no model.
+        assert_eq!(messages[3].model, None);
+    }
+
+    /// Open a temp SQLite file with the shared OpenCode/Kilo Code schema.
+    fn open_sqlite_text_db(path: &Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                  id text PRIMARY KEY,
+                  project_id text NOT NULL,
+                  directory text NOT NULL,
+                  model text,
+                  cost real DEFAULT 0 NOT NULL,
+                  tokens_input integer DEFAULT 0 NOT NULL,
+                  tokens_output integer DEFAULT 0 NOT NULL,
+                  tokens_reasoning integer DEFAULT 0 NOT NULL,
+                  tokens_cache_read integer DEFAULT 0 NOT NULL,
+                  tokens_cache_write integer DEFAULT 0 NOT NULL,
+                  time_created integer NOT NULL,
+                  time_updated integer NOT NULL);
+              CREATE TABLE message (
+                  id text PRIMARY KEY,
+                  session_id text NOT NULL,
+                  time_created integer NOT NULL,
+                  time_updated integer NOT NULL,
+                  data text NOT NULL);
+              CREATE TABLE part (
+                  id text PRIMARY KEY,
+                  message_id text NOT NULL,
+                  session_id text NOT NULL,
+                  time_created integer NOT NULL,
+                  time_updated integer NOT NULL,
+                  data text NOT NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn sqlite_sources_load_messages_from_part_rows() {
+        use super::kilo::KiloSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("kilo.db");
+        let conn = open_sqlite_text_db(&db);
+        conn.execute(
+            "INSERT INTO session (id, project_id, directory, model, time_created, time_updated)
+             VALUES ('ses_x', 'p', '/home/hunter/repos/test', ?1, 1700000000000, 1700000000100)",
+            rusqlite::params![r#"{"id":"auto","providerID":"freellm"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES ('m1', 'ses_x', 1700000000010, 1700000000010, '{\"role\":\"user\"}'),
+                    ('m2', 'ses_x', 1700000000020, 1700000000020, '{\"role\":\"assistant\"}'),
+                    ('m3', 'ses_x', 1700000000030, 1700000000030, '{\"role\":\"user\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO part VALUES ('p1','m1','ses_x',1700000000011,1700000000011,'{\"type\":\"text\",\"text\":\"user question text\"}');
+             INSERT INTO part VALUES ('p2','m2','ses_x',1700000000021,1700000000021,'{\"type\":\"reasoning\",\"text\":\"model reasoning text\",\"time\":{\"start\":1,\"end\":2}}');
+             INSERT INTO part VALUES ('p3','m2','ses_x',1700000000022,1700000000022,'{\"type\":\"text\",\"text\":\"assistant reply text\"}');
+             INSERT INTO part VALUES ('p4','m2','ses_x',1700000000023,1700000000023,'{\"type\":\"tool\",\"tool\":\"bash\",\"state\":{\"output\":\"HIDDEN\"}}');
+             INSERT INTO part VALUES ('p5','m2','ses_x',1700000000024,1700000000024,'{\"type\":\"text\",\"text\":\"synthetic narration\",\"synthetic\":true}');
+             INSERT INTO part VALUES ('p6','m3','ses_x',1700000000031,1700000000031,'{\"type\":\"text\",\"text\":\"ignored content\",\"ignored\":true}');
+             INSERT INTO part VALUES ('p7','m3','ses_x',1700000000032,1700000000032,'{\"type\":\"text\",\"text\":\"   \"}');
+             INSERT INTO part VALUES ('p8','m3','ses_x',1700000000033,1700000000033,'not json at all');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let src = KiloSource::new(vec![db]);
+        let messages = src.load_messages().unwrap();
+        let got: Vec<(&str, &str)> = messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("user", "user question text"),
+                ("thinking", "model reasoning text"),
+                ("assistant", "assistant reply text"),
+            ]
+        );
+        assert!(messages.iter().all(|m| m.session_id == "ses_x"));
+        assert!(messages
+            .iter()
+            .all(|m| m.project == "/home/hunter/repos/test"));
+        assert!(messages.iter().all(|m| m.source == "kilo"));
+        // The session's model envelope is normalized to its recorded id.
+        assert!(messages.iter().all(|m| m.model.as_deref() == Some("auto")));
+        assert!(messages.iter().all(|m| m.timestamp.is_some()));
+        assert!(!messages.iter().any(|m| m.text.contains("HIDDEN")));
+    }
+
+    #[test]
+    fn sqlite_source_without_part_table_yields_no_messages() {
+        use super::opencode::OpenCodeSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                  id text PRIMARY KEY,
+                  project_id text NOT NULL,
+                  directory text NOT NULL,
+                  title text NOT NULL DEFAULT '',
+                  cost real DEFAULT 0 NOT NULL,
+                  tokens_input integer DEFAULT 0 NOT NULL,
+                  tokens_output integer DEFAULT 0 NOT NULL,
+                  tokens_reasoning integer DEFAULT 0 NOT NULL,
+                  tokens_cache_read integer DEFAULT 0 NOT NULL,
+                  tokens_cache_write integer DEFAULT 0 NOT NULL,
+                  agent text,
+                  model text,
+                  time_created integer NOT NULL,
+                  time_updated integer NOT NULL);
+         CREATE TABLE session_message (
+                  id text PRIMARY KEY, session_id text NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, directory, time_created, time_updated)
+             VALUES ('ses_y', 'p', '/p', 1700000000000, 1700000000100)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let src = OpenCodeSource::new(vec![db]);
+        // Records still load; messages degrade to empty instead of an error.
+        let records = src.load().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].model, "");
+        assert!(src.load_messages().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sqlite_dedupes_sessions_across_dbs_without_dropping_real_messages() {
+        use super::kilo::KiloSource;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // `ses_dup` exists in both databases and holds two messages in the
+        // first one, so a "keep every message of a claimed session" dedup would
+        // also leak the copy from the second database.
+        let mk = |name: &str, rows: &[(&str, &str)]| {
+            let p = tmp.path().join(name);
+            let c = open_sqlite_text_db(&p);
+            let mut inserted_sessions: std::collections::HashSet<&str> =
+                std::collections::HashSet::new();
+            for (i, (sid, text)) in rows.iter().enumerate() {
+                if inserted_sessions.insert(*sid) {
+                    c.execute(
+                        "INSERT INTO session (id, project_id, directory, time_created, time_updated)
+                         VALUES (?1, 'p', '/p', 1700000000000, 1700000000100)",
+                        rusqlite::params![sid],
+                    )
+                    .unwrap();
+                }
+                let mid = format!("m{i}");
+                let pid = format!("p{i}");
+                let t = 1700000000010 + (i as i64) * 10;
+                c.execute(
+                    "INSERT INTO message (id, session_id, time_created, time_updated, data)
+                     VALUES (?1, ?2, ?3, ?3, '{\"role\":\"user\"}')",
+                    rusqlite::params![mid, sid, t],
+                )
+                .unwrap();
+                c.execute(
+                    "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                     VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                    rusqlite::params![pid, mid, sid, t + 1, serde_json::json!({"type": "text", "text": text}).to_string()],
+                )
+                .unwrap();
+            }
+            drop(c);
+            p
+        };
+        let src = KiloSource::new(vec![
+            mk(
+                "a.db",
+                &[
+                    ("ses_dup", "dup in first db"),
+                    ("ses_dup", "second dup in first db"),
+                    ("ses_only_a", "only in first db"),
+                ],
+            ),
+            mk(
+                "b.db",
+                &[
+                    ("ses_dup", "dup in second db"),
+                    ("ses_only_b", "only in second db"),
+                ],
+            ),
+        ]);
+
+        let messages = src.load_messages().unwrap();
+        let got: Vec<(&str, &str)> = messages
+            .iter()
+            .map(|m| (m.session_id.as_str(), m.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("ses_dup", "dup in first db"),
+                ("ses_dup", "second dup in first db"),
+                ("ses_only_a", "only in first db"),
+                ("ses_only_b", "only in second db"),
+            ],
+            "the database that first claims a session keeps all of its messages \
+             and drops that session's copies from later databases"
+        );
+    }
+
+    #[test]
+    fn registry_load_messages_all_reports_per_source_status() {
+        struct AbsentMsgSource;
+        impl Source for AbsentMsgSource {
+            fn name(&self) -> &str {
+                "missing"
+            }
+            fn load(&self) -> Result<Vec<Record>, SourceError> {
+                Ok(Vec::new())
+            }
+            fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
+                Err(SourceError::Absent("/nonexistent".to_string()))
+            }
+        }
+        let mut reg = Registry::new();
+        reg.register(Box::new(AbsentMsgSource));
+        let (messages, statuses) = reg.load_messages_all();
+        assert!(messages.is_empty());
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].message_count, 0);
+        assert!(matches!(
+            statuses[0].error.as_ref().unwrap(),
+            SourceError::Absent(_)
+        ));
     }
 }

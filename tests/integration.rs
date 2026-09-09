@@ -884,7 +884,13 @@ fn report_output_writes_file_and_keeps_stdout_empty() {
 #[test]
 fn report_output_unwritable_path_errors() {
     let mut cmd = Command::new(bin());
-    cmd.args(["report", "--last", "30d", "--output", "/nonexistent-dir-xyz-llmhelper/report.md"]);
+    cmd.args([
+        "report",
+        "--last",
+        "30d",
+        "--output",
+        "/nonexistent-dir-xyz-llmhelper/report.md",
+    ]);
     cmd.args([
         "--claude-dir",
         fixture_dir().join("claude").to_str().unwrap(),
@@ -907,14 +913,7 @@ fn report_output_unwritable_path_errors() {
 
 #[test]
 fn report_window_and_filter_echo() {
-    let out = run_report(&[
-        "--last",
-        "30d",
-        "--project",
-        "proj",
-        "--source",
-        "opencode",
-    ]);
+    let out = run_report(&["--last", "30d", "--project", "proj", "--source", "opencode"]);
     assert!(out.contains("window: last 30d"));
     assert!(out.contains("project=proj"));
     assert!(out.contains("source=opencode"));
@@ -981,7 +980,8 @@ fn report_top_zero_errors() {
         fixture_dir()
             .join("opencode")
             .join("opencode.db")
-            .to_str().unwrap(),
+            .to_str()
+            .unwrap(),
         "--omp-dir",
         fixture_dir().join("omp").to_str().unwrap(),
         "--kilo-db",
@@ -1019,4 +1019,347 @@ fn report_cost_by_source_order_is_deterministic() {
     let mut sorted = sources.clone();
     sorted.sort();
     assert_eq!(sources, sorted);
+}
+
+// ---------------------------------------------------------------------------
+// `search`
+// ---------------------------------------------------------------------------
+
+/// Run `llmhelper search <query> --json` with fixture paths and parse the output.
+fn run_search_json(query: &str, extra_args: &[&str]) -> serde_json::Value {
+    let mut cmd = Command::new(bin());
+    cmd.args(["search", "--json", query]);
+    add_fixture_source_args(&mut cmd);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    let output = cmd.output().expect("failed to run llmhelper search");
+    assert!(
+        output.status.success(),
+        "llmhelper search exited with {}: {:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap()
+}
+
+/// Point every source at its fixture path.
+fn add_fixture_source_args(cmd: &mut Command) {
+    cmd.arg("--claude-dir").arg(fixture_dir().join("claude"));
+    cmd.arg("--opencode-db")
+        .arg(fixture_dir().join("opencode").join("opencode.db"));
+    cmd.arg("--omp-dir").arg(fixture_dir().join("omp"));
+    cmd.arg("--kilo-db")
+        .arg(fixture_dir().join("kilo").join("kilo.db"));
+}
+
+fn run_search_output(extra_args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd.args(["search", "cache"]);
+    add_fixture_source_args(&mut cmd);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    cmd.output().expect("failed to run llmhelper search")
+}
+
+#[test]
+fn search_sources_panel_lists_every_source_as_ok() {
+    let out = run_search_json("token", &[]);
+    let panel = out["sources"].as_array().unwrap();
+    let names: Vec<&str> = panel.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        vec!["claude", "kilo", "omp", "opencode"],
+        "every known source should appear in the panel"
+    );
+    assert!(panel.iter().all(|s| s["status"] == "ok"));
+    let messages: u64 = panel.iter().map(|s| s["messages"].as_u64().unwrap()).sum();
+    assert!(messages > 0, "fixtures must expose searchable messages");
+}
+
+#[test]
+fn search_reaches_every_source_that_stores_text() {
+    // No single word appears in all four fixtures, so union the corpus over a
+    // handful of queries and prove every non-empty source is actually reachable.
+    let queries = ["token", "cache", "migration", "fixture", "session"];
+    let mut corpus_sources = std::collections::BTreeSet::new();
+    let mut hit_sources = std::collections::BTreeSet::new();
+    for query in queries {
+        let out = run_search_json(query, &[]);
+        for s in out["sources"].as_array().unwrap() {
+            if s["messages"].as_u64().unwrap_or(0) > 0 {
+                corpus_sources.insert(s["name"].as_str().unwrap().to_string());
+            }
+        }
+        for h in out["hits"].as_array().unwrap() {
+            hit_sources.insert(h["source"].as_str().unwrap().to_string());
+        }
+    }
+    assert!(!corpus_sources.is_empty());
+    assert_eq!(
+        hit_sources, corpus_sources,
+        "every source with messages must be searchable"
+    );
+}
+
+#[test]
+fn search_hits_are_ranked_by_matches_then_most_recent() {
+    let out = run_search_json("the", &[]);
+    let hits = out["hits"].as_array().unwrap();
+    for w in hits.windows(2) {
+        let a = w[0]["matches"].as_u64().unwrap();
+        let b = w[1]["matches"].as_u64().unwrap();
+        assert!(a >= b, "matches must be non-increasing: {a} then {b}");
+        if a == b {
+            assert!(
+                w[0]["timestamp"].as_str().unwrap() >= w[1]["timestamp"].as_str().unwrap(),
+                "ties break newest first"
+            );
+        }
+    }
+}
+
+#[test]
+fn search_snippet_marks_elision() {
+    let out = run_search_json("migration helper", &["--context", "5"]);
+    let hits = out["hits"].as_array().unwrap();
+    assert!(!hits.is_empty());
+    assert!(
+        hits.iter()
+            .any(|h| h["snippet"].as_str().unwrap().starts_with('…')
+                || h["snippet"].as_str().unwrap().ends_with('…')),
+        "a narrow context window must elide"
+    );
+}
+
+#[test]
+fn search_limit_caps_the_result_set() {
+    let out = run_search_json("the", &["--limit", "3"]);
+    let hits = out["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 3);
+    assert_eq!(out["limit"].as_u64().unwrap(), 3);
+}
+
+#[test]
+fn search_case_sensitivity_is_opt_in() {
+    let insensitive = run_search_json("CACHE", &[]);
+    let sensitive = run_search_json("CACHE", &["--case-sensitive"]);
+    assert!(
+        !insensitive["hits"].as_array().unwrap().is_empty(),
+        "default search is case-insensitive"
+    );
+    assert!(
+        sensitive["hits"].as_array().unwrap().is_empty(),
+        "uppercase query should miss lowercase prose when case-sensitive"
+    );
+    assert_eq!(sensitive["case_sensitive"], true);
+}
+
+#[test]
+fn search_role_filter_keeps_only_the_requested_role() {
+    let out = run_search_json("cache", &["--role", "assistant"]);
+    let hits = out["hits"].as_array().unwrap();
+    assert!(!hits.is_empty());
+    assert!(
+        hits.iter().all(|h| h["role"] == "assistant"),
+        "role filter leaked a non-assistant hit"
+    );
+    assert_eq!(out["role"].as_str().unwrap(), "assistant");
+}
+
+#[test]
+fn search_source_filter_restricts_to_one_source() {
+    let out = run_search_json("token", &["--source", "kilo"]);
+    let hits = out["hits"].as_array().unwrap();
+    assert!(!hits.is_empty());
+    assert!(
+        hits.iter().all(|h| h["source"] == "kilo"),
+        "source filter leaked another source"
+    );
+}
+
+#[test]
+fn search_project_filter_matches_a_project_substring() {
+    let matched = run_search_json("cache", &["--project", "omp-test"]);
+    assert!(!matched["hits"].as_array().unwrap().is_empty());
+    assert!(matched["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|h| h["project"].as_str().unwrap().contains("omp-test")));
+    let missed = run_search_json("cache", &["--project", "no-such-project"]);
+    assert!(missed["hits"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn search_excludes_tool_output_and_synthetic_parts() {
+    for query in [
+        "HIDDEN",
+        "SECRET",
+        "SYNTHETIC",
+        "IGNORED",
+        "TOOL_RESULT_MARKER",
+    ] {
+        let out = run_search_json(query, &[]);
+        assert!(
+            out["hits"].as_array().unwrap().is_empty(),
+            "{query}: non-prose content must not be searchable"
+        );
+        // The exclusion is per-message, not per-source: every source still
+        // reports itself as ok rather than erroring out.
+        assert!(out["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["status"] == "ok"));
+    }
+}
+
+#[test]
+fn search_no_searchable_text_is_honest_zero_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("empty.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, model TEXT);
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT);
+         INSERT INTO session VALUES ('ses_empty', '/home/hunter/projects/empty', 'auto');
+         INSERT INTO message VALUES
+           ('m1', 'ses_empty', '{}', 1756400000000),
+           ('m2', 'ses_empty', '{}', 1756400060000);
+         INSERT INTO part VALUES
+           ('p1', 'm1', '{\"type\":\"tool\",\"tool\":\"bash\",\"state\":{}}'),
+           ('p2', 'm2', '{\"type\":\"text\",\"text\":\"\",\"synthetic\":true}');",
+    )
+    .unwrap();
+    drop(conn);
+
+    // Scope the other sources to empty paths so this only touches the temp DB.
+    let mut cmd = Command::new(bin());
+    cmd.args(["search", "--json", "whatever"]);
+    cmd.arg("--opencode-db").arg(&db);
+    cmd.arg("--claude-dir").arg(dir.path().join("no-claude"));
+    cmd.arg("--omp-dir").arg(dir.path().join("no-omp"));
+    cmd.arg("--kilo-db").arg(dir.path().join("no-kilo.db"));
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert!(out["hits"].as_array().unwrap().is_empty());
+    let panel = out["sources"].as_array().unwrap();
+    let opencode = panel.iter().find(|s| s["name"] == "opencode").unwrap();
+    assert_eq!(opencode["status"], "ok");
+    assert_eq!(opencode["messages"].as_u64().unwrap(), 0);
+}
+
+#[test]
+fn search_since_in_the_future_returns_nothing() {
+    let before = run_search_json("cache", &["--since", "2000-01-01T00:00:00Z"]);
+    let after = run_search_json("cache", &["--since", "2030-01-01T00:00:00Z"]);
+    assert!(!before["hits"].as_array().unwrap().is_empty());
+    assert!(after["hits"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn search_sources_panel_counts_the_filtered_corpus() {
+    // The panel must say what was searched, not what was loaded: excluding
+    // three projects must zero out the sources that own them.
+    let out = run_search_json("cache", &["--project", "omp-test"]);
+    let panel = out["sources"].as_array().unwrap();
+    let omp = panel.iter().find(|s| s["name"] == "omp").unwrap();
+    assert!(omp["messages"].as_u64().unwrap() > 0);
+    for s in panel.iter().filter(|s| s["name"] != "omp") {
+        assert_eq!(
+            s["messages"].as_u64().unwrap(),
+            0,
+            "{} holds no messages in the filtered corpus",
+            s["name"]
+        );
+        assert_eq!(s["status"], "ok");
+    }
+}
+
+#[test]
+fn search_csv_output_has_expected_header() {
+    let output = run_search_output(&["--csv", "--limit", "1"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let header = stdout.lines().next().unwrap();
+    assert_eq!(
+        header,
+        "source,session_id,project,model,role,timestamp,matches,snippet"
+    );
+}
+
+#[test]
+fn search_text_output_lists_hits_without_a_tty() {
+    let output = run_search_output(&["--text", "--limit", "1"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines.len() >= 2,
+        "expected an indexed hit plus a metadata line"
+    );
+    assert!(lines[0].starts_with("[1]"));
+}
+
+#[test]
+fn search_rejects_empty_query() {
+    let output = Command::new(bin())
+        .args(["search", "   ", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("query must not be empty"));
+}
+
+#[test]
+fn search_rejects_zero_limit() {
+    let output = Command::new(bin())
+        .args(["search", "x", "--limit", "0"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--limit must be at least 1"));
+}
+
+#[test]
+fn search_rejects_json_and_csv_together() {
+    let output = Command::new(bin())
+        .args(["search", "x", "--json", "--csv"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
+#[test]
+fn search_rejects_since_and_last_together() {
+    let output = Command::new(bin())
+        .args([
+            "search",
+            "x",
+            "--since",
+            "2000-01-01T00:00:00Z",
+            "--last",
+            "1d",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
 }

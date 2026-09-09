@@ -23,6 +23,8 @@ pub enum Command {
     Report(ReportArgs),
     /// Send request to OpenAI compatible endpoint.
     Request(RequestArgs),
+    /// Search message text across Agent/LLM transcripts.
+    Search(SearchArgs),
 }
 
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
@@ -455,6 +457,111 @@ impl RequestArgs {
         }
         if self.messages.is_some() && self.prompt.is_some() {
             anyhow::bail!("--messages and --prompt are mutually exclusive");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct SearchArgs {
+    /// Text to search for across message content.
+    pub query: String,
+
+    /// Claude Code projects directory (defaults to ~/.claude/projects).
+    #[arg(long = "claude-dir")]
+    pub claude_dir: Option<std::path::PathBuf>,
+
+    /// OpenCode database path(s). Can be specified multiple times.
+    #[arg(long = "opencode-db")]
+    pub opencode_db: Option<Vec<std::path::PathBuf>>,
+
+    /// OMP sessions directory (defaults to ~/.omp/agent/sessions).
+    #[arg(long = "omp-dir")]
+    pub omp_dir: Option<std::path::PathBuf>,
+
+    /// Kilo Code database path(s). Can be specified multiple times.
+    #[arg(long = "kilo-db")]
+    pub kilo_db: Option<Vec<std::path::PathBuf>>,
+
+    /// Only include messages at or after this RFC 3339 timestamp.
+    #[arg(long = "since")]
+    pub since: Option<DateTime<Utc>>,
+
+    /// Only include messages from the last N days/hours (e.g. "7d", "4h").
+    /// Mutually exclusive with --since.
+    #[arg(long = "last")]
+    pub last: Option<String>,
+
+    /// Filter by project path substring.
+    #[arg(long = "project")]
+    pub project: Option<String>,
+
+    /// Filter by model substring (case-insensitive).
+    #[arg(long = "model")]
+    pub model: Option<String>,
+
+    /// Filter by source name.
+    #[arg(long = "source")]
+    pub source: Option<SourceArg>,
+
+    /// Filter by message role, e.g. user, assistant, or thinking.
+    #[arg(long = "role")]
+    pub role: Option<String>,
+
+    /// Match the query with case sensitivity. Case-insensitive by default.
+    #[arg(long = "case-sensitive")]
+    pub case_sensitive: bool,
+
+    /// Characters of context on either side of a match in the snippet.
+    #[arg(long = "context", default_value_t = crate::search::DEFAULT_CONTEXT)]
+    pub context: usize,
+
+    /// Show at most this many hits (must be >= 1).
+    #[arg(long = "limit", default_value_t = crate::search::DEFAULT_LIMIT)]
+    pub limit: usize,
+
+    /// Output as JSON instead of the interactive TUI.
+    #[arg(long = "json")]
+    pub json: bool,
+
+    /// Output as CSV instead of the interactive TUI.
+    #[arg(long = "csv")]
+    pub csv: bool,
+
+    /// Output a plain hit list instead of the interactive TUI.
+    #[arg(long = "text")]
+    pub text: bool,
+}
+
+impl SearchArgs {
+    pub fn parse_last(&self) -> anyhow::Result<Option<Duration>> {
+        let s = match &self.last {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        parse_duration(s)
+            .map_err(|e| anyhow::anyhow!("invalid --last {}", e))
+            .map(Some)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.query.trim().is_empty() {
+            anyhow::bail!("query must not be empty");
+        }
+        if self.json && self.csv {
+            anyhow::bail!("--json and --csv are mutually exclusive");
+        }
+        if self.json && self.text {
+            anyhow::bail!("--json and --text are mutually exclusive");
+        }
+        if self.csv && self.text {
+            anyhow::bail!("--csv and --text are mutually exclusive");
+        }
+        if self.since.is_some() && self.last.is_some() {
+            anyhow::bail!("--since and --last are mutually exclusive");
+        }
+        if self.limit == 0 {
+            anyhow::bail!("--limit must be at least 1");
         }
         Ok(())
     }
