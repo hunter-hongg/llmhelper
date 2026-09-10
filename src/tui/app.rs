@@ -1,5 +1,6 @@
 use ratatui::widgets::TableState;
 
+use super::table;
 use crate::aggregator::AggregateResult;
 use crate::domain::group::GroupBy;
 use crate::domain::record::Record;
@@ -118,7 +119,7 @@ impl TuiState {
             records,
         });
         self.app.view = View::Detail;
-        self.detail_state.select(Some(0));
+        table::set_selected(&mut self.detail_state, 0);
     }
 
     pub fn close_detail(&mut self) {
@@ -128,70 +129,34 @@ impl TuiState {
     }
 
     pub fn select_next(&mut self) {
-        let (selected, count) = if self.app.view == View::Detail {
-            (
-                self.detail_state.selected(),
-                self.app
-                    .detail
-                    .as_ref()
-                    .map(|d| d.records.len())
-                    .unwrap_or(0),
-            )
-        } else {
-            (
-                self.table_state.selected(),
-                self.app
-                    .result
-                    .as_ref()
-                    .map(|r| r.groups.len())
-                    .unwrap_or(0),
-            )
-        };
-        if count > 0 {
-            let next = match selected {
-                Some(i) => std::cmp::min(i + 1, count - 1),
-                None => 0,
-            };
-            let state = if self.app.view == View::Detail {
-                &mut self.detail_state
-            } else {
-                &mut self.table_state
-            };
-            state.select(Some(next));
-        }
+        let (state, count) = self.active_table();
+        table::select_next(state, count);
     }
 
     pub fn select_previous(&mut self) {
-        let (selected, count) = if self.app.view == View::Detail {
-            (
-                self.detail_state.selected(),
-                self.app
-                    .detail
-                    .as_ref()
-                    .map(|d| d.records.len())
-                    .unwrap_or(0),
-            )
+        let (state, count) = self.active_table();
+        table::select_previous(state, count);
+    }
+
+    /// The table and row count belonging to the current view, so navigation
+    /// dispatches to whichever of the two drill-down levels is visible.
+    fn active_table(&mut self) -> (&mut TableState, usize) {
+        if self.app.view == View::Detail {
+            let count = self
+                .app
+                .detail
+                .as_ref()
+                .map(|d| d.records.len())
+                .unwrap_or(0);
+            (&mut self.detail_state, count)
         } else {
-            (
-                self.table_state.selected(),
-                self.app
-                    .result
-                    .as_ref()
-                    .map(|r| r.groups.len())
-                    .unwrap_or(0),
-            )
-        };
-        if count > 0 {
-            let previous = match selected {
-                Some(i) => std::cmp::max(i.saturating_sub(1), 0),
-                None => 0,
-            };
-            let state = if self.app.view == View::Detail {
-                &mut self.detail_state
-            } else {
-                &mut self.table_state
-            };
-            state.select(Some(previous));
+            let count = self
+                .app
+                .result
+                .as_ref()
+                .map(|r| r.groups.len())
+                .unwrap_or(0);
+            (&mut self.table_state, count)
         }
     }
 
@@ -210,12 +175,8 @@ impl TuiState {
             .as_ref()
             .map(|r| r.groups.len())
             .unwrap_or(0);
-        if count == 0 {
-            self.table_state.select(None);
-            return;
-        }
-        let selected = self.table_state.selected().unwrap_or(0).min(count - 1);
-        self.table_state.select(Some(selected));
+        let selected = self.table_state.selected();
+        table::sync_selection(&mut self.table_state, count, selected);
     }
 
     fn sync_detail_selection(&mut self, selected: usize) {
@@ -225,12 +186,7 @@ impl TuiState {
             .as_ref()
             .map(|d| d.records.len())
             .unwrap_or(0);
-        if count == 0 {
-            self.detail_state.select(None);
-            return;
-        }
-        let selected = selected.min(count - 1);
-        self.detail_state.select(Some(selected));
+        table::sync_selection(&mut self.detail_state, count, Some(selected));
     }
 }
 
@@ -447,5 +403,40 @@ mod tests {
         assert_eq!(state.app.view, View::Groups);
         assert_eq!(state.app.group_by, GroupBy::Project);
         assert!(state.app.detail.is_none());
+    }
+
+    #[test]
+    fn detail_navigation_scrolls_selection_into_view() {
+        let now = Utc::now();
+        let records: Vec<Record> = (0..40)
+            .map(|i| {
+                record(
+                    &format!("s{:02}", i),
+                    "claude",
+                    "/p",
+                    "auto",
+                    now - Duration::minutes(i as i64),
+                    None,
+                )
+            })
+            .collect();
+        let mut state = load_state(&records, GroupBy::Source);
+        state.table_state.select(Some(0));
+        state.open_detail();
+
+        for _ in 0..super::table::VISIBLE_ROWS {
+            state.select_next();
+        }
+        assert_eq!(
+            state.detail_state.selected(),
+            Some(super::table::VISIBLE_ROWS)
+        );
+        assert_eq!(state.detail_state.offset(), 1);
+
+        for _ in 0..super::table::VISIBLE_ROWS {
+            state.select_previous();
+        }
+        assert_eq!(state.detail_state.selected(), Some(0));
+        assert_eq!(state.detail_state.offset(), 0);
     }
 }

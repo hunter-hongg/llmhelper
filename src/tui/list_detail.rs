@@ -1,5 +1,7 @@
 use ratatui::widgets::TableState;
 
+use super::table;
+
 /// A two-state view enum (List / Detail) that the shared list+detail state can
 /// flip without knowing the concrete variant names.
 pub trait ViewSwitcher {
@@ -31,10 +33,6 @@ impl<T: Clone, V: Default + ViewSwitcher> Default for ListDetail<T, V> {
 }
 
 impl<T: Clone, V: Default + ViewSwitcher> ListDetail<T, V> {
-    /// How many rows stay visible above or below the selection, used to scroll
-    /// the table so the selected row never leaves the viewport.
-    pub const VISIBLE_ROWS: usize = 15;
-
     pub fn new() -> Self {
         Self {
             running: false,
@@ -93,7 +91,7 @@ impl<T: Clone, V: Default + ViewSwitcher> ListDetail<T, V> {
             };
             self.detail = Some(self.items[index].clone());
             self.view.show_detail();
-            self.set_selection(index);
+            table::set_selected(&mut self.table_state, index);
             return Some(index);
         }
         None
@@ -103,71 +101,31 @@ impl<T: Clone, V: Default + ViewSwitcher> ListDetail<T, V> {
         if self.view.is_detail() {
             return;
         }
-        let count = self.items.len();
-        if count > 0 {
-            let i = match self.table_state.selected() {
-                Some(i) => std::cmp::min(i + 1, count - 1),
-                None => 0,
-            };
-            self.set_selection(i);
-        }
+        table::select_next(&mut self.table_state, self.items.len());
     }
 
     pub fn select_previous(&mut self) {
         if self.view.is_detail() {
             return;
         }
-        let count = self.items.len();
-        if count > 0 {
-            let i = match self.table_state.selected() {
-                Some(i) => i.saturating_sub(1),
-                None => 0,
-            };
-            self.set_selection(i);
-        }
+        table::select_previous(&mut self.table_state, self.items.len());
     }
 
     pub fn select_first(&mut self) {
-        if self.view.is_detail() || self.items.is_empty() {
+        if self.view.is_detail() {
             return;
         }
-        self.set_selection(0);
+        table::select_first(&mut self.table_state, self.items.len());
     }
 
     pub fn select_last(&mut self) {
-        if self.view.is_detail() || self.items.is_empty() {
+        if self.view.is_detail() {
             return;
         }
-        self.set_selection(self.items.len() - 1);
+        table::select_last(&mut self.table_state, self.items.len());
     }
 
-    /// Establish or re-clamp the list selection after the items change.
-    /// Constructors that seed `items` directly call this with `None`, so the
-    /// first draw always has a selection (`TableState::default()` starts with
-    /// none, which would make Enter and the arrow keys no-ops).
     pub fn sync_selection(&mut self, selected: Option<usize>) {
-        let count = self.items.len();
-        if count == 0 {
-            self.table_state.select(None);
-            *self.table_state.offset_mut() = 0;
-            return;
-        }
-        let selected = selected.unwrap_or(0).min(count - 1);
-        self.set_selection(selected);
-    }
-
-    fn set_selection(&mut self, selected: usize) {
-        self.table_state.select(Some(selected));
-        Self::adjust_offset(&mut self.table_state, selected);
-    }
-
-    fn adjust_offset(table_state: &mut TableState, selected: usize) {
-        let visible = Self::VISIBLE_ROWS;
-        let offset = table_state.offset();
-        if selected >= offset + visible {
-            *table_state.offset_mut() = selected - visible + 1;
-        } else if selected < offset {
-            *table_state.offset_mut() = selected;
-        }
+        table::sync_selection(&mut self.table_state, self.items.len(), selected);
     }
 }

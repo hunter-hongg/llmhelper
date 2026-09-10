@@ -84,6 +84,14 @@
 
 - 仍未做（下一批候选）：`usage` TUI 的 `Groups/Detail` 是第三份 list/detail 骨架，但它的 detail 是分组内的 Session 表（`GroupDetail` + 第二个 `detail_state`），与 `ListDetail` 的"detail = 列表项本身"不同构，需要单独设计而非直接套用。
 
+- 落地上一批候选：`usage` TUI 下钻视图迁移到共享 selection 机制。先把 `ListDetail` 内部那份真实的机器——offset 跟随的 TableState 遍历逻辑——抽成独立 `src/tui/table.rs` 纯函数模块（`VISIBLE_ROWS`、`set_selected`/`sync_selection`/`select_next`/`select_previous`/`select_first`/`select_last`），`ListDetail` 改为委托（行为零变化）。`usage` 的 `TuiState` 没有套用 `ListDetail`（其 detail 是分组内 Session 表 + 第二个 table_state，非同构，按上一批结论单独设计），但迁移到了同一份 table 机制：`active_table()` 按 `View` 派发到当前层级，`select_next/select_previous`、`sync_group_selection`/`sync_detail_selection` 全部改走共享函数，`open_detail` 用 `set_selected` 重置 offset。净效果：usage 消掉约 60 行重复的 clamp/offset 手工逻辑，并顺带修掉一个潜在交互 bug——此前 usage 的上下键不调整 offset，长按到底选中行会滚出视口（与 sessions 2026-09-05 修复过的问题同类），现在两侧层级都跟随滚动。新增 `table.rs` 5 个单元测试（空表清空、越界 clamp、边界 clamp、滚动进出视口、空 count no-op）+ `app.rs` 1 个 usage 回归测试（detail 导航 15 行越界后 offset 跟随、回顶归零）。测试 183 → 189 lib 全通过。
+
+- 提交上一会话工作区：`refactor(tui): extract shared ListDetail skeleton, single-pass OMP load` → `4d4f149`（9 文件 +522/-580）。
+
+- 清理历史 fmt 遗留：`cargo fmt` 全库格式化，落下 config/report/request 系列此前未过 fmt 的 diff（`src/config.rs`、`src/report.rs`、`src/request.rs`、`src/tui/request_app.rs`、`src/tui/request_render.rs`、`tests/request.rs` 及 `main.rs` 中 request 相关段落，纯排版零语义变化），`cargo fmt --check` 归零。
+
+- 会话总结：`usage` 下钻迁移到共享表机制（抽出 `src/tui/table.rs` 纯函数，`ListDetail` 委托、usage 双层派发），修掉上下键选中滚出视口的潜在 bug，新增 6 个回归测试；`cargo fmt` 全库清理历史遗留；提交工作区重构。新增 `.scratch/usage_tui_smoke.py` PTY smoke（Enter 下钻 → j/k → Esc 返回 → Tab 切分组 → r → q，130/80 列宽断言自适应全通过）。测试 265 → 271 全通过，clippy `-D warnings` 干净，`cargo fmt --check` 零 diff。
+
 ## 2026-09-09
 
 - 修复 `request` 端点路径 bug：`send_chat_completion` 与 `send_chat_completion_stream` 此前 POST 到 `{base}/chat/completions`，网关（如 freellmapi）对该路径返回 200 + SPA HTML 前端页而非 JSON，导致 `serde_json::from_str` 统一报 "failed to parse response JSON"（与 prompt 内容/语言无关）。两处端点统一改为 `{base}/v1/chat/completions`。集成测试夹具升级为按请求路径路由：非 `/v1/chat/completions` 返回 `text/html` 兜底页（复刻真实网关行为，此前夹具对任意路径回 JSON 掩盖了该 bug），新增请求行路径断言回归测试与 `--stream --text` 集成测试，`tests/request.rs` 9 → 11 全通过。同步修正 `docs/specs/0008-request.md` 的端点路径。注：此修复曾在 2026-09-08 会话中做过但仅存在于未提交工作区、未进任何 commit 而丢失，本次重新应用。HTTP 401（Invalid API key）为服务端凭据问题，curl 直连 `/v1/chat/completions` 可复现，与本次解析 bug 无关。

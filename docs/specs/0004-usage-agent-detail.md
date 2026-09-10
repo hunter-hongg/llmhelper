@@ -60,7 +60,7 @@ Add an interactive drill-down view to the existing `usage` TUI. With a group row
 - `r` reloads sources, rebuilds the aggregate result, and rebuilds the open detail list if the selected group still exists. If the selected group disappears after refresh, the TUI returns to groups mode.
 - Live refresh applies the same rules as manual refresh. The selected detail row is clamped to the refreshed list length.
 - Cycling grouping dimensions closes detail because old detail keys are not meaningful under a different grouping dimension.
-- The group table and detail table should render through stateful table rendering so selection changes scroll into view.
+- The group table and detail table should render through stateful table rendering so selection changes scroll into view. Selection traversal (clamping to bounds and offset follow so the selected row never leaves the viewport) is shared across TUIs through the `tui::table` helper functions; the `usage` drill-down dispatches them to whichever of its two levels is active.
 - The detail block title identifies the selected group key and Session count.
 - Detail columns are: Session id, Source, Project, Model, Started, Ended, Messages, Input, Output, Cache R, Cache W, Cost.
 - Timestamps are rendered in a compact local-readable UTC form; missing end time renders as `-`.

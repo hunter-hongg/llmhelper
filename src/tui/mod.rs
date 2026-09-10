@@ -12,6 +12,7 @@ pub mod search_app;
 pub mod search_render;
 pub mod sessions_app;
 pub mod sessions_render;
+pub mod table;
 pub mod terminal;
 pub mod viewer;
 
