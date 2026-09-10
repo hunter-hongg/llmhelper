@@ -856,6 +856,143 @@ mod omp {
             Self { sessions_dir }
         }
 
+        /// Walk every session JSONL once, producing both the aggregated
+        /// records and the raw message corpus. Without this the two reads each
+        /// walked the whole directory, which matters on a machine where the
+        /// transcripts run to hundreds of megabytes.
+        fn load_all(&self) -> Result<(Vec<Record>, Vec<Message>), SourceError> {
+            if !self.sessions_dir.exists() {
+                return Err(SourceError::Absent(
+                    self.sessions_dir.to_string_lossy().to_string(),
+                ));
+            }
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+            let mut records = Vec::new();
+            let mut messages = Vec::new();
+            let mut files = Vec::new();
+            collect_jsonl(&self.sessions_dir, &mut files);
+            for p in files {
+                let content = match std::fs::read_to_string(&p) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("warn: cannot read {:?}: {}", p, e);
+                        continue;
+                    }
+                };
+                let decoded_project = p
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|n| Self::decode_dir_name(n, &home));
+                let mut session_id: Option<String> = None;
+                let mut session_cwd: Option<String> = None;
+                let mut session_started_at: Option<DateTime<Utc>> = None;
+                let mut events: Vec<(DateTime<Utc>, String, TokenBreakdown)> = Vec::new();
+                let mut cost: f64 = 0.0;
+                // (timestamp, model, role, text) — resolved against the session
+                // envelope after the loop, matching how `load` builds a record.
+                let mut message_events: Vec<MessageEvent> = Vec::new();
+                for line in content.lines().filter(|l| !l.trim().is_empty()) {
+                    let line: Line = match serde_json::from_str(line) {
+                        Ok(l) => l,
+                        Err(_) => continue,
+                    };
+                    let ts = line.timestamp.as_deref().and_then(parse_timestamp);
+                    match line.line_type.as_deref() {
+                        Some("session") => {
+                            session_id = session_id.or(line.id);
+                            session_cwd = session_cwd.or(line.cwd);
+                            session_started_at = session_started_at.or(ts);
+                        }
+                        Some("message") => {
+                            let Some(m) = line.message else {
+                                continue;
+                            };
+                            // Record side: only assistant turns with a timestamp
+                            // contribute usage.
+                            if m.role.as_deref() == Some("assistant") {
+                                if let Some(ts) = ts {
+                                    let model = m.model.clone().unwrap_or_default();
+                                    let u = m.usage.unwrap_or_default();
+                                    cost += u.cost.as_ref().and_then(|c| c.total).unwrap_or(0.0);
+                                    events.push((
+                                        ts,
+                                        model,
+                                        TokenBreakdown {
+                                            input: u.input.unwrap_or(0),
+                                            output: u.output.unwrap_or(0)
+                                                + u.reasoning_tokens.unwrap_or(0),
+                                            cache_read: u.cache_read.unwrap_or(0),
+                                            cache_write: u.cache_write.unwrap_or(0),
+                                        },
+                                    ));
+                                }
+                            }
+                            // Corpus side: tool and shell output are machine
+                            // dumps, not conversation, and dominate the corpus
+                            // by volume.
+                            match m.role.as_deref() {
+                                Some("toolResult") | Some("bashExecution") => continue,
+                                _ => {}
+                            }
+                            let Some(role) = m.role.clone() else {
+                                continue;
+                            };
+                            let model = m.model.clone();
+                            for (msg_role, text) in content_texts(m.content.as_ref(), &role) {
+                                message_events.push((ts, model.clone(), msg_role, text));
+                            }
+                        }
+                        Some("custom_message") => {
+                            let Some(v) = line.content.as_ref() else {
+                                continue;
+                            };
+                            let role = line
+                                .custom_type
+                                .clone()
+                                .unwrap_or_else(|| "custom".to_string());
+                            for (msg_role, text) in content_texts(Some(v), &role) {
+                                message_events.push((ts, None, msg_role, text));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let project = session_cwd
+                    .or_else(|| decoded_project.clone())
+                    .unwrap_or_else(|| "/unknown".to_string());
+                let sid = session_id.unwrap_or_else(|| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string()
+                });
+                let cost = if cost == 0.0 { None } else { Some(cost) };
+                if let Some(rec) = build_session_record(
+                    "omp",
+                    sid.clone(),
+                    project.clone(),
+                    session_started_at,
+                    &mut events,
+                    cost,
+                ) {
+                    records.push(rec);
+                }
+                for (ts, model, role, text) in message_events {
+                    messages.push(Message {
+                        source: "omp".to_string(),
+                        session_id: sid.clone(),
+                        project: project.clone(),
+                        model,
+                        role,
+                        timestamp: ts,
+                        text,
+                    });
+                }
+            }
+            Ok((records, messages))
+        }
+
         /// Decode a hyphen-encoded project directory name.
         /// OMP encodes paths relative to $HOME: `~/projects/modbox` becomes
         /// `-projects-modbox`, and the home directory itself becomes `-`.
@@ -875,190 +1012,12 @@ mod omp {
         }
 
         fn load(&self) -> Result<Vec<Record>, SourceError> {
-            if !self.sessions_dir.exists() {
-                return Err(SourceError::Absent(
-                    self.sessions_dir.to_string_lossy().to_string(),
-                ));
-            }
-            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-            let mut records = Vec::new();
-            let mut files = Vec::new();
-            collect_jsonl(&self.sessions_dir, &mut files);
-            for p in files {
-                let content = match std::fs::read_to_string(&p) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("warn: cannot read {:?}: {}", p, e);
-                        continue;
-                    }
-                };
-                let project_dir = p.parent();
-                let decoded_project = project_dir
-                    .and_then(|d| d.file_name())
-                    .and_then(|n| n.to_str())
-                    .map(|n| Self::decode_dir_name(n, &home));
-                let mut session_id: Option<String> = None;
-                let mut session_cwd: Option<String> = None;
-                let mut session_started_at: Option<DateTime<Utc>> = None;
-                let mut events: Vec<(DateTime<Utc>, String, TokenBreakdown)> = Vec::new();
-                let mut cost: f64 = 0.0;
-                for line in content.lines().filter(|l| !l.trim().is_empty()) {
-                    let line: Line = match serde_json::from_str(line) {
-                        Ok(l) => l,
-                        Err(_) => continue,
-                    };
-                    match line.line_type.as_deref() {
-                        Some("session") => {
-                            session_id = session_id.or(line.id);
-                            session_cwd = session_cwd.or(line.cwd);
-                            session_started_at = session_started_at
-                                .or_else(|| line.timestamp.as_deref().and_then(parse_timestamp));
-                        }
-                        Some("message") => {
-                            let m = match line.message {
-                                Some(m) => m,
-                                None => continue,
-                            };
-                            if m.role.as_deref() != Some("assistant") {
-                                continue;
-                            }
-                            let ts = match line.timestamp.as_deref().and_then(parse_timestamp) {
-                                Some(ts) => ts,
-                                None => continue,
-                            };
-                            let model = m.model.clone().unwrap_or_default();
-                            let u = m.usage.unwrap_or_default();
-                            cost += u.cost.as_ref().and_then(|c| c.total).unwrap_or(0.0);
-                            events.push((
-                                ts,
-                                model,
-                                TokenBreakdown {
-                                    input: u.input.unwrap_or(0),
-                                    output: u.output.unwrap_or(0) + u.reasoning_tokens.unwrap_or(0),
-                                    cache_read: u.cache_read.unwrap_or(0),
-                                    cache_write: u.cache_write.unwrap_or(0),
-                                },
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                let project = session_cwd
-                    .or_else(|| decoded_project.clone())
-                    .unwrap_or_else(|| "/unknown".to_string());
-                let cost = if cost == 0.0 { None } else { Some(cost) };
-                if let Some(rec) = build_session_record(
-                    "omp",
-                    session_id.unwrap_or_else(|| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_string()
-                    }),
-                    project,
-                    session_started_at,
-                    &mut events,
-                    cost,
-                ) {
-                    records.push(rec);
-                }
-            }
+            let (records, _) = self.load_all()?;
             Ok(records)
         }
 
         fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
-            if !self.sessions_dir.exists() {
-                return Err(SourceError::Absent(
-                    self.sessions_dir.to_string_lossy().to_string(),
-                ));
-            }
-            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-            let mut messages = Vec::new();
-            let mut files = Vec::new();
-            collect_jsonl(&self.sessions_dir, &mut files);
-            for p in files {
-                let content = match std::fs::read_to_string(&p) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("warn: cannot read {:?}: {}", p, e);
-                        continue;
-                    }
-                };
-                let decoded_project = p
-                    .parent()
-                    .and_then(|d| d.file_name())
-                    .and_then(|n| n.to_str())
-                    .map(|n| Self::decode_dir_name(n, &home));
-                let mut session_id: Option<String> = None;
-                let mut session_cwd: Option<String> = None;
-                // (timestamp, model, role, text) — resolved against the session
-                // envelope after the loop, matching how `load` builds a record.
-                let mut events: Vec<MessageEvent> = Vec::new();
-                for line in content.lines().filter(|l| !l.trim().is_empty()) {
-                    let line: Line = match serde_json::from_str(line) {
-                        Ok(l) => l,
-                        Err(_) => continue,
-                    };
-                    let ts = line.timestamp.as_deref().and_then(parse_timestamp);
-                    match line.line_type.as_deref() {
-                        Some("session") => {
-                            session_id = session_id.or(line.id);
-                            session_cwd = session_cwd.or(line.cwd);
-                        }
-                        Some("message") => {
-                            let Some(m) = line.message else {
-                                continue;
-                            };
-                            // Tool and shell output are machine dumps, not
-                            // conversation, and dominate the corpus by volume.
-                            match m.role.as_deref() {
-                                Some("toolResult") | Some("bashExecution") => continue,
-                                _ => {}
-                            }
-                            let Some(role) = m.role.clone() else {
-                                continue;
-                            };
-                            let model = m.model.clone();
-                            for (msg_role, text) in content_texts(m.content.as_ref(), &role) {
-                                events.push((ts, model.clone(), msg_role, text));
-                            }
-                        }
-                        Some("custom_message") => {
-                            let Some(v) = line.content.as_ref() else {
-                                continue;
-                            };
-                            let role = line
-                                .custom_type
-                                .clone()
-                                .unwrap_or_else(|| "custom".to_string());
-                            for (msg_role, text) in content_texts(Some(v), &role) {
-                                events.push((ts, None, msg_role, text));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                let project = session_cwd
-                    .or_else(|| decoded_project.clone())
-                    .unwrap_or_else(|| "/unknown".to_string());
-                let sid = session_id.unwrap_or_else(|| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string()
-                });
-                for (ts, model, role, text) in events {
-                    messages.push(Message {
-                        source: "omp".to_string(),
-                        session_id: sid.clone(),
-                        project: project.clone(),
-                        model,
-                        role,
-                        timestamp: ts,
-                        text,
-                    });
-                }
-            }
+            let (_, messages) = self.load_all()?;
             Ok(messages)
         }
     }

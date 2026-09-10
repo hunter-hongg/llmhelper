@@ -26,22 +26,22 @@ pub fn render(frame: &mut Frame, state: &mut SearchTuiState) {
         ])
         .split(area);
     frame.render_widget(render_header(state), chunks[0]);
-    frame.render_widget(render_sources(&state.app.message_statuses), chunks[1]);
-    match state.app.view {
+    frame.render_widget(render_sources(&state.message_statuses), chunks[1]);
+    match state.list.view {
         SearchView::Detail => {
             // Resize before taking the detail borrow: the wrap width and the
             // viewport both mutate the state.
-            if state.app.detail.is_some() {
+            if state.list.detail.is_some() {
                 state.set_detail_width((chunks[2].width as usize).saturating_sub(2));
                 state.set_viewport_height((chunks[2].height as usize).saturating_sub(2));
-                if let Some(detail) = state.app.detail.as_ref() {
+                if let Some(detail) = state.list.detail.as_ref() {
                     frame.render_widget(render_detail(detail, state), chunks[2]);
                 }
             }
         }
         SearchView::List => {
             let table = render_table(state);
-            frame.render_stateful_widget(table, chunks[2], &mut state.table_state);
+            frame.render_stateful_widget(table, chunks[2], &mut state.list.table_state);
         }
     }
     frame.render_widget(render_footer(state), chunks[3]);
@@ -58,41 +58,41 @@ fn render_header(state: &SearchTuiState) -> Paragraph<'_> {
     let mut query_spans = vec![
         Span::styled("Query ", Style::default().fg(MUTED)),
         Span::styled(
-            state.app.query.clone(),
+            state.query.clone(),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
     ];
-    if state.app.case_sensitive {
+    if state.case_sensitive {
         query_spans.push(Span::styled(
             "  case-sensitive",
             Style::default().fg(YELLOW),
         ));
     }
-    if let Some(role) = &state.app.role {
+    if let Some(role) = &state.role {
         query_spans.push(Span::styled(
             format!("  role:{role}"),
             Style::default().fg(ACCENT2),
         ));
     }
-    if !state.app.filters.is_empty() {
+    if !state.filters.is_empty() {
         query_spans.push(Span::styled(
-            format!("  {}", state.app.filters),
+            format!("  {}", state.filters),
             Style::default().fg(MUTED),
         ));
     }
     lines.push(Line::from(query_spans));
-    match state.app.view {
+    match state.list.view {
         SearchView::List => {
             lines.push(Line::from(vec![
                 Span::styled("Hits ", Style::default().fg(MUTED)),
                 Span::styled(
-                    state.app.hits.len().to_string(),
+                    state.list.items.len().to_string(),
                     Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
                 ),
             ]));
         }
         SearchView::Detail => {
-            let who = state.app.detail.as_ref().map(|h| {
+            let who = state.list.detail.as_ref().map(|h| {
                 format!(
                     "{} / {}",
                     h.source,
@@ -137,7 +137,7 @@ fn render_sources(statuses: &[MessageStatus]) -> Paragraph<'_> {
 }
 
 fn render_footer(state: &SearchTuiState) -> Paragraph<'_> {
-    let keys: &[(&str, &str)] = match state.app.view {
+    let keys: &[(&str, &str)] = match state.list.view {
         SearchView::Detail => &[
             ("↑↓", "scroll"),
             ("PgUp/PgDn", "page"),
@@ -222,7 +222,7 @@ fn render_detail(hit: &SearchHit, state: &SearchTuiState) -> Paragraph<'static> 
 
 fn render_table(state: &mut SearchTuiState) -> Table<'static> {
     let block = panel("hits");
-    let hits = &state.app.hits;
+    let hits = &state.list.items;
     if hits.is_empty() {
         return Table::new(
             vec![Row::new(vec![Cell::from(" No matches ")].into_iter())
@@ -261,7 +261,7 @@ fn render_table(state: &mut SearchTuiState) -> Table<'static> {
         })
         .collect();
     let header_row = Row::new(header_cells).height(1);
-    let selected = state.table_state.selected();
+    let selected = state.list.table_state.selected();
     let rows: Vec<Row> = hits
         .iter()
         .enumerate()

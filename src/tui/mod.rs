@@ -1,6 +1,7 @@
 pub mod app;
 pub mod diff_app;
 pub mod diff_render;
+pub mod list_detail;
 pub mod render;
 pub mod report_app;
 pub mod report_render;
@@ -16,7 +17,8 @@ pub mod viewer;
 
 pub use app::{App, TerminalApp, TuiState, View};
 pub use diff_app::{DiffApp, DiffTuiApp, DiffTuiState};
+pub use list_detail::{ListDetail, ViewSwitcher};
 pub use report_app::{ReportTuiApp, ReportTuiState};
 pub use request_app::{RequestMeta, RequestTuiApp, RequestTuiState};
-pub use search_app::{SearchApp, SearchData, SearchTuiApp, SearchTuiState, SearchView};
-pub use sessions_app::{SessionsApp, SessionsData, SessionsTuiApp, SessionsTuiState, SessionsView};
+pub use search_app::{SearchData, SearchTuiApp, SearchTuiState, SearchView};
+pub use sessions_app::{SessionsData, SessionsTuiApp, SessionsTuiState, SessionsView};

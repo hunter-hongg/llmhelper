@@ -25,16 +25,16 @@ pub fn render(frame: &mut Frame, state: &mut SessionsTuiState) {
         ])
         .split(area);
     frame.render_widget(render_header(state), chunks[0]);
-    frame.render_widget(render_sources(&state.app.source_statuses), chunks[1]);
-    match state.app.view {
+    frame.render_widget(render_sources(&state.source_statuses), chunks[1]);
+    match state.list.view {
         SessionsView::Detail => {
-            if let Some(detail) = state.app.detail.as_ref() {
+            if let Some(detail) = state.list.detail.as_ref() {
                 frame.render_widget(render_detail(detail), chunks[2]);
             }
         }
         SessionsView::List => {
             let table = render_table(state);
-            frame.render_stateful_widget(table, chunks[2], &mut state.table_state);
+            frame.render_stateful_widget(table, chunks[2], &mut state.list.table_state);
         }
     }
     frame.render_widget(render_footer(state), chunks[3]);
@@ -60,9 +60,9 @@ fn render_header(state: &SessionsTuiState) -> Paragraph<'_> {
         ),
         Span::styled("  sessions", Style::default().fg(TITLE)),
     ])];
-    match state.app.view {
+    match state.list.view {
         SessionsView::List => {
-            let count = state.app.records.len();
+            let count = state.list.items.len();
             lines.push(Line::from(vec![
                 Span::styled("Sessions ", Style::default().fg(MUTED)),
                 Span::styled(
@@ -73,7 +73,7 @@ fn render_header(state: &SessionsTuiState) -> Paragraph<'_> {
         }
         SessionsView::Detail => {
             let id = state
-                .app
+                .list
                 .detail
                 .as_ref()
                 .map(|r| r.session_id.chars().take(56).collect::<String>())
@@ -111,7 +111,7 @@ fn render_sources(statuses: &[SourceStatus]) -> Paragraph<'_> {
 }
 
 fn render_footer(state: &SessionsTuiState) -> Paragraph<'_> {
-    let keys: &[(&str, &str)] = match state.app.view {
+    let keys: &[(&str, &str)] = match state.list.view {
         SessionsView::Detail => &[("r", "refresh"), ("Esc", "back"), ("q", "quit")],
         SessionsView::List => &[
             ("↑↓", "select"),
@@ -224,7 +224,7 @@ fn format_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> String {
 
 fn render_table(state: &mut SessionsTuiState) -> Table<'static> {
     let block = panel("sessions");
-    let records = &state.app.records;
+    let records = &state.list.items;
     if records.is_empty() {
         return Table::new(
             vec![
@@ -276,7 +276,7 @@ fn render_table(state: &mut SessionsTuiState) -> Table<'static> {
         Constraint::Length(8),
         Constraint::Length(8),
     ];
-    let selected = state.table_state.selected();
+    let selected = state.list.table_state.selected();
     let rows: Vec<Row> = records
         .iter()
         .enumerate()

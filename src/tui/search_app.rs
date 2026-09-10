@@ -1,7 +1,6 @@
-use ratatui::widgets::TableState;
-
 use crate::search::SearchHit;
 use crate::source::MessageStatus;
+use crate::tui::list_detail::{ListDetail, ViewSwitcher};
 use crate::tui::scroll::Scrollable;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +10,18 @@ pub enum SearchView {
     Detail,
 }
 
+impl ViewSwitcher for SearchView {
+    fn is_detail(&self) -> bool {
+        *self == Self::Detail
+    }
+    fn show_list(&mut self) {
+        *self = Self::List;
+    }
+    fn show_detail(&mut self) {
+        *self = Self::Detail;
+    }
+}
+
 /// Ranked hits plus the per-Source message counts, mirroring `SessionsData`.
 #[derive(Default)]
 pub struct SearchData {
@@ -18,24 +29,15 @@ pub struct SearchData {
     pub message_statuses: Vec<MessageStatus>,
 }
 
-#[derive(Default)]
-pub struct SearchApp {
-    pub running: bool,
-    pub view: SearchView,
+pub struct SearchTuiState {
+    pub list: ListDetail<SearchHit, SearchView>,
     pub query: String,
     pub case_sensitive: bool,
     pub role: Option<String>,
     /// `--project`/`--model`/`--since`/`--last`/`--source`/`--limit`/`--context`
     /// as one line, so a scoped search never looks unscoped on screen.
     pub filters: String,
-    pub hits: Vec<SearchHit>,
-    pub detail: Option<SearchHit>,
     pub message_statuses: Vec<MessageStatus>,
-}
-
-pub struct SearchTuiState {
-    pub app: SearchApp,
-    pub table_state: TableState,
     /// Scroll offset and line count for the detail body.
     pub scroll: usize,
     pub viewport_height: usize,
@@ -44,8 +46,6 @@ pub struct SearchTuiState {
 }
 
 impl SearchTuiState {
-    pub const VISIBLE_ROWS: usize = 15;
-
     pub fn new(
         query: String,
         case_sensitive: bool,
@@ -54,18 +54,12 @@ impl SearchTuiState {
         data: SearchData,
     ) -> Self {
         let mut this = Self {
-            app: SearchApp {
-                running: false,
-                view: SearchView::List,
-                query,
-                case_sensitive,
-                role,
-                filters,
-                hits: data.hits,
-                detail: None,
-                message_statuses: data.message_statuses,
-            },
-            table_state: TableState::default(),
+            list: ListDetail::new(),
+            query,
+            case_sensitive,
+            role,
+            filters,
+            message_statuses: data.message_statuses,
             scroll: 0,
             viewport_height: 0,
             detail_lines: Vec::new(),
@@ -73,129 +67,25 @@ impl SearchTuiState {
         };
         // A non-empty list must start with something selected, otherwise
         // Enter and the arrow keys are all no-ops on first interaction.
-        this.sync_list_selection(None);
+        this.list.items = data.hits;
+        this.list.sync_selection(None);
         this
     }
 
     pub fn quit(&mut self) {
-        self.app.running = false;
+        self.list.quit();
     }
 
     /// Merge freshly loaded hits into the state. The detail view is preserved
     /// when the same hit survives the re-run; otherwise it closes, matching
     /// the `sessions` refresh behaviour.
     pub fn apply_data(&mut self, data: SearchData) {
-        let selected = self.table_state.selected();
-        let detail = self.app.detail.take();
-
-        self.app.hits = data.hits;
-        self.app.message_statuses = data.message_statuses;
-        self.sync_list_selection(selected);
-
-        if let Some(detail) = detail {
-            let Some(index) = self.app.hits.iter().position(|h| h.same_message(&detail)) else {
-                self.close_detail();
-                return;
-            };
-            self.app.detail = Some(self.app.hits[index].clone());
-            self.app.view = SearchView::Detail;
-            self.set_list_selection(index);
+        self.message_statuses = data.message_statuses;
+        let survived = self.list.apply_items(data.hits, |a, b| a.same_message(b));
+        if survived.is_some() {
             self.set_scroll(0);
             self.rewrap_detail();
         }
-    }
-
-    pub fn open_detail(&mut self) {
-        if self.app.view != SearchView::List {
-            return;
-        }
-        let Some(selected) = self.table_state.selected() else {
-            return;
-        };
-        let Some(hit) = self.app.hits.get(selected) else {
-            return;
-        };
-        self.app.detail = Some(hit.clone());
-        self.app.view = SearchView::Detail;
-        self.set_scroll(0);
-    }
-
-    pub fn close_detail(&mut self) {
-        if self.app.view != SearchView::Detail {
-            return;
-        }
-        self.app.view = SearchView::List;
-        self.app.detail = None;
-    }
-
-    pub fn select_next(&mut self) {
-        if self.app.view != SearchView::List {
-            return;
-        }
-        let count = self.app.hits.len();
-        if count == 0 {
-            return;
-        }
-        let i = match self.table_state.selected() {
-            Some(i) => std::cmp::min(i + 1, count - 1),
-            None => 0,
-        };
-        self.set_list_selection(i);
-    }
-
-    pub fn select_previous(&mut self) {
-        if self.app.view != SearchView::List {
-            return;
-        }
-        let count = self.app.hits.len();
-        if count == 0 {
-            return;
-        }
-        let i = match self.table_state.selected() {
-            Some(i) => i.saturating_sub(1),
-            None => 0,
-        };
-        self.set_list_selection(i);
-    }
-
-    pub fn select_first(&mut self) {
-        if self.app.view != SearchView::List || self.app.hits.is_empty() {
-            return;
-        }
-        self.set_list_selection(0);
-    }
-
-    pub fn select_last(&mut self) {
-        if self.app.view != SearchView::List || self.app.hits.is_empty() {
-            return;
-        }
-        self.set_list_selection(self.app.hits.len() - 1);
-    }
-
-    fn set_list_selection(&mut self, selected: usize) {
-        self.table_state.select(Some(selected));
-        Self::adjust_offset(&mut self.table_state, selected);
-    }
-
-    fn adjust_offset(table_state: &mut TableState, selected: usize) {
-        let visible = Self::VISIBLE_ROWS;
-        let offset = table_state.offset();
-        if selected >= offset + visible {
-            *table_state.offset_mut() = selected - visible + 1;
-        } else if selected < offset {
-            *table_state.offset_mut() = selected;
-        }
-    }
-
-    fn sync_list_selection(&mut self, selected: Option<usize>) {
-        let count = self.app.hits.len();
-        if count == 0 {
-            self.table_state.select(None);
-            *self.table_state.offset_mut() = 0;
-            return;
-        }
-        let selected = selected.unwrap_or(0).min(count - 1);
-        self.set_list_selection(selected);
     }
 
     /// Record the detail body width and re-wrap the open message when it
@@ -209,7 +99,7 @@ impl SearchTuiState {
     }
 
     fn rewrap_detail(&mut self) {
-        let Some(detail) = self.app.detail.as_ref() else {
+        let Some(detail) = self.list.detail.as_ref() else {
             self.detail_lines.clear();
             return;
         };
@@ -331,25 +221,25 @@ mod tests {
                 message_statuses: Vec::new(),
             },
         );
-        state.app.running = true;
+        state.list.running = true;
         state
     }
 
     #[test]
     fn enter_opens_selected_hit_detail() {
         let mut state = load_state(vec![hit(1, "one", 1), hit(2, "two", 1)]);
-        state.table_state.select(Some(1));
+        state.list.table_state.select(Some(1));
 
-        state.open_detail();
+        state.list.open_detail();
 
-        assert_eq!(state.app.view, SearchView::Detail);
-        assert_eq!(state.app.detail.as_ref().unwrap().session_id, "s2");
+        assert_eq!(state.list.view, SearchView::Detail);
+        assert_eq!(state.list.detail.as_ref().unwrap().session_id, "s2");
     }
 
     #[test]
     fn new_state_selects_the_first_hit() {
         let state = load_state(vec![hit(1, "one", 1), hit(2, "two", 1)]);
-        assert_eq!(state.table_state.selected(), Some(0));
+        assert_eq!(state.list.table_state.selected(), Some(0));
     }
 
     #[test]
@@ -358,64 +248,64 @@ mod tests {
         // works before the user has ever pressed an arrow key.
         let mut state = load_state(vec![hit(1, "one", 1), hit(2, "two", 1)]);
 
-        state.open_detail();
+        state.list.open_detail();
 
-        assert_eq!(state.app.view, SearchView::Detail);
-        assert_eq!(state.app.detail.as_ref().unwrap().session_id, "s1");
+        assert_eq!(state.list.view, SearchView::Detail);
+        assert_eq!(state.list.detail.as_ref().unwrap().session_id, "s1");
     }
 
     #[test]
     fn enter_is_noop_without_selection() {
         let mut state = load_state(vec![hit(1, "one", 1)]);
-        state.table_state.select(None);
+        state.list.table_state.select(None);
 
-        state.open_detail();
+        state.list.open_detail();
 
-        assert_eq!(state.app.view, SearchView::List);
-        assert!(state.app.detail.is_none());
+        assert_eq!(state.list.view, SearchView::List);
+        assert!(state.list.detail.is_none());
     }
 
     #[test]
     fn enter_is_noop_with_empty_list() {
         let mut state = load_state(Vec::new());
-        state.table_state.select(Some(0));
+        state.list.table_state.select(Some(0));
 
-        state.open_detail();
+        state.list.open_detail();
 
-        assert_eq!(state.app.view, SearchView::List);
-        assert!(state.app.detail.is_none());
+        assert_eq!(state.list.view, SearchView::List);
+        assert!(state.list.detail.is_none());
     }
 
     #[test]
     fn esc_returns_to_list_preserving_selection() {
         let mut state = load_state(vec![hit(1, "one", 1), hit(2, "two", 1)]);
-        state.table_state.select(Some(1));
-        state.open_detail();
-        state.close_detail();
+        state.list.table_state.select(Some(1));
+        state.list.open_detail();
+        state.list.close_detail();
 
-        assert_eq!(state.app.view, SearchView::List);
-        assert!(state.app.detail.is_none());
-        assert_eq!(state.table_state.selected(), Some(1));
+        assert_eq!(state.list.view, SearchView::List);
+        assert!(state.list.detail.is_none());
+        assert_eq!(state.list.table_state.selected(), Some(1));
     }
 
     #[test]
     fn navigation_in_detail_does_not_change_selected_hit() {
         let mut state = load_state(vec![hit(1, "one", 1), hit(2, "two", 1)]);
-        state.table_state.select(Some(0));
-        state.open_detail();
+        state.list.table_state.select(Some(0));
+        state.list.open_detail();
 
-        state.select_next();
-        state.select_previous();
+        state.list.select_next();
+        state.list.select_previous();
 
-        assert_eq!(state.table_state.selected(), Some(0));
-        assert_eq!(state.app.detail.as_ref().unwrap().session_id, "s1");
+        assert_eq!(state.list.table_state.selected(), Some(0));
+        assert_eq!(state.list.detail.as_ref().unwrap().session_id, "s1");
     }
 
     #[test]
     fn refresh_preserves_surviving_detail_and_clamps_selection() {
         let mut state = load_state(vec![hit(1, "one", 1), hit(2, "two", 1), hit(3, "three", 1)]);
-        state.table_state.select(Some(1));
-        state.open_detail();
+        state.list.table_state.select(Some(1));
+        state.list.open_detail();
 
         state.apply_data(SearchData {
             hits: vec![hit(2, "two", 3), hit(1, "one", 1)],
@@ -426,60 +316,60 @@ mod tests {
             }],
         });
 
-        assert_eq!(state.app.view, SearchView::Detail);
-        assert_eq!(state.app.detail.as_ref().unwrap().matches, 3);
-        assert_eq!(state.table_state.selected(), Some(0));
-        assert_eq!(state.app.message_statuses[0].message_count, 2);
+        assert_eq!(state.list.view, SearchView::Detail);
+        assert_eq!(state.list.detail.as_ref().unwrap().matches, 3);
+        assert_eq!(state.list.table_state.selected(), Some(0));
+        assert_eq!(state.message_statuses[0].message_count, 2);
     }
 
     #[test]
     fn refresh_closes_detail_when_selected_hit_disappears() {
         let mut state = load_state(vec![hit(1, "one", 1), hit(2, "two", 1)]);
-        state.table_state.select(Some(1));
-        state.open_detail();
+        state.list.table_state.select(Some(1));
+        state.list.open_detail();
 
         state.apply_data(SearchData {
             hits: vec![hit(1, "one", 1)],
             message_statuses: Vec::new(),
         });
 
-        assert_eq!(state.app.view, SearchView::List);
-        assert!(state.app.detail.is_none());
+        assert_eq!(state.list.view, SearchView::List);
+        assert!(state.list.detail.is_none());
     }
 
     #[test]
     fn refresh_closes_detail_when_the_hit_body_changes() {
         let mut state = load_state(vec![hit(1, "one", 1), hit(2, "two", 1)]);
-        state.table_state.select(Some(1));
-        state.open_detail();
+        state.list.table_state.select(Some(1));
+        state.list.open_detail();
 
         state.apply_data(SearchData {
             hits: vec![hit(1, "one", 1), hit(2, "rewritten", 1)],
             message_statuses: Vec::new(),
         });
 
-        assert_eq!(state.app.view, SearchView::List);
-        assert!(state.app.detail.is_none());
+        assert_eq!(state.list.view, SearchView::List);
+        assert!(state.list.detail.is_none());
     }
 
     #[test]
     fn selection_clamps_when_the_list_shrinks() {
         let mut state = load_state(vec![hit(1, "one", 1), hit(2, "two", 1), hit(3, "three", 1)]);
-        state.table_state.select(Some(2));
+        state.list.table_state.select(Some(2));
 
         state.apply_data(SearchData {
             hits: vec![hit(1, "one", 1)],
             message_statuses: Vec::new(),
         });
 
-        assert_eq!(state.table_state.selected(), Some(0));
+        assert_eq!(state.list.table_state.selected(), Some(0));
     }
 
     #[test]
     fn refresh_resets_detail_scroll_to_the_top() {
         let mut state = load_state(vec![hit(1, "line\nline\nline\nline", 1)]);
-        state.table_state.select(Some(0));
-        state.open_detail();
+        state.list.table_state.select(Some(0));
+        state.list.open_detail();
         state.set_detail_width(40);
         state.set_viewport_height(2);
         state.scroll_bottom();
@@ -491,16 +381,16 @@ mod tests {
             message_statuses: Vec::new(),
         });
 
-        assert_eq!(state.app.view, SearchView::Detail);
+        assert_eq!(state.list.view, SearchView::Detail);
         assert_eq!(state.scroll, 0);
-        assert_eq!(state.app.detail.as_ref().unwrap().matches, 3);
+        assert_eq!(state.list.detail.as_ref().unwrap().matches, 3);
     }
 
     #[test]
     fn narrowing_the_detail_width_clamps_the_scroll() {
         let mut state = load_state(vec![hit(1, "one two three four five six seven eight", 1)]);
-        state.table_state.select(Some(0));
-        state.open_detail();
+        state.list.table_state.select(Some(0));
+        state.list.open_detail();
         state.set_detail_width(3);
         state.set_viewport_height(2);
         state.scroll_bottom();
@@ -516,9 +406,9 @@ mod tests {
     #[test]
     fn quit_is_idempotent() {
         let mut state = load_state(vec![hit(1, "one", 1)]);
-        state.quit();
-        state.quit();
-        assert!(!state.app.running);
+        state.list.quit();
+        state.list.quit();
+        assert!(!state.list.running);
     }
 
     #[test]
@@ -540,8 +430,8 @@ mod tests {
     #[test]
     fn wrap_text_reflows_when_the_width_changes() {
         let mut state = load_state(vec![hit(1, "the quick brown fox", 1)]);
-        state.table_state.select(Some(0));
-        state.open_detail();
+        state.list.table_state.select(Some(0));
+        state.list.open_detail();
         state.set_detail_width(4);
         assert!(state.detail_lines.len() > 1);
         state.set_detail_width(100);

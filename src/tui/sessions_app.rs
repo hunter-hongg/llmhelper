@@ -1,6 +1,6 @@
 use crate::domain::record::Record;
 use crate::source::SourceStatus;
-use ratatui::widgets::TableState;
+use crate::tui::list_detail::{ListDetail, ViewSwitcher};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum SessionsView {
@@ -9,24 +9,27 @@ pub enum SessionsView {
     Detail,
 }
 
+impl ViewSwitcher for SessionsView {
+    fn is_detail(&self) -> bool {
+        *self == Self::Detail
+    }
+    fn show_list(&mut self) {
+        *self = Self::List;
+    }
+    fn show_detail(&mut self) {
+        *self = Self::Detail;
+    }
+}
+
 #[derive(Default)]
 pub struct SessionsData {
     pub records: Vec<Record>,
     pub source_statuses: Vec<SourceStatus>,
 }
 
-#[derive(Default)]
-pub struct SessionsApp {
-    pub running: bool,
-    pub view: SessionsView,
-    pub records: Vec<Record>,
-    pub detail: Option<Record>,
-    pub source_statuses: Vec<SourceStatus>,
-}
-
 pub struct SessionsTuiState {
-    pub app: SessionsApp,
-    pub table_state: TableState,
+    pub list: ListDetail<Record, SessionsView>,
+    pub source_statuses: Vec<SourceStatus>,
 }
 
 impl Default for SessionsTuiState {
@@ -38,114 +41,19 @@ impl Default for SessionsTuiState {
 impl SessionsTuiState {
     pub fn new() -> Self {
         Self {
-            app: SessionsApp::default(),
-            table_state: TableState::default(),
+            list: ListDetail::new(),
+            source_statuses: Vec::new(),
         }
     }
-}
 
-impl SessionsTuiState {
-    const VISIBLE_ROWS: usize = 15;
-
+    /// Merge freshly loaded records into the state. A detail that survives the
+    /// refresh (same `(source, session_id)`) stays open; otherwise it closes,
+    /// matching the `search` refresh behaviour.
     pub fn apply_data(&mut self, data: SessionsData) {
-        let selected = self.table_state.selected();
-        let detail = self.app.detail.take();
-
-        self.app.records = data.records;
-        self.app.source_statuses = data.source_statuses;
-        self.sync_list_selection(selected);
-
-        if let Some(detail) = detail {
-            let Some(index) = self
-                .app
-                .records
-                .iter()
-                .position(|r| r.source == detail.source && r.session_id == detail.session_id)
-            else {
-                self.app.view = SessionsView::List;
-                self.app.detail = None;
-                return;
-            };
-            self.app.detail = Some(self.app.records[index].clone());
-            self.app.view = SessionsView::Detail;
-            self.table_state.select(Some(index));
-            Self::adjust_offset(&mut self.table_state, index);
-        }
-    }
-
-    pub fn open_detail(&mut self) {
-        if self.app.view != SessionsView::List {
-            return;
-        }
-        let Some(selected) = self.table_state.selected() else {
-            return;
-        };
-        let Some(record) = self.app.records.get(selected) else {
-            return;
-        };
-        self.app.detail = Some(record.clone());
-        self.app.view = SessionsView::Detail;
-    }
-
-    pub fn close_detail(&mut self) {
-        if self.app.view != SessionsView::Detail {
-            return;
-        }
-        self.app.view = SessionsView::List;
-        self.app.detail = None;
-    }
-
-    pub fn select_next(&mut self) {
-        if self.app.view != SessionsView::List {
-            return;
-        }
-        let count = self.app.records.len();
-        if count > 0 {
-            let i = match self.table_state.selected() {
-                Some(i) => std::cmp::min(i + 1, count - 1),
-                None => 0,
-            };
-            self.set_list_selection(i);
-        }
-    }
-    pub fn select_previous(&mut self) {
-        if self.app.view != SessionsView::List {
-            return;
-        }
-        let count = self.app.records.len();
-        if count > 0 {
-            let i = match self.table_state.selected() {
-                Some(i) => std::cmp::max(i.saturating_sub(1), 0),
-                None => 0,
-            };
-            self.set_list_selection(i);
-        }
-    }
-
-    fn set_list_selection(&mut self, selected: usize) {
-        self.table_state.select(Some(selected));
-        Self::adjust_offset(&mut self.table_state, selected);
-    }
-
-    fn adjust_offset(table_state: &mut TableState, selected: usize) {
-        let visible = Self::VISIBLE_ROWS;
-        let offset = table_state.offset();
-        if selected >= offset + visible {
-            *table_state.offset_mut() = selected - visible + 1;
-        } else if selected < offset {
-            *table_state.offset_mut() = selected;
-        }
-    }
-
-    fn sync_list_selection(&mut self, selected: Option<usize>) {
-        let count = self.app.records.len();
-        if count == 0 {
-            self.table_state.select(None);
-            *self.table_state.offset_mut() = 0;
-            return;
-        }
-        let selected = selected.unwrap_or(0).min(count - 1);
-        self.set_list_selection(selected);
+        self.source_statuses = data.source_statuses;
+        let _ = self.list.apply_items(data.records, |a, b| {
+            a.source == b.source && a.session_id == b.session_id
+        });
     }
 }
 
@@ -204,12 +112,12 @@ mod tests {
     #[test]
     fn enter_opens_selected_session_detail() {
         let mut state = load_state(vec![record("one", None), record("two", Some(1.0))]);
-        state.table_state.select(Some(1));
+        state.list.table_state.select(Some(1));
 
-        state.open_detail();
+        state.list.open_detail();
 
-        assert_eq!(state.app.view, SessionsView::Detail);
-        let detail = state.app.detail.as_ref().unwrap();
+        assert_eq!(state.list.view, SessionsView::Detail);
+        let detail = state.list.detail.as_ref().unwrap();
         assert_eq!(detail.session_id, "two");
         assert_eq!(detail.cost, Some(1.0));
     }
@@ -217,59 +125,59 @@ mod tests {
     #[test]
     fn enter_is_noop_without_selection() {
         let mut state = load_state(vec![record("one", None)]);
-        state.table_state.select(None);
+        state.list.table_state.select(None);
 
-        state.open_detail();
+        state.list.open_detail();
 
-        assert_eq!(state.app.view, SessionsView::List);
-        assert!(state.app.detail.is_none());
+        assert_eq!(state.list.view, SessionsView::List);
+        assert!(state.list.detail.is_none());
     }
 
     #[test]
     fn enter_is_noop_with_empty_list() {
         let mut state = load_state(Vec::new());
-        state.table_state.select(Some(0));
+        state.list.table_state.select(Some(0));
 
-        state.open_detail();
+        state.list.open_detail();
 
-        assert_eq!(state.app.view, SessionsView::List);
-        assert!(state.app.detail.is_none());
+        assert_eq!(state.list.view, SessionsView::List);
+        assert!(state.list.detail.is_none());
     }
 
     #[test]
     fn enter_in_detail_is_noop() {
         let mut state = load_state(vec![record("one", None), record("two", None)]);
-        state.table_state.select(Some(0));
-        state.open_detail();
+        state.list.table_state.select(Some(0));
+        state.list.open_detail();
 
-        state.open_detail();
+        state.list.open_detail();
 
-        assert_eq!(state.app.detail.as_ref().unwrap().session_id, "one");
+        assert_eq!(state.list.detail.as_ref().unwrap().session_id, "one");
     }
 
     #[test]
     fn esc_returns_to_list_preserving_selection() {
         let mut state = load_state(vec![record("one", None), record("two", None)]);
-        state.table_state.select(Some(1));
-        state.open_detail();
-        state.close_detail();
+        state.list.table_state.select(Some(1));
+        state.list.open_detail();
+        state.list.close_detail();
 
-        assert_eq!(state.app.view, SessionsView::List);
-        assert!(state.app.detail.is_none());
-        assert_eq!(state.table_state.selected(), Some(1));
+        assert_eq!(state.list.view, SessionsView::List);
+        assert!(state.list.detail.is_none());
+        assert_eq!(state.list.table_state.selected(), Some(1));
     }
 
     #[test]
     fn navigation_in_detail_does_not_change_selected_session() {
         let mut state = load_state(vec![record("one", None), record("two", None)]);
-        state.table_state.select(Some(0));
-        state.open_detail();
+        state.list.table_state.select(Some(0));
+        state.list.open_detail();
 
-        state.select_next();
-        state.select_previous();
+        state.list.select_next();
+        state.list.select_previous();
 
-        assert_eq!(state.table_state.selected(), Some(0));
-        assert_eq!(state.app.detail.as_ref().unwrap().session_id, "one");
+        assert_eq!(state.list.table_state.selected(), Some(0));
+        assert_eq!(state.list.detail.as_ref().unwrap().session_id, "one");
     }
 
     #[test]
@@ -279,8 +187,8 @@ mod tests {
             record("two", None),
             record("three", None),
         ]);
-        state.table_state.select(Some(1));
-        state.open_detail();
+        state.list.table_state.select(Some(1));
+        state.list.open_detail();
 
         let mut replacement = record("two", None);
         replacement.cost = Some(2.0);
@@ -293,32 +201,32 @@ mod tests {
             }],
         });
 
-        assert_eq!(state.app.view, SessionsView::Detail);
-        assert_eq!(state.app.detail.as_ref().unwrap().cost, Some(2.0));
-        assert_eq!(state.table_state.selected(), Some(0));
-        assert_eq!(state.app.source_statuses[0].record_count, 2);
+        assert_eq!(state.list.view, SessionsView::Detail);
+        assert_eq!(state.list.detail.as_ref().unwrap().cost, Some(2.0));
+        assert_eq!(state.list.table_state.selected(), Some(0));
+        assert_eq!(state.source_statuses[0].record_count, 2);
     }
 
     #[test]
     fn refresh_closes_detail_when_selected_session_disappears() {
         let mut state = load_state(vec![record("one", None), record("two", None)]);
-        state.table_state.select(Some(1));
-        state.open_detail();
+        state.list.table_state.select(Some(1));
+        state.list.open_detail();
 
         state.apply_data(SessionsData {
             records: vec![record("one", None)],
             source_statuses: Vec::new(),
         });
 
-        assert_eq!(state.app.view, SessionsView::List);
-        assert!(state.app.detail.is_none());
+        assert_eq!(state.list.view, SessionsView::List);
+        assert!(state.list.detail.is_none());
     }
 
     #[test]
     fn refresh_closes_detail_when_source_changes_for_same_session_id() {
         let mut state = load_state(vec![record("one", None), record("two", None)]);
-        state.table_state.select(Some(1));
-        state.open_detail();
+        state.list.table_state.select(Some(1));
+        state.list.open_detail();
 
         let mut replacement = record("two", None);
         replacement.source = "opencode".to_string();
@@ -327,7 +235,7 @@ mod tests {
             source_statuses: Vec::new(),
         });
 
-        assert_eq!(state.app.view, SessionsView::List);
-        assert!(state.app.detail.is_none());
+        assert_eq!(state.list.view, SessionsView::List);
+        assert!(state.list.detail.is_none());
     }
 }

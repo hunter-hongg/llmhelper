@@ -605,10 +605,10 @@ fn run_sessions_tui(registry: Registry, filter: Filter, refresh_secs: u64) -> an
         }
     });
     let mut tui = SessionsTuiApp::new()?;
-    tui.state.app.running = true;
+    tui.state.list.running = true;
     let data = load_sessions_data(&reg_arc, &filter);
     tui.state.apply_data(data);
-    while tui.state.app.running {
+    while tui.state.list.running {
         if let Ok(data) = rx.try_recv() {
             tui.state.apply_data(data);
         }
@@ -619,27 +619,27 @@ fn run_sessions_tui(registry: Registry, filter: Filter, refresh_secs: u64) -> an
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 match key.code {
                     crossterm::event::KeyCode::Char('q') => {
-                        tui.state.app.running = false;
+                        tui.state.list.running = false;
                     }
                     crossterm::event::KeyCode::Esc => {
-                        if tui.state.app.view == SessionsView::Detail {
-                            tui.state.close_detail();
+                        if tui.state.list.view == SessionsView::Detail {
+                            tui.state.list.close_detail();
                         } else {
-                            tui.state.app.running = false;
+                            tui.state.list.running = false;
                         }
                     }
                     crossterm::event::KeyCode::Enter => {
-                        tui.state.open_detail();
+                        tui.state.list.open_detail();
                     }
                     crossterm::event::KeyCode::Char('r') => {
                         let data = load_sessions_data(&reg_arc, &filter);
                         tui.state.apply_data(data);
                     }
                     crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                        tui.state.select_next();
+                        tui.state.list.select_next();
                     }
                     crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                        tui.state.select_previous();
+                        tui.state.list.select_previous();
                     }
                     _ => {}
                 }
@@ -870,38 +870,38 @@ fn run_search_tui(
         filter_summary,
         load(&registry),
     )?;
-    tui.state.app.running = true;
+    tui.state.list.running = true;
     let reg_arc = Arc::new(registry);
-    while tui.state.app.running {
+    while tui.state.list.running {
         tui.terminal.draw(|frame| {
             llmhelper::tui::search_render::render(frame, &mut tui.state);
         })?;
         if crossterm::event::poll(std::time::Duration::from_millis(200))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 match key.code {
-                    crossterm::event::KeyCode::Char('q') => tui.state.quit(),
+                    crossterm::event::KeyCode::Char('q') => tui.state.list.quit(),
                     crossterm::event::KeyCode::Esc => {
-                        if tui.state.app.view == llmhelper::tui::search_app::SearchView::Detail {
-                            tui.state.close_detail();
+                        if tui.state.list.view == llmhelper::tui::search_app::SearchView::Detail {
+                            tui.state.list.close_detail();
                         } else {
-                            tui.state.quit();
+                            tui.state.list.quit();
                         }
                     }
-                    crossterm::event::KeyCode::Enter => tui.state.open_detail(),
+                    crossterm::event::KeyCode::Enter => tui.state.list.open_detail(),
                     crossterm::event::KeyCode::Char('r') => {
                         tui.state.apply_data(load(&reg_arc));
                     }
                     crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                        tui.state.select_next();
+                        tui.state.list.select_next();
                     }
                     crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                        tui.state.select_previous();
+                        tui.state.list.select_previous();
                     }
                     crossterm::event::KeyCode::Home | crossterm::event::KeyCode::Char('g') => {
-                        tui.state.select_first();
+                        tui.state.list.select_first();
                     }
                     crossterm::event::KeyCode::End | crossterm::event::KeyCode::Char('G') => {
-                        tui.state.select_last();
+                        tui.state.list.select_last();
                     }
                     crossterm::event::KeyCode::PageDown => tui.state.page_down(),
                     crossterm::event::KeyCode::PageUp => tui.state.page_up(),
