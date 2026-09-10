@@ -29,7 +29,8 @@ pub fn is_truncation_note(line: &str) -> bool {
 }
 
 fn cost_cell(cost: Option<f64>) -> String {
-    cost.map(|c| format!("{:.6}", c)).unwrap_or_else(|| "—".to_string())
+    cost.map(|c| format!("{:.6}", c))
+        .unwrap_or_else(|| "—".to_string())
 }
 
 /// Render the complete Markdown report as a string. Pure: no I/O.
@@ -202,13 +203,13 @@ mod tests {
     }
 
     fn agg_with(groups: Vec<Group>) -> AggregateResult {
-        let grand_totals = groups
-            .iter()
-            .map(|g| g.tokens.clone())
-            .fold(TokenBreakdown::default(), |mut acc, t| {
+        let grand_totals = groups.iter().map(|g| g.tokens.clone()).fold(
+            TokenBreakdown::default(),
+            |mut acc, t| {
                 acc.add(&t);
                 acc
-            });
+            },
+        );
         AggregateResult {
             grand_totals,
             grand_messages: groups.iter().map(|g| g.messages).sum(),
@@ -339,10 +340,7 @@ mod tests {
     fn unavailable_cost_renders_em_dash_not_zero() {
         let agg = agg_with(vec![group("claude", "claude", 100, None)]);
         let report = render_report(&agg, &meta(), &[], None);
-        let row = report
-            .lines()
-            .find(|l| l.starts_with("| claude "))
-            .unwrap();
+        let row = report.lines().find(|l| l.starts_with("| claude ")).unwrap();
         assert!(row.ends_with("| — |"));
         assert!(!row.contains("| 0.000000 |"));
     }

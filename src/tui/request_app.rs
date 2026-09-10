@@ -33,13 +33,14 @@ pub struct RequestTuiState {
 
 impl RequestTuiState {
     pub fn new(meta: RequestMeta, body: &str) -> Self {
-        let body_lines: Vec<String> = if body.trim().is_empty() && !matches!(meta.stream_state, StreamState::Live) {
-            vec!["(empty response)".to_string()]
-        } else if body.trim().is_empty() && matches!(meta.stream_state, StreamState::Live) {
-            vec!["".to_string()]
-        } else {
-            body.lines().map(str::to_string).collect()
-        };
+        let body_lines: Vec<String> =
+            if body.trim().is_empty() && !matches!(meta.stream_state, StreamState::Live) {
+                vec!["(empty response)".to_string()]
+            } else if body.trim().is_empty() && matches!(meta.stream_state, StreamState::Live) {
+                vec!["".to_string()]
+            } else {
+                body.lines().map(str::to_string).collect()
+            };
         Self {
             running: false,
             body_lines,
@@ -103,8 +104,7 @@ mod tests {
             usage_tokens: Some(30),
             stream_state: StreamState::Off,
         };
-        let mut state =
-            RequestTuiState::new(meta, &"x\n".repeat(body_lines));
+        let mut state = RequestTuiState::new(meta, &"x\n".repeat(body_lines));
         state.set_viewport_height(viewport);
         state
     }

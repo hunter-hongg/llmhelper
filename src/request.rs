@@ -1,4 +1,4 @@
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -65,7 +65,10 @@ pub fn build_payload(
         payload.insert("stream".to_string(), serde_json::Value::Bool(true));
         let mut stream_options = serde_json::Map::new();
         stream_options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
-        payload.insert("stream_options".to_string(), serde_json::Value::Object(stream_options));
+        payload.insert(
+            "stream_options".to_string(),
+            serde_json::Value::Object(stream_options),
+        );
     }
     serde_json::Value::Object(payload)
 }
@@ -103,7 +106,9 @@ impl RequestSettings {
             .model
             .clone()
             .or_else(|| config.request_default_model.clone())
-            .ok_or_else(|| anyhow::anyhow!("model is required (via --model or config [request] default_model)"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("model is required (via --model or config [request] default_model)")
+            })?;
         let timeout = Duration::from_secs(
             config
                 .request_timeout_seconds
@@ -140,10 +145,7 @@ pub async fn send_chat_completion(
         .await
         .context("failed to send request to OpenAI-compatible endpoint")?;
     let status_code = resp.status().as_u16();
-    let body = resp
-        .text()
-        .await
-        .context("failed to read response body")?;
+    let body = resp.text().await.context("failed to read response body")?;
     if !(200..300).contains(&status_code) {
         bail!(
             "HTTP {}: {}",
@@ -185,11 +187,18 @@ where
     if let Some(key) = &settings.api_key {
         req = req.header("Authorization", format!("Bearer {}", key));
     }
-    let resp = req.send().await.context("failed to send request to OpenAI-compatible endpoint")?;
+    let resp = req
+        .send()
+        .await
+        .context("failed to send request to OpenAI-compatible endpoint")?;
     let status_code = resp.status().as_u16();
     if !(200..300).contains(&status_code) {
         let body = resp.text().await.unwrap_or_default();
-        bail!("HTTP {}: {}", status_code, body.chars().take(500).collect::<String>());
+        bail!(
+            "HTTP {}: {}",
+            status_code,
+            body.chars().take(500).collect::<String>()
+        );
     }
     let mut stream = resp.bytes_stream();
     let mut parser = SseParser::new();
@@ -376,7 +385,10 @@ mod tests {
     fn build_payload_includes_model_and_messages() {
         let payload = build_payload("gpt-4", &[user_msg("Hello")], None, None, None, &[], false);
         assert_eq!(payload["model"].as_str().unwrap(), "gpt-4");
-        assert_eq!(payload["messages"], json!([{"role": "user", "content": "Hello"}]));
+        assert_eq!(
+            payload["messages"],
+            json!([{"role": "user", "content": "Hello"}])
+        );
     }
 
     #[test]
@@ -434,7 +446,9 @@ mod tests {
         let resp = parse_response(200, raw);
         assert_eq!(resp.status, 200);
         assert_eq!(
-            resp.usage.as_ref().unwrap()["total_tokens"].as_u64().unwrap(),
+            resp.usage.as_ref().unwrap()["total_tokens"]
+                .as_u64()
+                .unwrap(),
             30
         );
         assert_eq!(resp.assistant_content, Some("Hello back".to_string()));
@@ -610,7 +624,9 @@ mod tests {
     fn build_payload_includes_stream_fields_when_streaming() {
         let payload = build_payload("m", &[], None, None, None, &[], true);
         assert!(payload["stream"].as_bool().unwrap());
-        assert!(payload["stream_options"]["include_usage"].as_bool().unwrap());
+        assert!(payload["stream_options"]["include_usage"]
+            .as_bool()
+            .unwrap());
     }
 
     #[test]

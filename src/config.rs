@@ -75,7 +75,10 @@ impl Config {
                 .unwrap_or(5),
             request_base_url: parsed.request.as_ref().and_then(|r| r.base_url.clone()),
             request_api_key: parsed.request.as_ref().and_then(|r| r.api_key.clone()),
-            request_default_model: parsed.request.as_ref().and_then(|r| r.default_model.clone()),
+            request_default_model: parsed
+                .request
+                .as_ref()
+                .and_then(|r| r.default_model.clone()),
             request_timeout_seconds: parsed.request.as_ref().and_then(|r| r.timeout_seconds),
         }
     }

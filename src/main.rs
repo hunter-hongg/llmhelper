@@ -1149,7 +1149,9 @@ fn run_request(args: RequestArgs) -> anyhow::Result<()> {
 
     let messages = request_messages(&args)?;
     if messages.is_empty() {
-        anyhow::bail!("provide a prompt via --prompt or --messages (TUI input is not supported yet)");
+        anyhow::bail!(
+            "provide a prompt via --prompt or --messages (TUI input is not supported yet)"
+        );
     }
 
     let payload = llmhelper::request::build_payload(
@@ -1176,8 +1178,7 @@ fn run_request(args: RequestArgs) -> anyhow::Result<()> {
     } else {
         let start = std::time::Instant::now();
         let response = match rt.block_on(llmhelper::request::send_chat_completion(
-            &settings,
-            &payload,
+            &settings, &payload,
         )) {
             Ok(resp) => resp,
             Err(e) => {
@@ -1221,7 +1222,10 @@ fn run_request(args: RequestArgs) -> anyhow::Result<()> {
     }
 }
 
-async fn run_request_stream_json(settings: &llmhelper::request::RequestSettings, payload: &serde_json::Value) -> anyhow::Result<()> {
+async fn run_request_stream_json(
+    settings: &llmhelper::request::RequestSettings,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
     let mut first = true;
     let _ = llmhelper::request::send_chat_completion_stream(settings, payload, |event| {
         if first {
@@ -1234,7 +1238,10 @@ async fn run_request_stream_json(settings: &llmhelper::request::RequestSettings,
     Ok(())
 }
 
-async fn run_request_stream_text(settings: &llmhelper::request::RequestSettings, payload: &serde_json::Value) -> anyhow::Result<()> {
+async fn run_request_stream_text(
+    settings: &llmhelper::request::RequestSettings,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
     let mut content = String::new();
     let _res = llmhelper::request::send_chat_completion_stream(settings, payload, |event| {
         if let Some(delta) = llmhelper::request::extract_delta_content(&event) {
@@ -1252,7 +1259,11 @@ async fn run_request_stream_text(settings: &llmhelper::request::RequestSettings,
     Ok(())
 }
 
-fn run_request_stream_tui(settings: &llmhelper::request::RequestSettings, payload: &serde_json::Value, rt: Runtime) -> anyhow::Result<()> {
+fn run_request_stream_tui(
+    settings: &llmhelper::request::RequestSettings,
+    payload: &serde_json::Value,
+    rt: Runtime,
+) -> anyhow::Result<()> {
     let host = extract_host(&settings.base_url);
     let meta = RequestMeta {
         model: settings.model.clone(),
@@ -1265,9 +1276,13 @@ fn run_request_stream_tui(settings: &llmhelper::request::RequestSettings, payloa
     let settings_clone = settings.clone();
     let payload_clone = payload.clone();
     rt.spawn(async move {
-        let _ = llmhelper::request::send_chat_completion_stream(&settings_clone, &payload_clone, |event| {
-            let _ = tx.try_send(event);
-        })
+        let _ = llmhelper::request::send_chat_completion_stream(
+            &settings_clone,
+            &payload_clone,
+            |event| {
+                let _ = tx.try_send(event);
+            },
+        )
         .await;
     });
     let mut tui = RequestTuiApp::new(meta, "")?;
@@ -1282,7 +1297,12 @@ fn run_request_stream_tui(settings: &llmhelper::request::RequestSettings, payloa
                 if let Some(l) = tui.state.body_lines.last_mut() {
                     l.push_str(&delta);
                 }
-                if tui.state.body_lines.last().is_some_and(|l| l.ends_with('\n')) {
+                if tui
+                    .state
+                    .body_lines
+                    .last()
+                    .is_some_and(|l| l.ends_with('\n'))
+                {
                     tui.state.body_lines.push(String::new());
                 }
             }
@@ -1292,7 +1312,10 @@ fn run_request_stream_tui(settings: &llmhelper::request::RequestSettings, payloa
                 }
             }
             if tui.state.follow {
-                let max_scroll = tui.state.content_length().saturating_sub(tui.state.viewport_height());
+                let max_scroll = tui
+                    .state
+                    .content_length()
+                    .saturating_sub(tui.state.viewport_height());
                 tui.state.set_scroll(max_scroll);
             }
         }

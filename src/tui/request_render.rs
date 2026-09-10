@@ -13,10 +13,7 @@ use ratatui::{
 
 pub fn render(frame: &mut Frame, state: &mut RequestTuiState) {
     let area = frame.area();
-    frame.render_widget(
-        Paragraph::new("").style(Style::default().bg(BG)),
-        area,
-    );
+    frame.render_widget(Paragraph::new("").style(Style::default().bg(BG)), area);
     let chunks = Layout::default()
         .constraints([
             Constraint::Length(3),
@@ -40,13 +37,13 @@ fn render_header(state: &RequestTuiState) -> Paragraph<'_> {
 fn header_line(state: &RequestTuiState) -> Line<'static> {
     let meta = &state.meta;
     let mut spans = vec![
-        Span::styled("llmhelper", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "llmhelper",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  request"),
         Span::raw("  "),
-        Span::styled(
-            format!("model: {}", meta.model),
-            Style::default().fg(TITLE),
-        ),
+        Span::styled(format!("model: {}", meta.model), Style::default().fg(TITLE)),
         Span::raw("  "),
         Span::styled(
             format!("endpoint: {}", meta.host),
@@ -79,7 +76,9 @@ fn header_line(state: &RequestTuiState) -> Line<'static> {
 
 /// Token count for the header, dimmed dash when the provider omitted usage.
 fn usage_text(usage_tokens: Option<u64>) -> String {
-    usage_tokens.map(format_tokens).unwrap_or_else(|| "—".to_string())
+    usage_tokens
+        .map(format_tokens)
+        .unwrap_or_else(|| "—".to_string())
 }
 
 fn render_body(state: &RequestTuiState) -> Paragraph<'static> {

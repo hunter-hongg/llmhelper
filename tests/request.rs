@@ -13,7 +13,10 @@ fn bin() -> PathBuf {
 /// Start a one-shot HTTP server on an ephemeral port. Returns the address
 /// plus a handle to join after the client request completes, so the test can
 /// assert on the request the server actually received.
-fn start_server(status: &str, body: &str) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
+fn start_server(
+    status: &str,
+    body: &str,
+) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let status = status.to_string();
@@ -84,7 +87,8 @@ const OK_BODY: &str = r#"{"id":"chatcmpl-test","model":"gpt-4","choices":[{"inde
 /// SPA fallback served for any path other than `/v1/chat/completions`,
 /// mirroring the real OpenAI-compatible frontend behaviour that made a
 /// wrong endpoint path surface as 200 + HTML instead of a JSON body.
-const HTML_FALLBACK_BODY: &str = "<!doctype html>\n<html lang=\"en\"><body>frontend</body></html>\n";
+const HTML_FALLBACK_BODY: &str =
+    "<!doctype html>\n<html lang=\"en\"><body>frontend</body></html>\n";
 
 fn base_args(addr: &std::net::SocketAddr) -> Vec<String> {
     vec![
@@ -299,7 +303,10 @@ timeout_seconds = 5
 "#,
     )
     .unwrap();
-    let (addr, handle) = start_server("200 OK", r#"{"choices":[{"message":{"content":"from config"}}]}"#);
+    let (addr, handle) = start_server(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"from config"}}]}"#,
+    );
     let output = Command::new(bin())
         .env("XDG_CONFIG_HOME", cfg_dir.path())
         .args([
