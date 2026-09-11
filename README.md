@@ -54,7 +54,31 @@ llmhelper request --base-url https://api.example.com --api-key $KEY --model gpt-
 llmhelper request --base-url https://api.example.com --model gpt-4 --prompt "Hi" --text
 ```
 
-Flags: `--base-url` (required unless in config), `--api-key` (env `LLMHELPER_API_KEY` fallback), `--model` (required), `--messages <path>` (JSON array of `{role, content}`), `--prompt <string>` (single user turn), `--json` prints full response, `--text` prints only assistant message content, `--temperature`, `--top-p`, `--max-tokens`, `--stop` (repeatable). Configuration via `[request]` section in `~/.config/llmhelper/config.toml`.
+With `--stream` the response is consumed as SSE and deltas appear as they arrive instead of blocking until the full response. All three output modes have a streaming form:
+```bash
+# Streaming TUI (default) — header shows `stream: live`, then `stream: done`
+llmhelper request --base-url https://api.example.com --model gpt-4 --prompt "Explain TCP" --stream
+
+# Incremental text — each delta is printed and flushed as it arrives, pipable
+llmhelper request --base-url https://api.example.com --model gpt-4 --prompt "Explain TCP" --text --stream
+
+# NDJSON — one JSON object per SSE event, pipeable into other tools
+llmhelper request --base-url https://api.example.com --model gpt-4 --messages messages.json --json --stream
+```
+
+With `--stream` the payload carries `stream: true` and `stream_options.include_usage`, so providers following the OpenAI schema report token counts in a stream chunk. Without `--stream` the one-shot payload carries neither key. A provider that rejects unknown request fields surfaces that as an HTTP error with the provider's body snippet; there is no way to detect it proactively.
+
+Flags: `--base-url` (required unless in config), `--api-key` (env `LLMHELPER_API_KEY` fallback), `--model` (required), `--messages <path>` (JSON array of `{role, content}`), `--prompt <string>` (single user turn), `--json` prints full response, `--text` prints only assistant message content, `--stream` streams the response as SSE, `--temperature`, `--top-p`, `--max-tokens`, `--stop` (repeatable). Configuration via `[request]` section in `~/.config/llmhelper/config.toml`.
+
+### search
+Full-text search across agent session message text.
+```bash
+llmhelper search "cache invalidation"
+llmhelper search --last 7d --source omp --role assistant "refactor"
+```
+Without `--json`/`--csv`/`--text`, `search` opens an interactive TUI: select a hit and press `Enter` for the message detail, `Esc` to return, `↑↓`/`j k` to move, `g`/`G` for top/bottom, `r` to rerun, `q` to quit. The header shows the query plus any non-default active filters.
+
+Flags: `--source`, `--project`, `--model`, `--role`, `--since`/`--last`, `--context` (snippet context, default 80), `--limit` (default 100), `--case-sensitive`, `--json`/`--csv`/`--text`. Messages without a timestamp never match a time filter. Tool output and image/patch blocks are excluded from the searchable corpus.
 
 ## Sources
 
@@ -73,4 +97,4 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 ## Specs
-See `docs/specs/` for usage, diff, sessions and report specifications. Architecture notes in `docs/adr/`.
+See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream and search specifications. Architecture notes in `docs/adr/`.

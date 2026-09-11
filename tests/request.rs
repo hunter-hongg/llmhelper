@@ -369,3 +369,83 @@ fn request_stream_text_prints_deltas() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "hello\n");
     let _req = handle.join().unwrap();
 }
+
+const STREAM_BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\ndata: [DONE]\n\n";
+
+#[test]
+fn request_stream_json_emits_one_line_per_event() {
+    let (addr, handle) = start_server("200 OK", STREAM_BODY);
+    let mut args = base_args(&addr);
+    args.push("--json".into());
+    args.push("--stream".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    let output = run_with_args(&args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "stdout was:\n{}", stdout);
+    let events: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("valid JSON line"))
+        .collect();
+    assert_eq!(
+        events[0]["choices"][0]["delta"]["content"].as_str(),
+        Some("he")
+    );
+    assert_eq!(
+        events[1]["choices"][0]["delta"]["content"].as_str(),
+        Some("llo")
+    );
+    assert!(events[0].get("usage").is_none());
+    assert!(events[2].get("choices").is_none());
+    let usage = &events[2]["usage"];
+    assert_eq!(usage["prompt_tokens"].as_u64(), Some(4));
+    assert_eq!(usage["completion_tokens"].as_u64(), Some(2));
+    assert_eq!(usage["total_tokens"].as_u64(), Some(6));
+    let _req = handle.join().unwrap();
+}
+
+#[test]
+fn request_stream_payload_carries_stream_fields() {
+    let (addr, handle) = start_server("200 OK", STREAM_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--stream".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    let output = run_with_args(&args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let received = body_of(&handle.join().unwrap());
+    assert_eq!(received["stream"].as_bool(), Some(true));
+    assert_eq!(
+        received["stream_options"]["include_usage"].as_bool(),
+        Some(true)
+    );
+}
+
+#[test]
+fn request_one_shot_payload_omits_stream_fields() {
+    let (addr, handle) = start_server("200 OK", OK_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    let output = run_with_args(&args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let received = body_of(&handle.join().unwrap());
+    assert!(received.get("stream").is_none());
+    assert!(received.get("stream_options").is_none());
+}

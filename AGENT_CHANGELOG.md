@@ -2,6 +2,7 @@
 
 ## 2026-08-30
 
+
 - 从零实现 `llmhelper` Rust CLI：`usage` 子命令读取 Claude Code (JSONL) 和 OpenCode (SQLite) 的本地使用数据，ratatui TUI 展示 + `--json`/`--csv` 输出，支持 `--group-by`/`--last`/`--source` 等过滤，36 个测试全通过
 - `usage` 新增 OMP 数据源：读取 `~/.omp/agent/sessions/` 下每项目的会话 JSONL（`type=="message"` 的 assistant 消息 `usage` 块，camelCase 字段 + `cost.total`），项目路径优先取 session 行 `cwd`，目录名按 home 相对路径解码（`-projects-x` → `~/projects/x`）；模型记为 `provider/model`（如 `freellm/auto`）；新增 `--omp-dir` 参数与 `[source.omp] dir` 配置
 - TUI token 单位按数量级显示：低于 1K 显示原始值，之后 K/M/B（十进制），整数去掉小数（如 `35.8M`、`318.7K`、`2B`）
@@ -11,11 +12,13 @@
 
 ## 2026-08-31
 
+
 - 统计数据合并：将 Reasoning 合并进 Output。`TokenBreakdown` 移除 `reasoning` 字段；三个 Source adapter（Claude / OpenCode / OMP）在加载时把 reasoning tokens 直接累加进 `output`。TUI 表格、CSV、JSON 输出同步去掉 Reasoning 列/字段。更新 `CONTEXT.md`、`docs/specs/0001-usage.md` 与集成测试断言。
 
 - 会话总结：本次会话把统计数据的 Reasoning 合并进 Output——移除 `TokenBreakdown.reasoning`、在三处 Source adapter 加载时把 reasoning tokens 累加进 `output`，并同步去掉 TUI/CSV/JSON 的 Reasoning 列。已更新 CONTEXT.md、spec 与测试，30 个测试全通过。
 
 ## 2026-09-03
+
 
 - `diff` 子命令完整实现：`llmhelper diff --last <duration> --prev <duration>` 比较两个滑动窗口（[now-prev-last, now-last] vs [now-last, now]）的 token 用量，复用 Source registry / Filter / AggregateResult 管线；新增 `Filter.until` 字段与 `within()` 构造函数、独立 `src/diff.rs` 模块（`compute_diff` + `DiffRow`/`Snapshot`/`Delta` 类型）、终端表格/JSON/CSV 三套渲染器；spec 写入 `docs/specs/0002-diff.md`；CLI 新增 `DiffArgs`，共享 `parse_duration` 并支持 `Ns` 秒级后缀
 - 修复 12 个失败的 diff 集成测试：`parse_duration` 增加 `s` 后缀支持；fixture 时间戳改用 `Utc::now()` 相对计算消除 wall-clock 抖动；隔离 OMP/OpenCode 测试目录防止真实用户数据混入（默认路径回退问题）；`parse_last` 错误包装恢复 "invalid --last" 前缀
@@ -34,6 +37,7 @@
 
 ## 2026-09-05
 
+
 - `diff` TUI 审查修复全部落地：1) Duration 精度损失 → `to_chrono()` 改用 `milliseconds()`，`DiffTuiData` 新增 `loaded_at` 字段记录加载时刻，`apply_window_data()` 用该时刻刷新 header 窗口边界；2) 补齐 spec 要求的 `messages Δ` 与 `cost Δ` 列（`ColKind::Messages` / `ColKind::Cost` + `fmt_delta_msgs()` / `fmt_cost()` + 颜色语义绿正/红负/灰n/a）；3) 消除 `run_diff_tui` 中 Divergent Change — 三处"加载+刷新"重复逻辑收敛为 `apply_window_data()` 单点调用；4) `docs/specs/0002-diff.md` 更新 Output formats（两级表头 + 13 列）、Architectural decisions（TUI + 后台刷新 + 滑动窗口）、Out of Scope（移除 "Live / interactive diff"）三节以反映实际实现；5) 修正 header 时间戳漂移 bug — 使用 `loaded_at` 而非当前时间刷新窗口边界。`cargo test` 67 全通过（35+32），`cargo clippy` 无 error，PTY 130/80 列实测通过，13 列全部可见且无截断。
 
 - 实现 `sessions` 子命令：按 spec `0003-sessions.md` 新增 `llmhelper sessions`，支持 `--last/--since/project/model/source` 过滤、默认按 `started_at` 降序、`--limit/--offset` 分页、`--detail <id>` 详情、`--json/--csv/--table` 输出，复用 Source registry/Filter/Record 管线，token 单位 K/M/B，cost 仅源存在时显示，源错误降级打印；抽出 `format_tokens` 为 `output::format_tokens` 消除重复；新增 6 个集成测试验证总数量、过滤、分页、详情、排序。`cargo test` 40/40 lib + 40/40 integration 全通过。
@@ -48,6 +52,7 @@
 
 ## 2026-09-06
 
+
 - 实现 `report` 子命令：按 spec `docs/specs/0005-report.md` 与 `.scratch/report/issues/` 两张 ticket，新增 `llmhelper report`——复用 Source registry / Filter / AggregateResult 管线，一次性输出可共享的 Markdown 汇总：头信息（生成时间、窗口、过滤器回显）、Totals 总览表、Cost by source（仅源内求和、按字母序、claude 无 cost 不出现、绝无跨源总计）、Usage by <dimension> 分组表（按 input tokens 降序、`--top n` 截断并折叠 `(+ k more — hidden input)` 行）、Sources 附件（records + 错误状态）。`ReportMeta` + `render_report` 为纯函数（`md_cell` 转义 `|`/换行），`ReportArgs` 校验 `--since/--last` 互斥与 `--top >= 1`；`main.rs` 新增 `run_report`/`report_meta`/`build_filter_report`/`report_args_to_usage_args`。新增 12 个渲染单元测试（头信息、totals、per-source cost、排序、截断折叠、`—` 成本、空结果、源错误、转义）+ 8 个集成测试（Markdown 结构、回显、all-time、--top 折叠、cost 排除 claude、互斥报错、--top 0 报错、group-by model 标题、cost 表确定性排序）。审查修复：cost 表按字母序保证确定性输出、spec 同步 `ReportMeta.group_by` 字段与纯函数签名。`cargo test` 70 lib + 49 integration 全通过，`cargo clippy --all-targets -- -D warnings` 通过。commit `f623eb1`。
 
 - 会话收尾：提交 `.gitignore` 忽略 `.codewhale/`（`chore: ignore .codewhale/` → `fada7c6`）；新增项目 README.md，覆盖 `usage / diff / sessions / report` 四条子命令的用法示例、Source 清单、构建与测试入口（`docs: add README...` → `97d0152`）。
@@ -60,8 +65,12 @@
 
 ## 2026-09-08
 
+
 - 为 `request` 子命令加入 SSE 流式支持：新增 `--stream` 标志，payload 增加 `stream: true` 与 `stream_options.include_usage`，实现纯 SSE 解析器 `SseParser` 及 `extract_delta_content`/`extract_stream_usage` 工具函数；新增 `send_chat_completion_stream`，支持回调逐事件处理。CLI 增加 `--stream` 模式，`--text --stream` 实时打印增量，`--json --stream` 以 NDJSON 输出原始事件；TUI 流式查看器实时渲染文本，header 显示 `stream: live/done`、`time` 实时递增、token 使用更新，并实现 auto-follow 尾部、滚动上下切换 follow 行为。新增 SSE 解析单元测试 7 项、构建 payload 流式字段测试、流式状态单元测试；`cargo test` 133 lib + 52 integration + 9 request 全通过。Spec 写入 `docs/specs/0009-request-stream.md`。commit `a300252`.
 
+## 2026-09-09
+
+- 修复 `request` 端点路径 bug：`send_chat_completion` 与 `send_chat_completion_stream` 此前 POST 到 `{base}/chat/completions`，网关（如 freellmapi）对该路径返回 200 + SPA HTML 前端页而非 JSON，导致 `serde_json::from_str` 统一报 "failed to parse response JSON"（与 prompt 内容/语言无关）。两处端点统一改为 `{base}/v1/chat/completions`。集成测试夹具升级为按请求路径路由：非 `/v1/chat/completions` 返回 `text/html` 兜底页（复刻真实网关行为，此前夹具对任意路径回 JSON 掩盖了该 bug），新增请求行路径断言回归测试与 `--stream --text` 集成测试，`tests/request.rs` 9 → 11 全通过。同步修正 `docs/specs/0008-request.md` 的端点路径。注：此修复曾在 2026-09-08 会话中做过但仅存在于未提交工作区、未进任何 commit 而丢失，本次重新应用。HTTP 401（Invalid API key）为服务端凭据问题，curl 直连 `/v1/chat/completions` 可复现，与本次解析 bug 无关。
 ## 2026-09-10
 
 - 实现 `search` 子命令（全文检索 agent 会话消息原文）：按 spec `docs/specs/0010-search.md` 与 `.scratch/search/issues/` 七张 ticket。新增领域类型 `Message`（`source`/`session_id`/`project`/`model: Option`/`role`/`timestamp: Option`/`text`）；`Source` trait 新增 `load_messages()` 并带默认空实现（符合 ADR 0002：新增 Source 仍是一个注册结构体，dispatch 点零改动；不存文本的 Source 降级为空集而非特判），`Registry::load_messages_all()` 返回 `(Vec<Message>, Vec<MessageStatus>)`，`MessageStatus` 独立于 `SourceStatus`，`usage`/`diff`/`sessions`/`report` 完全不受影响。四个 adapter 全部接入：Claude JSONL（user 字符串 content 或 block list；assistant 的 `text`/`thinking`/`tool_use`）与 OMP JSONL（`message` block list，role 含 `toolResult`/`bashExecution`；`custom_message` 顶层 `content` + `customType`）共享 `content_texts()`；OpenCode 与 Kilo 共享 `session`/`message`/`part` schema，文本在 `part.data` 的 `{"type":"text"|"reasoning","text":...}`，排除 `synthetic`/`ignored` 标记行（与 Kilo 自身 `recall_part_search_idx` 的过滤一致），连 per-db 循环与跨库去重也抽出为 `load_sqlite_messages_all()`。语料排除 `toolResult`/`tool_use`/`toolCall`/`tool`/`image`/`patch`/`compaction`（工具输出是文件与命令转储，会把真实对话淹没），保留 reasoning 并标 `role: "thinking"`。`src/search.rs` 为纯引擎（`SearchOptions`/`SearchHit`/`search()`/`snippet()`）：substring 匹配、默认大小写不敏感（`--case-sensitive` 可选）、按出现次数降序 + 时间降序排序、snippet 取首个匹配前后 `--context`（默认 80）字符并把换行压成空格、两端用 `…` 标记截断；Unicode 安全的 `fold()`/`find_ci()` 记录折叠后字节到原文字节偏移映射。`Filter` 新增 `matches_message()`，与 `matches()` 共用私有 `matches_at()` 避免漂移；**无 timestamp 的 Message 对时间谓词一律 fail closed**（`Record.started_at` 必填而 `Message.timestamp` 可选，二者刻意不等价）。`--project` 直接过滤 Message 的项目子串，可与 `--json`/`--csv`/`--text` 任意组合。输出：默认 TUI（复用 sessions 的 list+detail，`Enter` 详情、`Esc` 返回、`↑↓/jk`/`g G`/`PgUp/PgDn`、`r` 手动重跑、`q` 退出），TUI 刻意静态无后台刷新（重扫数百 MB 转储毫无必要），header 显示查询、`case-sensitive`、`role` 及一行非默认活跃过滤（`project`/`model`/`source`/`since`/`last`/`context`/`limit`），避免有范围的查询看起来像全量；另有 `--text`/`--json`（含查询、选项、hits、per-Source 计数）/`--csv`。**per-Source 消息计数是过滤后的语料规模**（重新统计而非回显原始 load），被 `--project` 排除的 Source 报 0 而非暗示被扫描过；加载错误仍按 Source 单独上报。无匹配退出码 0，TUI 显示 "No matches"。顺带修复两个潜伏 bug：OpenCode 与 Kilo 的 record `load()` 把可空 `model` 列绑定为 `String`，NULL 模型会话被静默丢弃，现改 `Option<String>`。
@@ -92,6 +101,17 @@
 
 - 会话总结：`usage` 下钻迁移到共享表机制（抽出 `src/tui/table.rs` 纯函数，`ListDetail` 委托、usage 双层派发），修掉上下键选中滚出视口的潜在 bug，新增 6 个回归测试；`cargo fmt` 全库清理历史遗留；提交工作区重构。新增 `.scratch/usage_tui_smoke.py` PTY smoke（Enter 下钻 → j/k → Esc 返回 → Tab 切分组 → r → q，130/80 列宽断言自适应全通过）。测试 265 → 271 全通过，clippy `-D warnings` 干净，`cargo fmt --check` 零 diff。
 
-## 2026-09-09
+## 2026-09-11
 
-- 修复 `request` 端点路径 bug：`send_chat_completion` 与 `send_chat_completion_stream` 此前 POST 到 `{base}/chat/completions`，网关（如 freellmapi）对该路径返回 200 + SPA HTML 前端页而非 JSON，导致 `serde_json::from_str` 统一报 "failed to parse response JSON"（与 prompt 内容/语言无关）。两处端点统一改为 `{base}/v1/chat/completions`。集成测试夹具升级为按请求路径路由：非 `/v1/chat/completions` 返回 `text/html` 兜底页（复刻真实网关行为，此前夹具对任意路径回 JSON 掩盖了该 bug），新增请求行路径断言回归测试与 `--stream --text` 集成测试，`tests/request.rs` 9 → 11 全通过。同步修正 `docs/specs/0008-request.md` 的端点路径。注：此修复曾在 2026-09-08 会话中做过但仅存在于未提交工作区、未进任何 commit 而丢失，本次重新应用。HTTP 401（Invalid API key）为服务端凭据问题，curl 直连 `/v1/chat/completions` 可复现，与本次解析 bug 无关。
+- 文档补齐与 spec 校准（无 Rust 行为改动）：按 spec `docs/specs/0011-request-docs-sync.md` 与 `.scratch/request-docs/issues/` 四张 ticket，把 `request --stream`（2026-09-08 已落地但未记文档）与 `search` 补进 README。README `request` 段新增三种流式形态的示例（TUI 默认、`--text --stream` 逐增量可管道、`--json --stream` 每事件一行 NDJSON），flags 句补 `--stream`，并写明 `stream_options.include_usage` 随 `--stream` 自动发送、one-shot 不带这两个键、拒绝未知字段的 provider 会以带 body 片段的 HTTP 错误暴露（无法主动探测）。新增 `search` 段：两条示例命令 + 默认 TUI 行为（`Enter` 详情 / `Esc` 返回 / `↑↓ j k` / `g G` / `r` / `q`）+ flags 句（`--source`/`--project`/`--model`/`--role`/`--since`/`--last`/`--context`/`--limit`/`--case-sensitive`/`--json`/`--csv`/`--text`），并标注无 timestamp 的消息对时间谓词 fail closed、工具输出与 image/patch 不进语料。README 末尾 Specs 指针由"usage, diff, sessions and report"修正为列出全部 spec（含 usage-agent-detail、report-output-title、report-tui、request、request-stream、search）。
+
+- 同步 `docs/specs/0008-request.md` 到实际实现：Solution 不再把流式描述为未建（改为指向 `0009-request-stream.md` 作为 companion）；删除 Out of Scope 中"streaming SSE parsing beyond SSE lines"这一与 0009 直接矛盾的条目；退出码决策改为与二进制一致——0 成功，HTTP client error 与请求失败共用单一非零码，并**显式记录**此前文档声称的"码 2 专供 I/O 错误"从未实现（保留缺口而非静默删除）；`--config` 从未实现，改为"路径恒为 `~/.config/llmhelper/config.toml`"；补 `--refresh-interval` 不适用于 request（one-shot、无 refresh 循环）；TUI story 由"可交互输入 + streaming buffer"改为只读查看器，输入必须来自 `--messages`/`--prompt`；把从未实现的请求日志（`~/.config/llmhelper/logs/`）移入 Out of Scope，另把响应头展示与 copy/share 也移入 Out of Scope（代码不捕获 headers，`RequestResponse` 无该字段）。Testing Decisions 去掉 mockito/wiremock 假设，改为"经本地 HTTP server 记录请求"，流式测试归 0009。
+
+- 修正 spec 0009 一处与实现不符的措辞：原写"elapsed time 在 live 期间传入并在 done 后冻结"，实际实现是在 draw loop 每帧重算 `start.elapsed()`，因此末个事件被消费后、进程退出前的短暂窗口内时间仍在跳动。
+
+- 补齐流式 wire 契约的端到端断言（此前只有 `--text --stream` 一例）：`tests/request.rs` 11 → 14。新增 `request_stream_json_emits_one_line_per_event`（断言 3 个 SSE 事件产 3 行 NDJSON，逐行可解析，首两个事件无 `usage`、第三个无 `choices`，usage 三个计数字段正确——**按字段断言而非比对整行字符串**，因为 serde_json `Map` 键序不稳定）、`request_stream_payload_carries_stream_fields`（断言 wire body 带 `stream: true` 与 `stream_options.include_usage: true`）、`request_one_shot_payload_omits_stream_fields`（不带 `--stream` 时两个键均不存在，锁死 payload builder 的流式分支不会泄漏到 one-shot）。全部复用既有本地 HTTP server 夹具，未引入 mock 依赖。
+
+- 关闭 `.scratch/request-stream/issues/` 的文档尾票：`05-documentation-and-spec-sync.md` 复选框全部勾除（此前 5 项全空、状态仍 `ready-for-agent`，与已发布代码不符）。01–04 未勾除——它们记录的是实现阶段工作，其验收项已随 commit `a300252` 落地，改动其状态属本次范围外。
+
+- 会话总结：把 `request --stream` 与 `search` 补进 README（含全部示例与 flags）、把 spec 0008 从"首次提交时的承诺"校准为"已发布的行为"（退出码、`--config`、`--refresh-interval`、TUI 只读、请求日志四处不实描述）、修正 spec 0009 elapsed-time 措辞、新增 3 个流式 wire 契约集成测试、关闭遗留文档尾票、修好 AGENT_CHANGELOG 的日期乱序（原 `2026-09-10` 段排在 `2026-09-09` 之前）。零 Rust 行为改动：lib 189 与 integration 71 项断言全部原样通过，request 11 → 14。
+
