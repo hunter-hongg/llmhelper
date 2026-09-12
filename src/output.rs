@@ -3,6 +3,7 @@ use std::io::Write;
 use serde::Serialize;
 
 use crate::aggregator::{AggregateResult, Group};
+use crate::diagnostics::Diagnostics;
 use crate::diff::{DiffRow, Presence};
 use crate::source::SourceStatus;
 
@@ -18,6 +19,10 @@ struct JsonPayload {
     sources: Vec<SourceInfo>,
     group_by: String,
     groups: Vec<Group>,
+    /// Present only when the result is empty or `--explain` was passed, so an
+    /// ordinary non-empty run serialises exactly as it always has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<Diagnostics>,
 }
 
 pub struct OutputRenderer;
@@ -28,6 +33,7 @@ impl OutputRenderer {
         groups: &[Group],
         source_statuses: &[SourceStatus],
         group_by: &str,
+        diagnostics: Option<&Diagnostics>,
         out: &mut W,
     ) -> anyhow::Result<()> {
         let sources: Vec<SourceInfo> = source_statuses
@@ -45,6 +51,7 @@ impl OutputRenderer {
             sources,
             group_by: group_by.to_string(),
             groups: groups.to_vec(),
+            diagnostics: diagnostics.cloned(),
         };
         serde_json::to_writer_pretty(out, &payload)?;
         Ok(())
@@ -449,7 +456,7 @@ mod tests {
         let mut buf = Vec::new();
         let renderer = OutputRenderer;
         renderer
-            .json(&agg.groups, &statuses, "source", &mut buf)
+            .json(&agg.groups, &statuses, "source", None, &mut buf)
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(parsed.get("sources").is_some());

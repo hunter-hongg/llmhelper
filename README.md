@@ -4,13 +4,78 @@ A Rust + Clap CLI for agent/LLM usage introspection. Reads local usage data from
 
 ## Subcommands
 
+### Empty results and `--explain`
+Every read command applies the same four predicate layers in the same order —
+the time window (`--since`/`--last`/`--calendar`), `--project`, `--model`,
+`--source`. When a combination matches nothing, the command says *why* instead
+of printing an empty table:
+
+```bash
+$ llmhelper usage --project /typo-here --csv
+group_key,source,sessions,messages,input,output,cache_read,cache_write,cost
+no records matched — loaded 292, excluded by --project "/typo-here"
+  filters: loaded 292 · window: — · project ("/typo-here"): 0 left · model: — · source: —
+```
+
+The second line is the **funnel**: how many records survived each layer, applied
+cumulatively. Inactive layers show `—` rather than a carried-forward count, so
+you can see at a glance which predicates were even in play. The window layer is
+described by its resolved absolute bounds, never the keyword you typed.
+
+*"No data at all"* is reported distinctly from *"filtered to nothing"*: when
+nothing was loaded, the message is `no records loaded from any source` and **no
+filter is blamed**, however many predicates you set.
+
+`--explain` prints the funnel even on a non-empty result, which answers "how
+much did `--project` cost me?" without first emptying it:
+
+```bash
+$ llmhelper usage --source claude --explain --csv
+group_key,source,...
+claude,claude,2,4,...
+  filters: loaded 292 · window: — · project: — · model: — · source ("claude"): 22 left
+```
+
+Where it goes depends on the output mode:
+
+| mode | where the diagnostic appears |
+|---|---|
+| table / TUI | stderr, so stdout stays clean for piping |
+| `--csv` | stderr; the body stays a bare header, so the file still parses as CSV |
+| `--json` | a structured `diagnostics` object inside the payload |
+
+`--json` carries it as data, present only when the result is empty or
+`--explain` was passed — so an existing non-empty run is unchanged:
+
+```json
+"diagnostics": {
+  "loaded": 292,
+  "stages": [
+    {"layer": "window", "value": null, "remaining": 292},
+    {"layer": "project", "value": "/typo-here", "remaining": 0},
+    {"layer": "model", "value": null, "remaining": 0},
+    {"layer": "source", "value": null, "remaining": 0}
+  ],
+  "matched": 0,
+  "blamed": "project"
+}
+```
+
+`report --output` embeds the funnel in the generated Markdown (there is no
+terminal to print it to), under a `## Filters` section that appears only when
+there is something to explain or `--explain` was passed. `search` counts
+messages rather than records, so it reports its own message-level counts.
+
+**Exit code stays `0`.** Narrowing to nothing is a legitimate result, not an
+error, and turning it into a failure would break every existing script.
+
 ### usage
 Interactive TUI aggregate view.
 ```bash
 llmhelper usage --last 7d --group-by project
 llmhelper usage --project myproj --model auto --json
 ```
-Flags: `--since/--last`, `--project`, `--model`, `--source`, `--group-by source|project|model`, `--json/--csv`, `--budget <source:amount>` (repeatable), `--budget-window <spec>`, `--budget-name <name>` (repeatable).
+Flags: `--since/--last`, `--project`, `--model`, `--source`, `--group-by source|project|model`, `--json/--csv`, `--explain`, `--budget <source:amount>` (repeatable), `--budget-window <spec>`, `--budget-name <name>` (repeatable).
 
 With `--calendar`, `--last` snaps to a local-calendar bucket instead of a rolling duration, and takes calendar keywords only — `1d` (today), `1w` (the trailing 7 local days), `1mo` (30 days). A rolling duration such as `--last 4h` is rejected in calendar mode.
 ```bash
@@ -173,7 +238,7 @@ llmhelper search --last 7d --source omp --role assistant "refactor"
 ```
 Without `--json`/`--csv`/`--text`, `search` opens an interactive TUI: select a hit and press `Enter` for the message detail, `Esc` to return, `↑↓`/`j k` to move, `g`/`G` for top/bottom, `r` to rerun, `q` to quit. The header shows the query plus any non-default active filters.
 
-Flags: `--source`, `--project`, `--model`, `--role`, `--since`/`--last`, `--context` (snippet context, default 80), `--limit` (default 100), `--case-sensitive`, `--json`/`--csv`/`--text`. Messages without a timestamp never match a time filter. Tool output and image/patch blocks are excluded from the searchable corpus.
+Flags: `--source`, `--project`, `--model`, `--role`, `--since`/`--last`, `--context` (snippet context, default 80), `--limit` (default 100), `--case-sensitive`, `--json`/`--csv`/`--text`, `--explain`. Messages without a timestamp never match a time filter. Tool output and image/patch blocks are excluded from the searchable corpus.
 
 ### export
 Flat, machine-oriented dump of the filtered Session records — one row per
@@ -319,4 +384,4 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 ## Specs
-See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget, message-export, diff-calendar, usage-report-calendar and watch specifications. Architecture notes in `docs/adr/`.
+See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget, message-export, diff-calendar, usage-report-calendar, watch and empty-diagnostics specifications. Architecture notes in `docs/adr/`.

@@ -28,5 +28,13 @@ _Avoid_: token-count, token-usage
 The model identifier a Session ran against, as recorded by the Source (raw value). Claude Code often records the routing alias `auto`; OpenCode records a resolved id (e.g. `big-pickle`); OMP records the raw `model` value (`auto`, `sonnet`) and keeps `provider` separate. Grouping is by this raw value — `auto` is a known routing-alias bucket, not a resolved model, and is shown as-is rather than guessed.
 _Avoid_: engine, model-name
 
+**Predicate Layer**:
+One of the four independent exclusion rules a `Filter` applies to the loaded record set: the time window (any of `--since`/`--last`/`--until`/`--calendar`), project, model, and source. The layers are always evaluated in that fixed order, which is what makes the funnel deterministic and the blame layer unambiguous. The window layer is described by its already-resolved absolute bounds, never by the keyword the user typed.
+_Avoid_: filter-stage, condition, clause
+
+**Funnel**:
+The sequence of record counts observed by applying the Predicate Layers one at a time to the loaded set, each stage built on the previous stage's survivors: `loaded → after window → after project → after model → after source → matched`. The stages are nested by construction, never independent counts against the raw set — cumulative application is what makes "which layer removed the last records" answerable. The **blame layer** is the first stage whose output is zero while its input was non-zero; it is `None` when records matched or when nothing was loaded at all, because "there was no data" is not the filters' fault.
+_Avoid_: pipeline, breakdown, trace
+
 
 

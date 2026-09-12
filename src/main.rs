@@ -9,10 +9,11 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use llmhelper::cli::{
-    merge_source_paths, BudgetArgs, Cli, Command, DiffArgs, ExportArgs, FilterArgs, ReportArgs,
-    RequestArgs, SearchArgs, SessionsArgs, UsageArgs, WatchArgs, WindowArgs,
+    merge_source_paths, BudgetArgs, Cli, Command, DiffArgs, ExplainArgs, ExportArgs, FilterArgs,
+    ReportArgs, RequestArgs, SearchArgs, SessionsArgs, UsageArgs, WatchArgs, WindowArgs,
 };
 use llmhelper::config::Config;
+use llmhelper::diagnostics::{diagnose, funnel_line, reason_line, Diagnostics};
 use llmhelper::diff::{compute_diff, fmt_window_len, window_pair, DiffMode};
 use llmhelper::domain::group::GroupBy;
 use llmhelper::domain::message::Message;
@@ -562,9 +563,16 @@ fn run_sessions_non_tui(args: &SessionsArgs, config_path: &Option<PathBuf>) -> a
             eprintln!("warn: source {} error: {}", status.name, err);
         }
     }
+    // Diagnose against the loaded records before the filtered `records` binding
+    // shadows them: the funnel needs the pre-filter set to count what each
+    // layer removed.
+    let diag = diagnose(&records, &filter);
     let mut records: Vec<llmhelper::domain::record::Record> =
         filter.apply(&records).into_iter().cloned().collect();
     if let Some(id) = args.detail.clone() {
+        // The funnel is context for a miss, not a replacement for the error:
+        // the id-specific message and exit code are unchanged.
+        report_diagnostics(&diag, args.explain());
         let rec = records
             .iter()
             .find(|r| r.session_id == id)
@@ -628,6 +636,10 @@ fn run_sessions_non_tui(args: &SessionsArgs, config_path: &Option<PathBuf>) -> a
     let limit = args.limit.unwrap_or(usize::MAX);
     let paginated: Vec<_> = records.into_iter().skip(offset).take(limit).collect();
     if args.json {
+        // `sessions --json` is a bare array; wrapping it to carry the funnel
+        // would break every existing consumer, so the reason goes to stderr
+        // and the array keeps its shape.
+        report_diagnostics(&diag, args.explain());
         let mut buf = Vec::new();
         serde_json::to_writer_pretty(&mut buf, &paginated)?;
         println!("{}", String::from_utf8(buf)?);
@@ -662,6 +674,7 @@ fn run_sessions_non_tui(args: &SessionsArgs, config_path: &Option<PathBuf>) -> a
             ])?;
         }
         w.flush()?;
+        report_diagnostics(&diag, args.explain());
     } else {
         let header = format!(
             "{:<12} {:<30} {:<20} {:<20} {:<20} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}",
@@ -701,6 +714,7 @@ fn run_sessions_non_tui(args: &SessionsArgs, config_path: &Option<PathBuf>) -> a
                 cost_str
             );
         }
+        report_diagnostics(&diag, args.explain());
     }
     Ok(())
 }
@@ -846,16 +860,51 @@ fn load_search_data(
     filter: &Filter,
     options: &SearchOptions,
 ) -> (Vec<SearchHit>, Vec<MessageStatus>) {
+    let (hits, statuses, _) = load_search_data_counted(registry, filter, options);
+    (hits, statuses)
+}
+
+/// As [`load_search_data`], but also reports the pre-filter message count so the
+/// caller can explain an empty result.
+///
+/// `search` filters messages, not records, and the two corpora differ by orders
+/// of magnitude (every record summarises many messages). Reusing the
+/// record-level funnel here would print numbers that answer a different
+/// question, so the count is taken from the message corpus itself.
+fn load_search_data_counted(
+    registry: &Registry,
+    filter: &Filter,
+    options: &SearchOptions,
+) -> (Vec<SearchHit>, Vec<MessageStatus>, SearchCounts) {
     let (messages, statuses) = registry.load_messages_all();
+    let loaded = messages.len();
     let scoped: Vec<Message> = messages
         .iter()
         .filter(|m| filter.matches_message(m))
         .cloned()
         .collect();
+    let scoped_count = scoped.len();
     (
         search(&scoped, options),
         scoped_message_statuses(&scoped, &statuses),
+        SearchCounts {
+            loaded,
+            scoped: scoped_count,
+        },
     )
+}
+
+/// Pre- and post-filter message counts for one `search` run.
+struct SearchCounts {
+    loaded: usize,
+    scoped: usize,
+}
+
+impl SearchCounts {
+    /// Whether the filters excluded every loaded message.
+    fn filtered_to_nothing(&self) -> bool {
+        self.loaded > 0 && self.scoped == 0
+    }
 }
 
 /// Report post-filter message counts while keeping the load errors of sources
@@ -953,10 +1002,26 @@ fn run_search_non_tui(
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), args);
     let registry = discover_sources(&config);
     let filter = build_filter(args)?;
-    let (hits, statuses) = load_search_data(&registry, &filter, options);
+    let (hits, statuses, counts) = load_search_data_counted(&registry, &filter, options);
     for status in &statuses {
         if let Some(err) = &status.error {
             eprintln!("warn: source {} error: {}", status.name, err);
+        }
+    }
+    // `search`'s own wording is query-shaped, so it keeps it; the filter counts
+    // are added only when the filters are what removed the messages.
+    let explain_filters = args.explain() || counts.filtered_to_nothing();
+    if explain_filters {
+        if counts.filtered_to_nothing() {
+            eprintln!(
+                "filters excluded every message — loaded {}, none matched the scope",
+                counts.loaded
+            );
+        } else if args.explain() {
+            eprintln!(
+                "filters: loaded {} messages · {} in scope",
+                counts.loaded, counts.scoped
+            );
         }
     }
     if args.json {
@@ -1102,17 +1167,31 @@ fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
 
     let (records, source_statuses) = registry.load_all();
     let agg = AggregateResult::from_records(&records, &filter, group_by);
+    // Computed from the same two inputs as the aggregate, so the funnel and the
+    // result cannot disagree about what the filter did.
+    let diag = diagnose(&records, &filter);
+    let want_diag = diag_explains(&diag, args.explain());
 
     let renderer = OutputRenderer;
     if args.json {
         let mut buf = Vec::new();
-        renderer.json(&agg.groups, &source_statuses, group_by.label(), &mut buf)?;
+        renderer.json(
+            &agg.groups,
+            &source_statuses,
+            group_by.label(),
+            want_diag.then_some(&diag),
+            &mut buf,
+        )?;
         println!("{}", String::from_utf8(buf)?);
     } else if args.csv {
         let mut buf = Vec::new();
         renderer.csv(&agg.groups, &mut buf)?;
         println!("{}", String::from_utf8(buf)?);
+        // A comment line would corrupt a strict CSV parser, so the reason goes
+        // to stderr and the body stays a well-formed empty table.
+        report_diagnostics(&diag, args.explain());
     } else {
+        report_diagnostics(&diag, args.explain());
         run_tui(
             registry,
             base,
@@ -1123,6 +1202,31 @@ fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
         )?;
     }
     Ok(())
+}
+
+/// Whether a run should carry the funnel at all.
+///
+/// An empty result always explains itself; otherwise the funnel is opt-in via
+/// `--explain`. Stated once so the six read commands cannot disagree.
+fn diag_explains(diag: &Diagnostics, explain: bool) -> bool {
+    explain || diag.loaded == 0 || diag.is_filtered_to_nothing()
+}
+
+/// Print the reason and/or the funnel to stderr.
+///
+/// Only the shell-facing paths call this. The TUI owns its own screen, and
+/// `--json` carries the funnel as structured data instead, so neither should
+/// write prose here.
+fn report_diagnostics(diag: &Diagnostics, explain: bool) {
+    let Some(reason) = reason_line(diag) else {
+        // Non-empty: the funnel is shown only when explicitly asked for.
+        if explain {
+            eprintln!("filters: {}", funnel_line(diag));
+        }
+        return;
+    };
+    eprintln!("{reason}");
+    eprintln!("  filters: {}", funnel_line(diag));
 }
 
 /// `watch`: a continuously refreshing monitor. It reuses `usage`'s window,
@@ -1150,8 +1254,18 @@ fn run_watch(args: WatchArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
         })?;
         let (records, source_statuses) = registry.load_all();
         let agg = AggregateResult::from_records(&records, &filter, group_by);
+        // `watch --json` is the `usage --json` frame byte for byte, so the
+        // funnel is attached by the same rule and nothing prints to stderr.
+        let diag = diagnose(&records, &filter);
+        let want_diag = diag_explains(&diag, args.explain());
         let mut buf = Vec::new();
-        OutputRenderer.json(&agg.groups, &source_statuses, group_by.label(), &mut buf)?;
+        OutputRenderer.json(
+            &agg.groups,
+            &source_statuses,
+            group_by.label(),
+            want_diag.then_some(&diag),
+            &mut buf,
+        )?;
         println!("{}", String::from_utf8(buf)?);
         return Ok(());
     }
@@ -1275,6 +1389,17 @@ fn run_diff(args: DiffArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()>
     let prev_agg = AggregateResult::from_records(&records, &prev_filter, group_by);
     let curr_agg = AggregateResult::from_records(&records, &curr_filter, group_by);
 
+    // Two windows, two funnels: which side came up empty is a separate question
+    // from whether the run was empty.
+    let prev_diag = diagnose(&records, &prev_filter);
+    let curr_diag = diagnose(&records, &curr_filter);
+    if !args.json {
+        // The TUI draws its own screen, and the JSON payload carries both
+        // funnels structurally, so only the shell paths print here.
+        report_window_diagnostics("prev", &prev_diag, args.explain());
+        report_window_diagnostics("curr", &curr_diag, args.explain());
+    }
+
     let rows = compute_diff(&prev_agg, &curr_agg);
 
     // Render output
@@ -1305,9 +1430,17 @@ fn run_diff(args: DiffArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Explain one `diff` window, naming the side so an empty window is not
+/// mistaken for an empty run.
+fn report_window_diagnostics(side: &str, diag: &Diagnostics, explain: bool) {
+    if diag_explains(diag, explain) {
+        eprintln!("{side} window filters: {}", funnel_line(diag));
+    }
+}
+
 /// Build the ReportMeta describing the invocation: window text and the
 /// non-temporal filters that were applied.
-fn report_meta(args: &ReportArgs) -> ReportMeta {
+fn report_meta(args: &ReportArgs, diagnostics: Option<Diagnostics>) -> ReportMeta {
     let window = if let Some(last) = &args.last {
         if args.calendar {
             // The bucket is a partial local day, so a duration would misstate
@@ -1337,6 +1470,7 @@ fn report_meta(args: &ReportArgs) -> ReportMeta {
         group_by: args.group_by.to_string(),
         filters,
         title: args.title.clone(),
+        diagnostics,
     }
 }
 
@@ -1359,7 +1493,10 @@ fn run_report(args: ReportArgs, config_path: &Option<PathBuf>) -> anyhow::Result
 
     let (records, source_statuses) = registry.load_all();
     let agg = AggregateResult::from_records(&records, &filter, group_by);
-    let meta = report_meta(&args);
+    // The report document carries its own funnel: with `--output` there is no
+    // terminal to print a reason to, so the file must explain itself.
+    let diag = diagnose(&records, &filter);
+    let meta = report_meta(&args, diag_explains(&diag, args.explain()).then_some(diag));
     let budgets = args.resolve_budgets(&config.budgets)?;
     let evaluated =
         llmhelper::budget::evaluate_with_measurement(&budgets, &records, now, command_since);

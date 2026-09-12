@@ -39,6 +39,15 @@ pub trait FilterArgs {
     }
 }
 
+/// The filter-diagnostics flag shared by the read-only commands.
+///
+/// `--explain` reports how many records each predicate layer excluded. It lives
+/// beside [`FilterArgs`] rather than as a per-command boolean so a command
+/// cannot forget it, and so the six readers describe their filters identically.
+pub trait ExplainArgs {
+    fn explain(&self) -> bool;
+}
+
 /// The four source-path override flags shared by every command that reads data.
 ///
 /// Implementing this trait lets `main.rs` merge CLI overrides onto a loaded
@@ -340,6 +349,11 @@ pub struct UsageArgs {
     #[arg(long = "source")]
     pub source: Option<SourceArg>,
 
+    /// Explain the filter pipeline: report how many records each predicate
+    /// excluded, and name the one that removed the last records.
+    #[arg(long = "explain")]
+    pub explain: bool,
+
     /// Group output by this dimension: source, project, or model.
     #[arg(long = "group-by", default_value_t)]
     pub group_by: GroupByArg,
@@ -416,6 +430,12 @@ impl FilterArgs for UsageArgs {
     }
     fn source(&self) -> Option<&SourceArg> {
         self.source.as_ref()
+    }
+}
+
+impl ExplainArgs for UsageArgs {
+    fn explain(&self) -> bool {
+        self.explain
     }
 }
 
@@ -512,6 +532,11 @@ pub struct DiffArgs {
     #[arg(long = "source")]
     pub source: Option<SourceArg>,
 
+    /// Explain the filter pipeline: report how many records each predicate
+    /// excluded, and name the one that removed the last records.
+    #[arg(long = "explain")]
+    pub explain: bool,
+
     /// Group output by this dimension: source, project, or model.
     #[arg(long = "group-by", default_value_t)]
     pub group_by: GroupByArg,
@@ -575,6 +600,12 @@ impl DiffArgs {
     }
 }
 
+impl ExplainArgs for DiffArgs {
+    fn explain(&self) -> bool {
+        self.explain
+    }
+}
+
 impl SourcePathArgs for DiffArgs {
     fn claude_dir(&self) -> Option<&PathBuf> {
         self.claude_dir.as_ref()
@@ -629,6 +660,11 @@ pub struct SessionsArgs {
     #[arg(long = "source")]
     pub source: Option<SourceArg>,
 
+    /// Explain the filter pipeline: report how many records each predicate
+    /// excluded, and name the one that removed the last records.
+    #[arg(long = "explain")]
+    pub explain: bool,
+
     /// Limit number of sessions listed.
     #[arg(long = "limit")]
     pub limit: Option<usize>,
@@ -680,6 +716,12 @@ impl FilterArgs for SessionsArgs {
     }
     fn source(&self) -> Option<&SourceArg> {
         self.source.as_ref()
+    }
+}
+
+impl ExplainArgs for SessionsArgs {
+    fn explain(&self) -> bool {
+        self.explain
     }
 }
 
@@ -744,6 +786,11 @@ pub struct ReportArgs {
     /// Filter by source name.
     #[arg(long = "source")]
     pub source: Option<SourceArg>,
+
+    /// Explain the filter pipeline: report how many records each predicate
+    /// excluded, and name the one that removed the last records.
+    #[arg(long = "explain")]
+    pub explain: bool,
 
     /// Group output by this dimension: source, project, or model.
     #[arg(long = "group-by", default_value_t)]
@@ -826,6 +873,12 @@ impl FilterArgs for ReportArgs {
     }
     fn source(&self) -> Option<&SourceArg> {
         self.source.as_ref()
+    }
+}
+
+impl ExplainArgs for ReportArgs {
+    fn explain(&self) -> bool {
+        self.explain
     }
 }
 
@@ -966,6 +1019,11 @@ pub struct SearchArgs {
     #[arg(long = "source")]
     pub source: Option<SourceArg>,
 
+    /// Explain the filter pipeline: report how many messages each predicate
+    /// excluded.
+    #[arg(long = "explain")]
+    pub explain: bool,
+
     /// Filter by message role, e.g. user, assistant, or thinking.
     #[arg(long = "role")]
     pub role: Option<String>,
@@ -1042,6 +1100,12 @@ impl FilterArgs for SearchArgs {
     }
     fn fail_open(&self) -> bool {
         self.fail_open
+    }
+}
+
+impl ExplainArgs for SearchArgs {
+    fn explain(&self) -> bool {
+        self.explain
     }
 }
 
@@ -1248,6 +1312,11 @@ pub struct WatchArgs {
     #[arg(long = "source")]
     pub source: Option<SourceArg>,
 
+    /// Explain the filter pipeline: report how many records each predicate
+    /// excluded, and name the one that removed the last records.
+    #[arg(long = "explain")]
+    pub explain: bool,
+
     /// Group the table by this dimension: source, project, or model.
     #[arg(long = "group-by", default_value_t)]
     pub group_by: GroupByArg,
@@ -1302,6 +1371,12 @@ impl FilterArgs for WatchArgs {
     }
     fn source(&self) -> Option<&SourceArg> {
         self.source.as_ref()
+    }
+}
+
+impl ExplainArgs for WatchArgs {
+    fn explain(&self) -> bool {
+        self.explain
     }
 }
 

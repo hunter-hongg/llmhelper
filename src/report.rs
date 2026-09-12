@@ -17,6 +17,14 @@ pub struct ReportMeta {
     pub filters: Vec<(String, String)>,
     /// Custom document title. Falls back to "llmhelper report" when absent.
     pub title: Option<String>,
+    /// The filter funnel, rendered as a `## Filters` section.
+    ///
+    /// Carried on the metadata rather than passed separately because the report
+    /// **is** the document: when it is written to a file with `--output`, that
+    /// file must be able to explain its own emptiness. A reason printed to
+    /// stderr would be lost. `None` omits the section, leaving an ordinary
+    /// report byte-for-byte unchanged.
+    pub diagnostics: Option<crate::diagnostics::Diagnostics>,
 }
 
 fn md_cell(s: &str) -> String {
@@ -120,6 +128,27 @@ pub fn render_report(
         out.push_str(&format!("- filters: {}\n", joined));
     }
     out.push('\n');
+
+    // --- Filters funnel (only when asked for, or when nothing matched) ---
+    if let Some(diag) = &meta.diagnostics {
+        out.push_str("## Filters\n\n");
+        if let Some(reason) = crate::diagnostics::reason_line(diag) {
+            out.push_str(&format!("{}\n\n", md_cell(&reason)));
+        }
+        out.push_str("| layer | value | remaining |\n|---|---|---|\n");
+        for stage in &diag.stages {
+            let value = stage
+                .value
+                .as_deref()
+                .map(|v| format!("`{}`", md_cell(v)))
+                .unwrap_or_else(|| "—".to_string());
+            out.push_str(&format!(
+                "| {} | {} | {} |\n",
+                stage.layer, value, stage.remaining
+            ));
+        }
+        out.push('\n');
+    }
 
     // --- Totals ---
     out.push_str("## Totals\n\n");
@@ -262,6 +291,7 @@ mod tests {
             group_by: "source".to_string(),
             filters: vec![("project".to_string(), "/proj/a".to_string())],
             title: None,
+            diagnostics: None,
         }
     }
 
@@ -332,6 +362,7 @@ mod tests {
             group_by: "project".to_string(),
             filters: vec![],
             title: None,
+            diagnostics: None,
         };
         let report = render_report(&agg_with(vec![]), &m, &[], None, &[]);
         assert!(report.contains("filters: (none)"));
@@ -594,6 +625,7 @@ mod tests {
             group_by: "source".to_string(),
             filters: vec![],
             title: None,
+            diagnostics: None,
         };
         let agg = agg_with(vec![group("opencode", "opencode", 100, Some(1.5))]);
         let actual = render_report(&agg, &m, &[ok_status("opencode", 1)], None, &[]);

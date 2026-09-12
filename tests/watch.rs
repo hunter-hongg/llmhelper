@@ -118,6 +118,21 @@ fn watch_json_matches_usage_with_non_temporal_filters() {
     assert_watch_matches_usage(&fixture_paths(), &["--last", "3650d"]);
 }
 
+/// The empty-result diagnostic is part of the frame, so the equality must hold
+/// for the cases that carry one too — including a filter that excludes
+/// everything and an explicit `--explain` on a non-empty result. The blame for
+/// an empty result is the one field most likely to drift between the two
+/// commands, because each computes its own funnel.
+#[test]
+fn watch_json_matches_usage_for_every_diagnostics_case() {
+    // Excluded by a layer: the frame carries a blamed stage.
+    assert_watch_matches_usage(&fixture_paths(), &["--project", "/nonexistent-xyz"]);
+    // Non-empty with an explicit request: the frame carries all four stages.
+    assert_watch_matches_usage(&fixture_paths(), &["--source", "claude", "--explain"]);
+    // Non-empty without the request: the frame carries no diagnostics at all.
+    assert_watch_matches_usage(&fixture_paths(), &["--source", "claude"]);
+}
+
 #[test]
 fn watch_json_matches_usage_for_a_calendar_window() {
     assert_watch_matches_usage(&fixture_paths(), &["--calendar", "--last", "1d"]);
