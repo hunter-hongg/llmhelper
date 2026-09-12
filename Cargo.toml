@@ -2,6 +2,8 @@
 name = "llmhelper"
 version = "0.1.0"
 edition = "2021"
+description = "Agent/LLM usage introspection and OpenAI-compatible chat requests from the terminal"
+keywords = ["llm", "agent", "usage", "cli", "tui", "ratatui"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -16,6 +16,10 @@ pub struct Filter {
     pub project: Option<String>,
     pub model: Option<String>,
     pub source: Option<String>,
+    /// When true, a message without a recorded timestamp passes any active
+    /// time predicate instead of failing closed. Records always carry a
+    /// timestamp, so this only affects message search. Default `false`.
+    pub fail_open: bool,
 }
 
 impl Filter {
@@ -63,19 +67,23 @@ impl Filter {
         project: &str,
         model: &str,
     ) -> bool {
+        // A missing timestamp normally fails any active time predicate
+        // (fail-closed). With `fail_open`, the timestamp is treated as
+        // unknown rather than out-of-window, so the entry passes through.
+        let timestamp_known = at.is_some();
         if let Some(since) = self.since {
-            if at.is_none_or(|t| t < since) {
+            if at.is_none_or(|t| t < since) && !(self.fail_open && !timestamp_known) {
                 return false;
             }
         }
         if let Some(window) = self.last {
             let cutoff = Utc::now() - window;
-            if at.is_none_or(|t| t < cutoff) {
+            if at.is_none_or(|t| t < cutoff) && !(self.fail_open && !timestamp_known) {
                 return false;
             }
         }
         if let Some(until) = self.until {
-            if at.is_none_or(|t| t > until) {
+            if at.is_none_or(|t| t > until) && !(self.fail_open && !timestamp_known) {
                 return false;
             }
         }
@@ -277,5 +285,48 @@ mod tests {
         };
         assert!(!model_f.matches_message(&message("a", "/p", None, None)));
         assert!(model_f.matches_message(&message("a", "/p", Some("auto"), None)));
+    }
+
+    #[test]
+    fn message_filter_fail_open_passes_untimestamped_messages_through_time_filters() {
+        let since_f = Filter {
+            since: Some(Utc::now() - chrono::Duration::days(7)),
+            fail_open: true,
+            ..Default::default()
+        };
+        assert!(since_f.matches_message(&message("a", "/p", None, None)));
+
+        let last_f = Filter {
+            last: Some(Duration::from_secs(3600)),
+            fail_open: true,
+            ..Default::default()
+        };
+        assert!(last_f.matches_message(&message("a", "/p", None, None)));
+
+        let until_f = Filter {
+            until: Some(Utc::now()),
+            fail_open: true,
+            ..Default::default()
+        };
+        assert!(until_f.matches_message(&message("a", "/p", None, None)));
+
+        // fail_open never relaxes non-time predicates.
+        let project_f = Filter {
+            project: Some("proj".to_string()),
+            since: Some(Utc::now()),
+            fail_open: true,
+            ..Default::default()
+        };
+        assert!(!project_f.matches_message(&message("a", "/other", None, None)));
+        assert!(project_f.matches_message(&message("a", "/p/proj", None, None)));
+    }
+
+    #[test]
+    fn message_filter_fail_closed_by_default() {
+        let since_f = Filter {
+            since: Some(Utc::now() - chrono::Duration::days(7)),
+            ..Default::default()
+        };
+        assert!(!since_f.matches_message(&message("a", "/p", None, None)));
     }
 }

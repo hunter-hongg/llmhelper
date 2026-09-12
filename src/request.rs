@@ -1,9 +1,40 @@
+use std::time::Duration;
+
 use anyhow::{bail, Context};
 use serde_json::Value;
-use std::time::Duration;
 
 use crate::cli::RequestArgs;
 use crate::config::Config;
+
+/// Error classification for request operations. Determines the process exit
+/// code: `Client` errors (network / DNS / timeout) exit with code 2;
+/// `Request` errors (HTTP non-2xx, parse failure) exit with code 1.
+#[derive(Debug)]
+pub enum RequestError {
+    /// Network-level failure: connection refused, DNS, timeout, stream
+    /// interruption.
+    Client(String),
+    /// Request-level failure: non-2xx HTTP status, response JSON parse error.
+    Request(String),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(msg) => write!(f, "client error: {msg}"),
+            Self::Request(msg) => write!(f, "request error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+pub fn request_exit_code(err: &RequestError) -> i32 {
+    match err {
+        RequestError::Client(_) => 2,
+        RequestError::Request(_) => 1,
+    }
+}
 
 /// Result of a completed Chat Completions request. `raw` carries the
 /// unmodified provider response so `--json` can pipe the full response
@@ -14,21 +45,41 @@ pub struct RequestResponse {
     pub raw: Value,
     pub usage: Option<Value>,
     pub assistant_content: Option<String>,
+    /// Reasoning text captured from the fields named by `--reasoning-field`,
+    /// joined in flag order. `None` when no field matched, or when no field
+    /// was requested at all.
+    pub reasoning: Option<String>,
+    /// The field paths actually consulted, in flag order. Empty when capture
+    /// is off, which is what keeps the `--json` envelope off for everyone
+    /// else.
+    pub reasoning_fields: Vec<String>,
 }
 
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 
+/// Sampling parameters for a Chat Completions request. Every field is
+/// optional and omitted from the payload when `None`/empty.
+#[derive(Debug, Default, Clone)]
+pub struct SamplingParams {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub stop: Vec<String>,
+    /// Provider reasoning configuration, embedded verbatim as the payload's
+    /// `reasoning` key when present. This command does not interpret it.
+    pub reasoning: Option<Value>,
+}
+
 /// Build a Chat Completions request body following the OpenAI schema:
 /// `model` and `messages` are always present; sampling parameters sit at
-/// the top level and are omitted entirely when not supplied.
+/// the top level and are omitted entirely when not supplied. `tools`, when
+/// present, is embedded verbatim as the `tools` array.
 pub fn build_payload(
     model: &str,
     messages: &[Value],
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    max_tokens: Option<u32>,
-    stop: &[String],
+    params: &SamplingParams,
     stream: bool,
+    tools: Option<&Value>,
 ) -> Value {
     let mut payload = serde_json::Map::new();
     payload.insert(
@@ -39,27 +90,35 @@ pub fn build_payload(
         "messages".to_string(),
         serde_json::Value::Array(messages.to_vec()),
     );
-    if let Some(t) = temperature {
+    if let Some(t) = params.temperature {
         payload.insert("temperature".to_string(), serde_json::json!(t));
     }
-    if let Some(p) = top_p {
+    if let Some(p) = params.top_p {
         payload.insert("top_p".to_string(), serde_json::json!(p));
     }
-    if let Some(mt) = max_tokens {
+    if let Some(mt) = params.max_tokens {
         payload.insert(
             "max_tokens".to_string(),
             serde_json::Value::Number(mt.into()),
         );
     }
-    if !stop.is_empty() {
+    if !params.stop.is_empty() {
         payload.insert(
             "stop".to_string(),
             serde_json::Value::Array(
-                stop.iter()
+                params
+                    .stop
+                    .iter()
                     .map(|s| serde_json::Value::String(s.clone()))
                     .collect(),
             ),
         );
+    }
+    if let Some(tools) = tools {
+        payload.insert("tools".to_string(), tools.clone());
+    }
+    if let Some(reasoning) = &params.reasoning {
+        payload.insert("reasoning".to_string(), reasoning.clone());
     }
     if stream {
         payload.insert("stream".to_string(), serde_json::Value::Bool(true));
@@ -77,13 +136,15 @@ pub fn build_payload(
 /// `base_url` and `api_key` come from `--base-url`/`--api-key`, then the
 /// `LLMHELPER_API_KEY` env var (key only), then the `[request]` config
 /// section. The model falls back to `[request] default_model` when `--model`
-/// is absent.
+/// is absent, and `reasoning_fields` to `[request] reasoning_fields` when no
+/// `--reasoning-field` is given.
 #[derive(Debug, Clone)]
 pub struct RequestSettings {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
     pub timeout: Duration,
+    pub reasoning_fields: Vec<String>,
 }
 
 impl RequestSettings {
@@ -114,11 +175,17 @@ impl RequestSettings {
                 .request_timeout_seconds
                 .unwrap_or(DEFAULT_TIMEOUT_SECONDS),
         );
+        let reasoning_fields = if args.reasoning_field.is_empty() {
+            config.request_reasoning_fields.clone().unwrap_or_default()
+        } else {
+            args.reasoning_field.clone()
+        };
         Ok(Self {
             base_url,
             api_key,
             model,
             timeout,
+            reasoning_fields,
         })
     }
 }
@@ -129,32 +196,43 @@ impl RequestSettings {
 pub async fn send_chat_completion(
     settings: &RequestSettings,
     payload: &Value,
-) -> anyhow::Result<RequestResponse> {
+) -> Result<RequestResponse, RequestError> {
     let endpoint = format!("{}/v1/chat/completions", settings.base_url);
-    let mut req = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(settings.timeout)
-        .build()?
+        .build()
+        .map_err(|e| RequestError::Client(format!("failed to set up HTTP client: {e}")))?;
+    let mut req = client
         .post(&endpoint)
         .header("Content-Type", "application/json")
         .json(payload);
     if let Some(key) = &settings.api_key {
         req = req.header("Authorization", format!("Bearer {}", key));
     }
-    let resp = req
-        .send()
-        .await
-        .context("failed to send request to OpenAI-compatible endpoint")?;
+    let resp = req.send().await.map_err(|e| {
+        RequestError::Client(format!(
+            "failed to send request to OpenAI-compatible endpoint: {e}"
+        ))
+    })?;
     let status_code = resp.status().as_u16();
-    let body = resp.text().await.context("failed to read response body")?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| RequestError::Client(format!("failed to read response body: {e}")))?;
     if !(200..300).contains(&status_code) {
-        bail!(
+        return Err(RequestError::Request(format!(
             "HTTP {}: {}",
             status_code,
             body.chars().take(500).collect::<String>()
-        );
+        )));
     }
-    let raw: Value = serde_json::from_str(&body).context("failed to parse response JSON")?;
-    Ok(parse_response(status_code, raw))
+    let raw: Value = serde_json::from_str(&body)
+        .map_err(|e| RequestError::Request(format!("failed to parse response JSON: {e}")))?;
+    Ok(parse_response_with(
+        status_code,
+        raw,
+        &settings.reasoning_fields,
+    ))
 }
 
 #[derive(Debug)]
@@ -162,6 +240,28 @@ pub struct StreamResponse {
     pub status: u16,
     pub usage: Option<Value>,
     pub content: String,
+    /// Reasoning text accumulated from each event's named field. Empty when
+    /// capture is off or no event carried reasoning.
+    pub reasoning: String,
+}
+
+/// Which text channel a single SSE event fed, if any. Determined by the
+/// reasoning-field paths: an event that produced reasoning text is
+/// `"reasoning"`, one that produced answer text is `"content"`, and one that
+/// produced neither (usage-only, keep-alive, `[DONE]`) is `None`. Used to
+/// annotate `--json --stream` lines and route `--text --stream` output without
+/// restructuring the raw event.
+pub fn event_channel(event: &Value, reasoning_fields: &[String]) -> Option<&'static str> {
+    if extract_delta_content(event).is_some() {
+        return Some("content");
+    }
+    if reasoning_fields
+        .iter()
+        .any(|p| extract_text_by_path(event, p).is_some())
+    {
+        return Some("reasoning");
+    }
+    None
 }
 
 /// Stream a Chat Completions request, feeding each parsed SSE event to `on_event`.
@@ -171,7 +271,7 @@ pub async fn send_chat_completion_stream<F>(
     settings: &RequestSettings,
     payload: &Value,
     mut on_event: F,
-) -> anyhow::Result<StreamResponse>
+) -> Result<StreamResponse, RequestError>
 where
     F: FnMut(Value),
 {
@@ -179,7 +279,8 @@ where
     let endpoint = format!("{}/v1/chat/completions", settings.base_url);
     let client = reqwest::Client::builder()
         .connect_timeout(settings.timeout)
-        .build()?;
+        .build()
+        .map_err(|e| RequestError::Client(format!("failed to set up HTTP client: {e}")))?;
     let mut req = client
         .post(&endpoint)
         .header("Content-Type", "application/json")
@@ -187,22 +288,24 @@ where
     if let Some(key) = &settings.api_key {
         req = req.header("Authorization", format!("Bearer {}", key));
     }
-    let resp = req
-        .send()
-        .await
-        .context("failed to send request to OpenAI-compatible endpoint")?;
+    let resp = req.send().await.map_err(|e| {
+        RequestError::Client(format!(
+            "failed to send request to OpenAI-compatible endpoint: {e}"
+        ))
+    })?;
     let status_code = resp.status().as_u16();
     if !(200..300).contains(&status_code) {
         let body = resp.text().await.unwrap_or_default();
-        bail!(
+        return Err(RequestError::Request(format!(
             "HTTP {}: {}",
             status_code,
             body.chars().take(500).collect::<String>()
-        );
+        )));
     }
     let mut stream = resp.bytes_stream();
     let mut parser = SseParser::new();
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut usage = None;
     loop {
         let maybe_chunk = stream.next().await;
@@ -215,13 +318,18 @@ where
                     if let Some(delta) = extract_delta_content(&event) {
                         content.push_str(&delta);
                     }
+                    for field in &settings.reasoning_fields {
+                        if let Some(r) = extract_text_by_path(&event, field) {
+                            reasoning.push_str(&r);
+                        }
+                    }
                     if let Some(u) = extract_stream_usage(&event) {
                         usage = Some(u);
                     }
                 }
             }
             Some(Err(e)) => {
-                bail!("stream interrupted: {}", e);
+                return Err(RequestError::Client(format!("stream interrupted: {e}")));
             }
             None => break,
         }
@@ -232,6 +340,11 @@ where
         if let Some(delta) = extract_delta_content(&event) {
             content.push_str(&delta);
         }
+        for field in &settings.reasoning_fields {
+            if let Some(r) = extract_text_by_path(&event, field) {
+                reasoning.push_str(&r);
+            }
+        }
         if let Some(u) = extract_stream_usage(&event) {
             usage = Some(u);
         }
@@ -240,31 +353,77 @@ where
         status: status_code,
         usage,
         content,
+        reasoning,
     })
 }
 
 /// Extract `usage` and the first assistant content from a Chat
 /// Completions response. Pure function of the response JSON.
 pub fn parse_response(status: u16, raw: Value) -> RequestResponse {
+    parse_response_with(status, raw, &[])
+}
+
+/// As `parse_response`, additionally capturing reasoning from each field path
+/// in `reasoning_fields`. The provider response is never modified; the
+/// captured text is carried beside it. Empty paths mean capture is off, which
+/// is what keeps every output mode byte-for-byte unchanged by default.
+pub fn parse_response_with(
+    status: u16,
+    raw: Value,
+    reasoning_fields: &[String],
+) -> RequestResponse {
     let usage = raw.get("usage").cloned();
     let assistant_content = extract_assistant_content(&raw);
+    let matches: Vec<String> = reasoning_fields
+        .iter()
+        .filter_map(|path| extract_text_by_path(&raw, path))
+        .collect();
+    let reasoning = if matches.is_empty() {
+        None
+    } else {
+        Some(matches.join("\n\n"))
+    };
     RequestResponse {
         status,
         raw,
         usage,
         assistant_content,
+        reasoning,
+        reasoning_fields: reasoning_fields.to_vec(),
+    }
+}
+
+/// Walk a dot-separated path into a JSON value and return the string it
+/// holds. A segment is an object key, or a decimal index when the current
+/// value is an array (`choices.0.message.content`). A missing segment, a
+/// non-object intermediate, a non-string leaf, and an empty or
+/// whitespace-only string all read as absent — a field that does not match is
+/// simply empty, never an error.
+pub fn extract_text_by_path(value: &Value, path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let mut current = value;
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        current = match current {
+            Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+            _ => current.get(segment)?,
+        };
+    }
+    let text = current.as_str()?.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
     }
 }
 
 /// Read the first choice's message content, if present and textual.
 pub fn extract_assistant_content(raw: &Value) -> Option<String> {
-    raw.get("choices")?
-        .as_array()?
-        .first()?
-        .get("message")?
-        .get("content")?
-        .as_str()
-        .map(str::to_string)
+    extract_text_by_path(raw, "choices.0.message.content")
 }
 
 /// Load messages from a JSON file of `{role, content}` objects, validating
@@ -282,6 +441,132 @@ pub fn load_messages_file(path: &std::path::Path) -> anyhow::Result<Vec<Value>> 
         }
     }
     Ok(messages)
+}
+
+/// Load a tools definition file: a JSON array of OpenAI tool objects. The
+/// array is returned verbatim for embedding in the request payload; no
+/// per-entry schema validation is performed beyond the array shape.
+pub fn load_tools_file(path: &std::path::Path) -> anyhow::Result<Value> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read tools file: {}", path.display()))?;
+    let tools: Value = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse tools file: {}", path.display()))?;
+    if !tools.is_array() {
+        bail!("tools file must contain a JSON array of tool definitions");
+    }
+    Ok(tools)
+}
+
+/// Resolve a flag-supplied path relative to the loaded config file's
+/// directory, so a `--config some/dir/config.toml` can carry `--reasoning
+/// thinking.json` meaning the file next to that config. An absolute path, or
+/// no existing config file, leaves the candidate untouched (relative to the
+/// working directory).
+pub fn resolve_path_against_config(
+    config_path: Option<&std::path::Path>,
+    candidate: std::path::PathBuf,
+) -> std::path::PathBuf {
+    if candidate.is_absolute() {
+        return candidate;
+    }
+    match config_path {
+        Some(p) if p.exists() => match p.parent() {
+            Some(dir) => dir.join(candidate),
+            None => candidate,
+        },
+        _ => candidate,
+    }
+}
+
+/// Load a reasoning configuration file: a JSON object. The object is returned
+/// verbatim for embedding as the request `reasoning` key; a non-object is a
+/// usage error so a malformed config fails locally rather than as an HTTP 400.
+pub fn load_reasoning_file(path: &std::path::Path) -> anyhow::Result<Value> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read reasoning file: {}", path.display()))?;
+    let reasoning: Value = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse reasoning file: {}", path.display()))?;
+    if !reasoning.is_object() {
+        bail!("reasoning file must contain a JSON object");
+    }
+    Ok(reasoning)
+}
+
+/// Directory under which per-day request logs are written. Resolves to
+/// `~/.config/llmhelper/logs/`.
+pub fn log_dir() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("llmhelper").join("logs"))
+}
+
+/// Append one JSON entry (`timestamp`, `direction`, `body`) to the per-day
+/// request log file. Non-fatal: any I/O failure logs a warning to stderr and
+/// is otherwise ignored. The API key is never included in `body`.
+pub fn write_request_log(direction: &str, body: &str) {
+    let Some(base) = log_dir() else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&base) {
+        eprintln!("warn: cannot create request log dir {:?}: {}", base, e);
+        return;
+    }
+    let day = chrono::Utc::now().format("%Y-%m-%d");
+    let path = base.join(format!("request-{}.log", day));
+    let line = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "direction": direction,
+        "body": body,
+    });
+    let line = format!("{}\n", serde_json::to_string(&line).unwrap_or_default());
+    if let Err(e) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
+    {
+        eprintln!("warn: cannot write request log {:?}: {}", path, e);
+    }
+}
+
+/// Build the OSC 52 escape sequence that sets the terminal clipboard to
+/// `text`. Kept separate from the printing so it can be asserted on directly.
+fn osc52_clipboard_sequence(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+}
+
+/// Copy `text` to the terminal clipboard using the OSC 52 escape sequence.
+/// Works in terminals that support OSC 52 (iTerm2, Alacritty, Kitty, WezTerm,
+/// foot, ...). The sequence is written directly to stdout; if the terminal
+/// does not support it the bytes are simply ignored.
+pub fn copy_to_clipboard(text: &str) {
+    print!("{}", osc52_clipboard_sequence(text));
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+/// Minimal base64 encoder (standard alphabet, with padding) so the clipboard
+/// path does not pull in an extra dependency for a single escape sequence.
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[derive(Debug, Default)]
@@ -383,7 +668,13 @@ mod tests {
 
     #[test]
     fn build_payload_includes_model_and_messages() {
-        let payload = build_payload("gpt-4", &[user_msg("Hello")], None, None, None, &[], false);
+        let payload = build_payload(
+            "gpt-4",
+            &[user_msg("Hello")],
+            &SamplingParams::default(),
+            false,
+            None,
+        );
         assert_eq!(payload["model"].as_str().unwrap(), "gpt-4");
         assert_eq!(
             payload["messages"],
@@ -396,11 +687,15 @@ mod tests {
         let payload = build_payload(
             "gpt-4",
             &[user_msg("Hello")],
-            Some(0.7),
-            Some(0.95),
-            Some(100),
-            &["<stop>".to_string()],
+            &SamplingParams {
+                temperature: Some(0.7),
+                top_p: Some(0.95),
+                max_tokens: Some(100),
+                stop: vec!["<stop>".to_string()],
+                ..Default::default()
+            },
             false,
+            None,
         );
         let temp = payload["temperature"].as_f64().unwrap();
         let top_p = payload["top_p"].as_f64().unwrap();
@@ -413,7 +708,13 @@ mod tests {
 
     #[test]
     fn build_payload_omits_absent_sampling_params() {
-        let payload = build_payload("gpt-4", &[user_msg("Hello")], None, None, None, &[], false);
+        let payload = build_payload(
+            "gpt-4",
+            &[user_msg("Hello")],
+            &SamplingParams::default(),
+            false,
+            None,
+        );
         for key in ["temperature", "top_p", "max_tokens", "stop"] {
             assert!(payload.get(key).is_none(), "{} should be omitted", key);
         }
@@ -424,11 +725,12 @@ mod tests {
         let payload = build_payload(
             "gpt-4",
             &[user_msg("Hi")],
-            None,
-            None,
-            None,
-            &["<stop1>".to_string(), "<stop2>".to_string()],
+            &SamplingParams {
+                stop: vec!["<stop1>".to_string(), "<stop2>".to_string()],
+                ..Default::default()
+            },
             false,
+            None,
         );
         let stop_arr = payload["stop"].as_array().unwrap();
         assert_eq!(stop_arr.len(), 2);
@@ -622,7 +924,7 @@ mod tests {
 
     #[test]
     fn build_payload_includes_stream_fields_when_streaming() {
-        let payload = build_payload("m", &[], None, None, None, &[], true);
+        let payload = build_payload("m", &[], &SamplingParams::default(), true, None);
         assert!(payload["stream"].as_bool().unwrap());
         assert!(payload["stream_options"]["include_usage"]
             .as_bool()
@@ -631,8 +933,188 @@ mod tests {
 
     #[test]
     fn build_payload_omits_stream_fields_when_not_streaming() {
-        let payload = build_payload("m", &[], None, None, None, &[], false);
+        let payload = build_payload("m", &[], &SamplingParams::default(), false, None);
         assert!(payload.get("stream").is_none());
         assert!(payload.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn build_payload_embeds_tools_verbatim() {
+        let tools = json!([{"type": "function", "function": {"name": "get_weather"}}]);
+        let payload = build_payload("m", &[], &SamplingParams::default(), false, Some(&tools));
+        assert_eq!(payload["tools"], tools);
+        assert_eq!(
+            payload["tools"][0]["function"]["name"].as_str(),
+            Some("get_weather")
+        );
+    }
+
+    #[test]
+    fn build_payload_omits_tools_when_absent() {
+        let payload = build_payload("m", &[], &SamplingParams::default(), false, None);
+        assert!(payload.get("tools").is_none());
+    }
+
+    #[test]
+    fn build_payload_embeds_reasoning_verbatim() {
+        let reasoning = json!({"effort": "high", "exclude": true});
+        let params = SamplingParams {
+            reasoning: Some(reasoning.clone()),
+            ..Default::default()
+        };
+        let payload = build_payload("m", &[], &params, false, None);
+        assert_eq!(payload["reasoning"], reasoning);
+    }
+
+    #[test]
+    fn build_payload_omits_reasoning_when_absent() {
+        let payload = build_payload("m", &[], &SamplingParams::default(), false, None);
+        assert!(payload.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn load_reasoning_file_parses_object_and_rejects_non_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("r.json");
+        std::fs::write(&ok, r#"{"effort":"high"}"#).unwrap();
+        assert_eq!(
+            load_reasoning_file(&ok).unwrap()["effort"].as_str(),
+            Some("high")
+        );
+
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, r#"["not","object"]"#).unwrap();
+        let err = load_reasoning_file(&bad).unwrap_err();
+        assert!(err.to_string().contains("JSON object"));
+    }
+
+    #[test]
+    fn resolve_path_against_config_relative_and_absolute() {
+        use std::path::PathBuf;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+
+        let rel = PathBuf::from("thinking.json");
+        let resolved = resolve_path_against_config(Some(&cfg), rel.clone());
+        assert_eq!(resolved, dir.path().join("thinking.json"));
+
+        let abs = PathBuf::from("/abs/path.json");
+        assert_eq!(resolve_path_against_config(Some(&cfg), abs.clone()), abs);
+
+        let missing = dir.path().join("nope.toml");
+        let rel2 = PathBuf::from("thinking.json");
+        assert_eq!(
+            resolve_path_against_config(Some(&missing), rel2.clone()),
+            rel2
+        );
+        assert_eq!(resolve_path_against_config(None, rel2.clone()), rel2);
+    }
+
+    #[test]
+    fn load_tools_file_parses_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tools.json");
+        std::fs::write(&path, r#"[{"type":"function","function":{"name":"f"}}]"#).unwrap();
+        let tools = load_tools_file(&path).unwrap();
+        assert!(tools.as_array().unwrap().len() == 1);
+
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, r#"{"not":"an array"}"#).unwrap();
+        assert!(load_tools_file(&bad).is_err());
+    }
+
+    #[test]
+    fn request_error_maps_to_exit_codes() {
+        assert_eq!(
+            request_exit_code(&RequestError::Client("boom".to_string())),
+            2
+        );
+        assert_eq!(
+            request_exit_code(&RequestError::Request("HTTP 400".to_string())),
+            1
+        );
+    }
+
+    #[test]
+    fn base64_encode_standard_alphabet_with_padding() {
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"hello world"), "aGVsbG8gd29ybGQ=");
+    }
+
+    #[test]
+    fn osc52_sequence_wraps_base64_payload() {
+        assert_eq!(
+            osc52_clipboard_sequence("hello world"),
+            "\x1b]52;c;aGVsbG8gd29ybGQ=\x07"
+        );
+        // Empty input still produces a well-formed sequence.
+        assert_eq!(osc52_clipboard_sequence(""), "\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn extract_text_by_path_walks_segments() {
+        let v = json!({"a": {"b": "hi"}});
+        assert_eq!(extract_text_by_path(&v, "a.b"), Some("hi".to_string()));
+        assert_eq!(extract_text_by_path(&v, "a"), None);
+    }
+
+    #[test]
+    fn extract_text_by_path_rejects_missing_and_mistyped() {
+        let v = json!({"a": {"b": 7}, "c": "", "d": null});
+        assert_eq!(extract_text_by_path(&v, "a.zzz"), None);
+        assert_eq!(extract_text_by_path(&v, "a.b"), None);
+        assert_eq!(extract_text_by_path(&v, "c"), None);
+        assert_eq!(extract_text_by_path(&v, "d"), None);
+        assert_eq!(extract_text_by_path(&v, ""), None);
+    }
+
+    #[test]
+    fn parse_response_captures_reasoning_from_named_field() {
+        let raw = json!({
+            "choices": [{"message": {"content": "answer", "reasoning": "because"}}]
+        });
+        let resp = parse_response_with(200, raw, &["choices.0.message.reasoning".to_string()]);
+        assert_eq!(resp.assistant_content, Some("answer".to_string()));
+        assert_eq!(resp.reasoning, Some("because".to_string()));
+        assert_eq!(
+            resp.reasoning_fields,
+            vec!["choices.0.message.reasoning".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_response_without_fields_leaves_reasoning_none() {
+        let raw = json!({"choices": [{"message": {"content": "answer"}}]});
+        let resp = parse_response(200, raw);
+        assert_eq!(resp.reasoning, None);
+        assert!(resp.reasoning_fields.is_empty());
+    }
+
+    #[test]
+    fn parse_response_joins_multiple_reasoning_fields_in_flag_order() {
+        let raw = json!({
+            "choices": [{"message": {"content": "a", "reasoning": "one"}}],
+            "reasoning_content": "two"
+        });
+        let resp = parse_response_with(
+            200,
+            raw,
+            &[
+                "reasoning_content".to_string(),
+                "choices.0.message.reasoning".to_string(),
+            ],
+        );
+        assert_eq!(resp.reasoning, Some("two\n\none".to_string()));
+    }
+
+    #[test]
+    fn parse_response_reasoning_absent_is_not_an_error() {
+        let raw = json!({"choices": [{"message": {"content": "a"}}]});
+        let resp = parse_response_with(200, raw, &["nope".to_string()]);
+        assert_eq!(resp.reasoning, None);
+        assert_eq!(resp.reasoning_fields, vec!["nope".to_string()]);
     }
 }

@@ -11,6 +11,8 @@ pub struct Config {
     pub request_api_key: Option<String>,
     pub request_default_model: Option<String>,
     pub request_timeout_seconds: Option<u64>,
+    pub request_reasoning_fields: Option<Vec<String>>,
+    pub request_reasoning: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -25,16 +27,28 @@ impl Default for Config {
             request_api_key: None,
             request_default_model: None,
             request_timeout_seconds: None,
+            request_reasoning_fields: None,
+            request_reasoning: None,
         }
     }
 }
 
 impl Config {
-    pub fn load() -> Self {
-        let path = dirs::config_dir()
+    /// Default config location: `~/.config/llmhelper/config.toml`.
+    pub fn default_path() -> PathBuf {
+        dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("~"))
             .join("llmhelper")
-            .join("config.toml");
+            .join("config.toml")
+    }
+
+    /// Load config from the default location, or from `override_path` when
+    /// given (e.g. via `--config`). A missing file yields defaults; a
+    /// malformed file logs a warning and yields defaults.
+    pub fn load_with(override_path: Option<&std::path::Path>) -> Self {
+        let path = override_path
+            .map(PathBuf::from)
+            .unwrap_or_else(Self::default_path);
         if !path.exists() {
             return Self::default();
         }
@@ -80,7 +94,21 @@ impl Config {
                 .as_ref()
                 .and_then(|r| r.default_model.clone()),
             request_timeout_seconds: parsed.request.as_ref().and_then(|r| r.timeout_seconds),
+            request_reasoning_fields: parsed
+                .request
+                .as_ref()
+                .and_then(|r| r.reasoning_fields.clone()),
+            request_reasoning: parsed
+                .request
+                .as_ref()
+                .and_then(|r| r.reasoning.clone())
+                .map(|p| resolve_relative(&path, p)),
         }
+    }
+
+    /// Load config from the default location.
+    pub fn load() -> Self {
+        Self::load_with(None)
     }
 
     /// Merge CLI overrides on top of config. CLI flags win.
@@ -95,6 +123,8 @@ impl Config {
             request_api_key: self.request_api_key,
             request_default_model: self.request_default_model,
             request_timeout_seconds: self.request_timeout_seconds,
+            request_reasoning_fields: self.request_reasoning_fields,
+            request_reasoning: self.request_reasoning,
         }
     }
 }
@@ -145,6 +175,22 @@ struct RequestConfig {
     api_key: Option<String>,
     default_model: Option<String>,
     timeout_seconds: Option<u64>,
+    reasoning_fields: Option<Vec<String>>,
+    reasoning: Option<PathBuf>,
+}
+
+/// Resolve a path that appeared inside a config file. A relative path is
+/// interpreted relative to the config file's own directory, so a config and
+/// the files it references can be moved together; an absolute path is left
+/// alone.
+fn resolve_relative(config_path: &std::path::Path, candidate: PathBuf) -> PathBuf {
+    if candidate.is_absolute() {
+        return candidate;
+    }
+    match config_path.parent() {
+        Some(dir) => dir.join(candidate),
+        None => candidate,
+    }
 }
 
 #[cfg(test)]

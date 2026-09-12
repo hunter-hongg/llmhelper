@@ -7,6 +7,11 @@ use clap::{Parser, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(name = "llmhelper", about = "Agent usage introspection")]
 pub struct Cli {
+    /// Path to a TOML config file. Defaults to
+    /// ~/.config/llmhelper/config.toml.
+    #[arg(long = "config", global = true)]
+    pub config: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -434,12 +439,46 @@ pub struct RequestArgs {
     pub messages: Option<std::path::PathBuf>,
     #[arg(long = "prompt")]
     pub prompt: Option<String>,
+    /// Path to a JSON file of OpenAI tool definitions (an array). The array is
+    /// embedded verbatim in the request `tools` field.
+    #[arg(long = "tools")]
+    pub tools: Option<std::path::PathBuf>,
+    /// Response field carrying reasoning text, as a dotted path (e.g.
+    /// `choices.0.message.reasoning`, `delta.reasoning_content`). Repeatable:
+    /// every named field is consulted and the non-empty ones are joined.
+    /// Omit to disable reasoning capture entirely.
+    #[arg(long = "reasoning-field")]
+    pub reasoning_field: Vec<String>,
+    /// Path to a JSON file holding a reasoning configuration object (effort,
+    /// budget, ...). The object is embedded verbatim as the payload's
+    /// `reasoning` key; this command does not interpret it.
+    #[arg(long = "reasoning")]
+    pub reasoning: Option<std::path::PathBuf>,
+    /// Show the reasoning channel expanded in the TUI. Composes with
+    /// --interactive; `t` cycles the view at runtime.
+    #[arg(long = "thinking")]
+    pub thinking: bool,
     #[arg(long = "json")]
     pub json: bool,
     #[arg(long = "text")]
     pub text: bool,
     #[arg(long = "stream")]
     pub stream: bool,
+    /// Open an interactive TUI: after each response, type a follow-up and
+    /// press Enter to send it as the next user turn. Mutually exclusive with
+    /// --json and --text.
+    #[arg(long = "interactive")]
+    pub interactive: bool,
+    /// Append the request and response to a per-day log file under
+    /// ~/.config/llmhelper/logs/. Off by default; the API key is never
+    /// written.
+    #[arg(long = "log")]
+    pub log: bool,
+    /// After a successful TUI view, copy the assistant content to the
+    /// terminal clipboard via the OSC 52 sequence. Requires a terminal that
+    /// supports OSC 52. Mutually exclusive with --json and --text.
+    #[arg(long = "copy")]
+    pub copy: bool,
     #[arg(long = "temperature")]
     pub temperature: Option<f32>,
     #[arg(long = "top-p")]
@@ -457,6 +496,12 @@ impl RequestArgs {
         }
         if self.messages.is_some() && self.prompt.is_some() {
             anyhow::bail!("--messages and --prompt are mutually exclusive");
+        }
+        if self.interactive && (self.json || self.text) {
+            anyhow::bail!("--interactive is mutually exclusive with --json and --text");
+        }
+        if self.copy && (self.json || self.text) {
+            anyhow::bail!("--copy is mutually exclusive with --json and --text");
         }
         Ok(())
     }
@@ -511,6 +556,11 @@ pub struct SearchArgs {
     /// Match the query with case sensitivity. Case-insensitive by default.
     #[arg(long = "case-sensitive")]
     pub case_sensitive: bool,
+
+    /// Allow messages without a recorded timestamp to pass through --since
+    /// and --last time predicates. Default (fail-closed) excludes them.
+    #[arg(long = "fail-open")]
+    pub fail_open: bool,
 
     /// Characters of context on either side of a match in the snippet.
     #[arg(long = "context", default_value_t = crate::search::DEFAULT_CONTEXT)]

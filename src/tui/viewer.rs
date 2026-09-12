@@ -29,7 +29,14 @@ const NAV_KEYS: &[(&str, &str)] = &[
 
 /// Standard navigation legend for the static scrollable viewers.
 pub fn render_footer() -> Paragraph<'static> {
-    Paragraph::new(footer_line()).block(
+    render_footer_with(&[])
+}
+
+/// Standard navigation legend with extra key/label pairs appended, so a
+/// viewer can advertise a command-specific key (e.g. the request TUI's
+/// view-cycling `t`) without forking the shared legend.
+pub fn render_footer_with(extra: &[(&str, &str)]) -> Paragraph<'static> {
+    Paragraph::new(footer_line_with(extra)).block(
         Block::default()
             .borders(Borders::TOP)
             .border_style(Style::default().fg(BORDER))
@@ -37,10 +44,13 @@ pub fn render_footer() -> Paragraph<'static> {
     )
 }
 
-/// Footer content: one styled key/label pair per navigation shortcut.
-fn footer_line() -> Line<'static> {
+/// Footer content: one styled key/label pair per navigation shortcut, plus
+/// any caller-supplied extras.
+fn footer_line_with(extra: &[(&str, &str)]) -> Line<'static> {
+    let mut keys: Vec<(&str, &str)> = NAV_KEYS.to_vec();
+    keys.extend_from_slice(extra);
     let mut spans = Vec::new();
-    for (k, label) in NAV_KEYS {
+    for (k, label) in keys {
         spans.push(Span::styled(
             format!(" {} ", k),
             Style::default()
@@ -75,7 +85,7 @@ mod tests {
 
     #[test]
     fn footer_lists_every_nav_key() {
-        let out = plain(&footer_line());
+        let out = plain(&footer_line_with(&[]));
         for (k, _) in NAV_KEYS {
             assert!(out.contains(k), "footer missing key {}", k);
         }
@@ -86,7 +96,7 @@ mod tests {
 
     #[test]
     fn footer_keys_are_bold_accent_labels_muted() {
-        let spans = footer_line().spans;
+        let spans = footer_line_with(&[]).spans;
         assert_eq!(spans.len(), NAV_KEYS.len() * 2);
         for (k, _) in NAV_KEYS {
             let key_span = spans

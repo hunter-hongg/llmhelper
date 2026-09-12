@@ -92,6 +92,7 @@ fn build_filter(args: &UsageArgs) -> anyhow::Result<Filter> {
         project: args.project.clone(),
         model: args.model.clone(),
         source: args.source.as_ref().map(|s| s.to_string()),
+        fail_open: false,
     })
 }
 
@@ -106,6 +107,7 @@ fn build_filter_report(args: &ReportArgs) -> anyhow::Result<Filter> {
         project: args.project.clone(),
         model: args.model.clone(),
         source: args.source.as_ref().map(|s| s.to_string()),
+        fail_open: false,
     })
 }
 
@@ -118,6 +120,7 @@ fn build_filter_sessions(args: &SessionsArgs) -> anyhow::Result<Filter> {
         project: args.project.clone(),
         model: args.model.clone(),
         source: args.source.as_ref().map(|s| s.to_string()),
+        fail_open: false,
     })
 }
 
@@ -132,6 +135,8 @@ fn config_from_sessions_args(config: Config, args: &SessionsArgs) -> Config {
         request_api_key: config.request_api_key,
         request_default_model: config.request_default_model,
         request_timeout_seconds: config.request_timeout_seconds,
+        request_reasoning_fields: config.request_reasoning_fields,
+        request_reasoning: config.request_reasoning,
     }
 }
 
@@ -424,20 +429,20 @@ fn load_sessions_data(registry: &Registry, filter: &Filter) -> SessionsData {
     }
 }
 
-fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
+fn run_sessions(args: SessionsArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
     if args.detail.is_some() || args.json || args.csv {
-        run_sessions_non_tui(&args)
+        run_sessions_non_tui(&args, config_path)
     } else {
-        let config = config_from_sessions_args(Config::load(), &args);
+        let config = config_from_sessions_args(Config::load_with(config_path.as_deref()), &args);
         let registry = discover_sources(&config);
         let filter = build_filter_sessions(&args)?;
         run_sessions_tui(registry, filter, config.refresh_interval_seconds)
     }
 }
 
-fn run_sessions_non_tui(args: &SessionsArgs) -> anyhow::Result<()> {
-    let config = config_from_sessions_args(Config::load(), args);
+fn run_sessions_non_tui(args: &SessionsArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
+    let config = config_from_sessions_args(Config::load_with(config_path.as_deref()), args);
     let registry = discover_sources(&config);
     let filter = build_filter_sessions(args)?;
     let (records, source_statuses) = registry.load_all();
@@ -698,6 +703,8 @@ fn config_from_search_args(config: Config, args: &SearchArgs) -> Config {
         request_api_key: config.request_api_key,
         request_default_model: config.request_default_model,
         request_timeout_seconds: config.request_timeout_seconds,
+        request_reasoning_fields: config.request_reasoning_fields,
+        request_reasoning: config.request_reasoning,
     }
 }
 
@@ -710,6 +717,7 @@ fn build_filter_search(args: &SearchArgs) -> anyhow::Result<Filter> {
         project: args.project.clone(),
         model: args.model.clone(),
         source: args.source.as_ref().map(|s| s.to_string()),
+        fail_open: args.fail_open,
     })
 }
 
@@ -770,21 +778,25 @@ fn message_sources_json(statuses: &[MessageStatus]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn run_search(args: SearchArgs) -> anyhow::Result<()> {
+fn run_search(args: SearchArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
     let options = search_options(&args);
     if args.json || args.csv || args.text {
-        return run_search_non_tui(&args, &options);
+        return run_search_non_tui(&args, &options, config_path);
     }
-    let config = config_from_search_args(Config::load(), &args);
+    let config = config_from_search_args(Config::load_with(config_path.as_deref()), &args);
     let registry = discover_sources(&config);
     let filter = build_filter_search(&args)?;
     let filter_summary = search_filter_summary(&args);
     run_search_tui(registry, filter, options, filter_summary)
 }
 
-fn run_search_non_tui(args: &SearchArgs, options: &SearchOptions) -> anyhow::Result<()> {
-    let config = config_from_search_args(Config::load(), args);
+fn run_search_non_tui(
+    args: &SearchArgs,
+    options: &SearchOptions,
+    config_path: &Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let config = config_from_search_args(Config::load_with(config_path.as_deref()), args);
     let registry = discover_sources(&config);
     let filter = build_filter_search(args)?;
     let (hits, statuses) = load_search_data(&registry, &filter, options);
@@ -914,10 +926,10 @@ fn run_search_tui(
     Ok(())
 }
 
-fn run_usage(args: UsageArgs) -> anyhow::Result<()> {
+fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
     let group_by: GroupBy = args.group_by.clone().into();
-    let config = Config::load().merge(&args);
+    let config = Config::load_with(config_path.as_deref()).merge(&args);
     let registry = discover_sources(&config);
     let filter = build_filter(&args)?;
 
@@ -939,7 +951,7 @@ fn run_usage(args: UsageArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_diff(args: DiffArgs) -> anyhow::Result<()> {
+fn run_diff(args: DiffArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
     let (last_duration, prev_duration) = args.parse_windows()?;
 
@@ -953,7 +965,7 @@ fn run_diff(args: DiffArgs) -> anyhow::Result<()> {
     let group_by: GroupBy = args.group_by.clone().into();
 
     // Load sources once (they don't change between windows)
-    let config = Config::load().merge(&diff_args_to_usage_args(&args));
+    let config = Config::load_with(config_path.as_deref()).merge(&diff_args_to_usage_args(&args));
     let registry = discover_sources(&config);
 
     let (records, source_statuses) = registry.load_all();
@@ -1055,10 +1067,10 @@ fn report_meta(args: &ReportArgs) -> ReportMeta {
     }
 }
 
-fn run_report(args: ReportArgs) -> anyhow::Result<()> {
+fn run_report(args: ReportArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
     let group_by: GroupBy = args.group_by.clone().into();
-    let config = Config::load().merge(&report_args_to_usage_args(&args));
+    let config = Config::load_with(config_path.as_deref()).merge(&report_args_to_usage_args(&args));
     let registry = discover_sources(&config);
     let filter = build_filter_report(&args)?;
 
@@ -1142,37 +1154,110 @@ fn request_messages(args: &RequestArgs) -> anyhow::Result<Vec<serde_json::Value>
     }
 }
 
-fn run_request(args: RequestArgs) -> anyhow::Result<()> {
+fn run_request(args: RequestArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
-    let config = Config::load();
+    let config = Config::load_with(config_path.as_deref());
     let settings = llmhelper::request::RequestSettings::resolve(&args, &config)?;
 
-    let messages = request_messages(&args)?;
-    if messages.is_empty() {
-        anyhow::bail!(
-            "provide a prompt via --prompt or --messages (TUI input is not supported yet)"
-        );
+    let mut messages = request_messages(&args)?;
+    if messages.is_empty() && !args.interactive {
+        anyhow::bail!("provide a prompt via --prompt or --messages");
     }
 
-    let payload = llmhelper::request::build_payload(
-        &settings.model,
-        &messages,
-        args.temperature,
-        args.top_p,
-        args.max_tokens,
-        &args.stop,
-        args.stream,
-    );
+    let tools = match &args.tools {
+        Some(path) => Some(llmhelper::request::load_tools_file(
+            &llmhelper::request::resolve_path_against_config(config_path.as_deref(), path.clone()),
+        )?),
+        None => None,
+    };
+
+    let reasoning_file = args
+        .reasoning
+        .clone()
+        .or_else(|| config.request_reasoning.clone());
+    let reasoning = match reasoning_file {
+        Some(path) => Some(llmhelper::request::load_reasoning_file(
+            &llmhelper::request::resolve_path_against_config(config_path.as_deref(), path),
+        )?),
+        None => None,
+    };
+
+    let params = llmhelper::request::SamplingParams {
+        temperature: args.temperature,
+        top_p: args.top_p,
+        max_tokens: args.max_tokens,
+        stop: args.stop.clone(),
+        reasoning,
+    };
+
+    let build = |messages: &[serde_json::Value]| {
+        llmhelper::request::build_payload(
+            &settings.model,
+            messages,
+            &params,
+            args.stream,
+            tools.as_ref(),
+        )
+    };
+
+    let payload = build(&messages);
+    if args.log {
+        let body = serde_json::to_string(&payload).unwrap_or_default();
+        llmhelper::request::write_request_log("request", &body);
+    }
 
     let rt = Runtime::new()?;
 
+    if args.interactive {
+        let params = RequestParams {
+            model: settings.model.clone(),
+            params: params.clone(),
+            stream: args.stream,
+            tools: tools.clone(),
+        };
+        run_request_interactive(&settings, &mut messages, &params, &args, rt)?;
+        return Ok(());
+    }
+
     if args.stream {
         if args.json {
-            rt.block_on(run_request_stream_json(&settings, &payload))?;
+            match rt.block_on(run_request_stream_json(&settings, &payload, &args)) {
+                Ok(events) => {
+                    if args.log {
+                        llmhelper::request::write_request_log("response", &events);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(llmhelper::request::request_exit_code(&e));
+                }
+            }
         } else if args.text {
-            rt.block_on(run_request_stream_text(&settings, &payload))?;
+            match rt.block_on(run_request_stream_text(&settings, &payload, &args)) {
+                Ok(content) => {
+                    if args.log {
+                        llmhelper::request::write_request_log("response", &content);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(llmhelper::request::request_exit_code(&e));
+                }
+            }
         } else {
-            run_request_stream_tui(&settings, &payload, rt)?;
+            let (view, content, reasoning) =
+                run_request_stream_tui(&settings, &payload, rt, &args)?;
+            if args.copy {
+                // Copy the channel the view is currently showing: the reasoning
+                // pane is visible in the `both` and thinking-only views, so
+                // those copy the reasoning; the answer-only view copies the answer.
+                let copy_text = if view != llmhelper::tui::request_app::ThinkingView::Answer {
+                    reasoning
+                } else {
+                    content
+                };
+                llmhelper::request::copy_to_clipboard(&copy_text);
+            }
         }
         Ok(())
     } else {
@@ -1183,23 +1268,49 @@ fn run_request(args: RequestArgs) -> anyhow::Result<()> {
             Ok(resp) => resp,
             Err(e) => {
                 eprintln!("error: {}", e);
-                std::process::exit(1);
+                std::process::exit(llmhelper::request::request_exit_code(&e));
             }
         };
         let duration_ms = start.elapsed().as_millis();
+        if args.log {
+            let body = serde_json::to_string(&response.raw).unwrap_or_default();
+            llmhelper::request::write_request_log("response", &body);
+        }
 
         if args.json {
-            let mut buf = Vec::new();
-            serde_json::to_writer_pretty(&mut buf, &response.raw)?;
-            println!("{}", String::from_utf8(buf)?);
+            // With capture on, wrap the provider response in an envelope so a
+            // script can read the reasoning without re-deriving the field path.
+            // Without capture the untouched provider object is printed alone.
+            if settings.reasoning_fields.is_empty() {
+                let mut buf = Vec::new();
+                serde_json::to_writer_pretty(&mut buf, &response.raw)?;
+                println!("{}", String::from_utf8(buf)?);
+            } else {
+                let envelope = serde_json::json!({
+                    "response": response.raw,
+                    "reasoning": response.reasoning,
+                    "reasoning_fields": response.reasoning_fields,
+                });
+                let mut buf = Vec::new();
+                serde_json::to_writer_pretty(&mut buf, &envelope)?;
+                println!("{}", String::from_utf8(buf)?);
+            }
             Ok(())
         } else if args.text {
-            match &response.assistant_content {
-                Some(content) => {
-                    println!("{}", content);
-                    Ok(())
+            if args.thinking {
+                println!("{}", response.reasoning.as_deref().unwrap_or_default());
+                Ok(())
+            } else {
+                match &response.assistant_content {
+                    Some(content) => {
+                        println!("{}", content);
+                        if let Some(reasoning) = &response.reasoning {
+                            println!("\n[reasoning]\n{}", reasoning);
+                        }
+                        Ok(())
+                    }
+                    None => anyhow::bail!("response contains no assistant content"),
                 }
-                None => anyhow::bail!("response contains no assistant content"),
             }
         } else {
             let host = extract_host(&settings.base_url);
@@ -1208,60 +1319,69 @@ fn run_request(args: RequestArgs) -> anyhow::Result<()> {
                 .as_ref()
                 .and_then(|u| u.get("total_tokens").and_then(|v| v.as_u64()));
             let body_text = response.assistant_content.as_deref().unwrap_or("");
-            run_request_tui(
+            let res = run_request_tui(
                 &RequestMeta {
                     model: settings.model.clone(),
                     host,
                     duration_ms,
                     usage_tokens,
                     stream_state: llmhelper::tui::request_app::StreamState::Off,
+                    last_activity: None,
+                    gen_state: llmhelper::tui::request_app::GenerationState::Done,
                 },
                 body_text,
-            )
+                response.reasoning.as_deref(),
+                &args,
+                !settings.reasoning_fields.is_empty(),
+            );
+            let view = res?;
+            if args.copy {
+                // Copy the channel the view is currently showing: the reasoning
+                // pane is visible in the `both` and thinking-only views, so
+                // those copy the reasoning; the answer-only view copies the answer.
+                let copy_text = if view != llmhelper::tui::request_app::ThinkingView::Answer {
+                    response.reasoning.as_deref().unwrap_or_default()
+                } else {
+                    response.assistant_content.as_deref().unwrap_or_default()
+                };
+                llmhelper::request::copy_to_clipboard(copy_text);
+            }
+            Ok(())
         }
     }
 }
 
-async fn run_request_stream_json(
-    settings: &llmhelper::request::RequestSettings,
-    payload: &serde_json::Value,
-) -> anyhow::Result<()> {
-    let mut first = true;
-    let _ = llmhelper::request::send_chat_completion_stream(settings, payload, |event| {
-        if first {
-            first = false;
-        }
-        let line = serde_json::to_string(&event).unwrap_or_default();
-        println!("{}", line);
-    })
-    .await?;
-    Ok(())
+/// Immutable parameters needed to build a request payload. Cloned into
+/// spawned send tasks so the payload is always built from the same settings.
+#[derive(Clone)]
+struct RequestParams {
+    model: String,
+    params: llmhelper::request::SamplingParams,
+    stream: bool,
+    tools: Option<serde_json::Value>,
 }
 
-async fn run_request_stream_text(
-    settings: &llmhelper::request::RequestSettings,
-    payload: &serde_json::Value,
-) -> anyhow::Result<()> {
-    let mut content = String::new();
-    let _res = llmhelper::request::send_chat_completion_stream(settings, payload, |event| {
-        if let Some(delta) = llmhelper::request::extract_delta_content(&event) {
-            print!("{}", delta);
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-            content.push_str(&delta);
-        }
-    })
-    .await?;
-    if content.is_empty() {
-        anyhow::bail!("stream produced no assistant content");
+impl RequestParams {
+    fn build(&self, messages: &[serde_json::Value]) -> serde_json::Value {
+        llmhelper::request::build_payload(
+            &self.model,
+            messages,
+            &self.params,
+            self.stream,
+            self.tools.as_ref(),
+        )
     }
-    println!();
-    Ok(())
 }
 
-fn run_request_stream_tui(
+/// Interactive multi-turn request: the TUI shows the response body and an
+/// input line; Enter appends the typed text as the next user turn and
+/// re-sends the full conversation. Works for both one-shot and streaming
+/// modes (streaming appends deltas to the body as they arrive).
+fn run_request_interactive(
     settings: &llmhelper::request::RequestSettings,
-    payload: &serde_json::Value,
+    messages: &mut Vec<serde_json::Value>,
+    params: &RequestParams,
+    args: &RequestArgs,
     rt: Runtime,
 ) -> anyhow::Result<()> {
     let host = extract_host(&settings.base_url);
@@ -1270,7 +1390,346 @@ fn run_request_stream_tui(
         host,
         duration_ms: 0,
         usage_tokens: None,
+        stream_state: llmhelper::tui::request_app::StreamState::Off,
+        last_activity: Some(std::time::Instant::now()),
+        gen_state: llmhelper::tui::request_app::GenerationState::Idle,
+    };
+    let mut tui = RequestTuiApp::new(meta, "")?;
+    tui.state.running = true;
+    tui.state.interactive = true;
+    tui.state.capture_on = !settings.reasoning_fields.is_empty();
+    tui.state.view = if args.thinking {
+        llmhelper::tui::request_app::ThinkingView::Both
+    } else {
+        llmhelper::tui::request_app::ThinkingView::Answer
+    };
+    tui.state.body_lines = vec!["(thinking…)".to_string()];
+    tui.state.follow = true;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1024);
+    let params_owned = params.clone();
+
+    // Spawn the first request immediately.
+    {
+        let tx = tx.clone();
+        let params = params_owned.clone();
+        let settings = settings.clone();
+        let first_messages = messages.clone();
+        rt.spawn(async move {
+            let payload = params.build(&first_messages);
+            send_and_stream(&settings, &payload, |event| {
+                let _ = tx.try_send(event);
+            })
+            .await;
+        });
+    }
+
+    let mut current_messages: Vec<serde_json::Value> = messages.clone();
+
+    loop {
+        if !tui.state.running {
+            break;
+        }
+
+        // Drain incoming stream events (or the one-shot response).
+        while let Ok(event) = rx.try_recv() {
+            handle_request_event(
+                &mut tui.state,
+                &event,
+                args.stream,
+                &settings.reasoning_fields,
+            );
+        }
+
+        let elapsed = tui
+            .state
+            .meta
+            .last_activity
+            .map(|t| std::time::Instant::now().duration_since(t).as_millis())
+            .unwrap_or(0);
+        tui.state.meta.duration_ms = elapsed;
+        tui.terminal.draw(|frame| {
+            llmhelper::tui::request_render::render(frame, &mut tui.state);
+        })?;
+
+        if crossterm::event::poll(std::time::Duration::from_millis(100))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                if llmhelper::tui::request_app::handle_request_key(&mut tui.state, key.code) {
+                    continue;
+                }
+                match key.code {
+                    crossterm::event::KeyCode::Enter => {
+                        let text = tui.state.input.trim().to_string();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        tui.state.input.clear();
+                        let turn = serde_json::json!({"role": "user", "content": text});
+                        current_messages.push(turn.clone());
+                        messages.push(turn);
+                        let payload = params.build(&current_messages);
+                        if args.log {
+                            let body = serde_json::to_string(&payload).unwrap_or_default();
+                            llmhelper::request::write_request_log("request", &body);
+                        }
+                        tui.state.body_lines =
+                            vec![format!("> {}", text), "(waiting for response…)".to_string()];
+                        tui.state.reset_reasoning();
+                        tui.state.follow = true;
+                        tui.state.meta.last_activity = Some(std::time::Instant::now());
+                        tui.state.meta.usage_tokens = None;
+                        let tx2 = tx.clone();
+                        let settings2 = settings.clone();
+                        rt.spawn(async move {
+                            let payload2 = payload;
+                            send_and_stream(&settings2, &payload2, |event| {
+                                let _ = tx2.try_send(event);
+                            })
+                            .await;
+                        });
+                    }
+                    crossterm::event::KeyCode::Backspace => {
+                        tui.state.input.pop();
+                    }
+                    crossterm::event::KeyCode::Char(c) => {
+                        tui.state.input.push(c);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if args.copy {
+        // Copy the channel the view is showing: the reasoning pane is visible
+        // in the `both` and thinking-only views, those copy the reasoning, the
+        // answer-only view copies the displayed answer.
+        let copy_text = if tui.state.view != llmhelper::tui::request_app::ThinkingView::Answer {
+            tui.state.reasoning_lines.join("\n")
+        } else {
+            tui.state.body_lines.join("\n")
+        };
+        llmhelper::request::copy_to_clipboard(&copy_text);
+    }
+    tui.exit()?;
+    Ok(())
+}
+
+/// Append a streamed text chunk to `lines`, merging into the current last
+/// line and opening a new line per newline the chunk introduces. Placeholders
+/// left by a pending request are cleared by the first chunk that lands.
+fn append_chunk(lines: &mut Vec<String>, chunk: &str) {
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    if let Some(last) = lines.last_mut() {
+        if last == "(waiting for response…)" || last == "(thinking…)" {
+            last.clear();
+        }
+        last.push_str(chunk);
+    }
+    if lines.last().is_some_and(|l| l.ends_with('\n')) {
+        lines.push(String::new());
+    }
+}
+
+/// Scroll a state to its newest line when tail-following is on. Shared by
+/// every live loop so a second buffer cannot drift from the first.
+fn follow_tail(state: &mut llmhelper::tui::request_app::RequestTuiState) {
+    if state.follow {
+        let max_scroll = state
+            .content_length()
+            .saturating_sub(state.viewport_height());
+        state.set_scroll(max_scroll);
+    }
+}
+
+/// Feed a single stream (or response) event into the interactive TUI state.
+fn handle_request_event(
+    state: &mut llmhelper::tui::request_app::RequestTuiState,
+    event: &serde_json::Value,
+    streaming: bool,
+    reasoning_fields: &[String],
+) {
+    // End-of-turn marker from `send_and_stream`: no content, just tells the
+    // header the generation is settled so a stale phase is not shown.
+    if event.get("@turn_done").and_then(|v| v.as_bool()) == Some(true) {
+        state.meta.gen_state = llmhelper::tui::request_app::GenerationState::Done;
+        return;
+    }
+    state.meta.last_activity = Some(std::time::Instant::now());
+
+    let content_delta = llmhelper::request::extract_delta_content(event);
+
+    if let Some(delta) = &content_delta {
+        append_chunk(&mut state.body_lines, delta);
+        follow_tail(state);
+    }
+
+    // Reasoning arrives either as a canonical synthetic delta (one-shot
+    // interactive) or from the named fields in a raw stream event.
+    let mut reasoning_chunk = String::new();
+    if let Some(r) = event.get("reasoning_delta").and_then(|v| v.as_str()) {
+        reasoning_chunk.push_str(r);
+    }
+    for field in reasoning_fields {
+        if let Some(r) = llmhelper::request::extract_text_by_path(event, field) {
+            reasoning_chunk.push_str(&r);
+        }
+    }
+    if !reasoning_chunk.is_empty() {
+        append_chunk(&mut state.reasoning_lines, &reasoning_chunk);
+        state.follow_reasoning_tail();
+    }
+
+    state.note_event(content_delta.is_some(), !reasoning_chunk.is_empty());
+
+    if let Some(usage) = llmhelper::request::extract_stream_usage(event) {
+        if let Some(total) = usage.get("total_tokens").and_then(|v| v.as_u64()) {
+            state.meta.usage_tokens = Some(total);
+        }
+        if streaming {
+            state.meta.stream_state = llmhelper::tui::request_app::StreamState::Done;
+        }
+    }
+
+    if let Some(err) = event.get("error").and_then(|e| e.as_str()) {
+        state.body_lines = vec![format!("error: {err}")];
+    }
+}
+
+/// Send a one-shot or streaming request and forward each event (for
+/// streaming) or the single response (for one-shot) to `on_event`.
+async fn send_and_stream(
+    settings: &llmhelper::request::RequestSettings,
+    payload: &serde_json::Value,
+    mut on_event: impl FnMut(serde_json::Value),
+) {
+    if payload.get("stream").and_then(|v| v.as_bool()) == Some(true) {
+        let _ = llmhelper::request::send_chat_completion_stream(settings, payload, |e| {
+            on_event(e);
+        })
+        .await;
+    } else {
+        match llmhelper::request::send_chat_completion(settings, payload).await {
+            Ok(resp) => {
+                if let Some(content) = &resp.assistant_content {
+                    on_event(serde_json::json!({"choices": [{"delta": {"content": content}}]}));
+                }
+                if let Some(reasoning) = &resp.reasoning {
+                    on_event(serde_json::json!({"reasoning_delta": reasoning}));
+                }
+                if let Some(usage) = &resp.usage {
+                    on_event(serde_json::json!({"usage": usage}));
+                }
+            }
+            Err(e) => {
+                on_event(serde_json::json!({"error": e.to_string()}));
+            }
+        }
+    }
+    // The interactive loop owns the channel and holds a sender across turns,
+    // so `is_closed` never fires between turns; this sentinel is the unambiguous
+    // mark that one turn's events are fully delivered, letting the header move
+    // to `done`.
+    on_event(serde_json::json!({"@turn_done": true}));
+}
+
+async fn run_request_stream_json(
+    settings: &llmhelper::request::RequestSettings,
+    payload: &serde_json::Value,
+    _args: &RequestArgs,
+) -> Result<String, llmhelper::request::RequestError> {
+    let capture = !settings.reasoning_fields.is_empty();
+    let mut lines = Vec::new();
+    let _ = llmhelper::request::send_chat_completion_stream(settings, payload, |event| {
+        let out = if capture {
+            match llmhelper::request::event_channel(&event, &settings.reasoning_fields) {
+                Some(channel) => {
+                    let mut e = event.clone();
+                    e.as_object_mut()
+                        .map(|m| m.insert("@channel".to_string(), serde_json::json!(channel)));
+                    e
+                }
+                None => event.clone(),
+            }
+        } else {
+            event
+        };
+        let line = serde_json::to_string(&out).unwrap_or_default();
+        lines.push(line.clone());
+        println!("{}", line);
+    })
+    .await?;
+    Ok(lines.join("\n"))
+}
+
+async fn run_request_stream_text(
+    settings: &llmhelper::request::RequestSettings,
+    payload: &serde_json::Value,
+    args: &RequestArgs,
+) -> Result<String, llmhelper::request::RequestError> {
+    let mut content = String::new();
+    let mut produced_any = false;
+    let capture = !settings.reasoning_fields.is_empty();
+    let thinking_only = args.thinking;
+    let _res = llmhelper::request::send_chat_completion_stream(settings, payload, |event| {
+        let content_delta = llmhelper::request::extract_delta_content(&event);
+        let mut reasoning_delta = String::new();
+        if capture {
+            for field in &settings.reasoning_fields {
+                if let Some(r) = llmhelper::request::extract_text_by_path(&event, field) {
+                    reasoning_delta.push_str(&r);
+                }
+            }
+        }
+        use std::io::Write;
+        if thinking_only {
+            // --text --thinking --stream: only the thinking channel, on stdout.
+            if !reasoning_delta.is_empty() {
+                print!("{}", reasoning_delta);
+                let _ = std::io::stdout().flush();
+                produced_any = true;
+            }
+            return;
+        }
+        // Default split: answer to stdout, thinking to stderr.
+        if let Some(delta) = content_delta {
+            print!("{}", delta);
+            let _ = std::io::stdout().flush();
+            content.push_str(&delta);
+            produced_any = true;
+        }
+        if !reasoning_delta.is_empty() {
+            eprint!("{}", reasoning_delta);
+            let _ = std::io::stderr().flush();
+            produced_any = true;
+        }
+    })
+    .await?;
+    if !produced_any {
+        return Err(llmhelper::request::RequestError::Request(
+            "stream produced no assistant content".to_string(),
+        ));
+    }
+    println!();
+    Ok(content)
+}
+
+fn run_request_stream_tui(
+    settings: &llmhelper::request::RequestSettings,
+    payload: &serde_json::Value,
+    rt: Runtime,
+    args: &RequestArgs,
+) -> anyhow::Result<(llmhelper::tui::request_app::ThinkingView, String, String)> {
+    let host = extract_host(&settings.base_url);
+    let meta = RequestMeta {
+        model: settings.model.clone(),
+        host,
+        duration_ms: 0,
+        usage_tokens: None,
         stream_state: llmhelper::tui::request_app::StreamState::Live,
+        last_activity: None,
+        gen_state: llmhelper::tui::request_app::GenerationState::Idle,
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1024);
     let settings_clone = settings.clone();
@@ -1287,37 +1746,38 @@ fn run_request_stream_tui(
     });
     let mut tui = RequestTuiApp::new(meta, "")?;
     tui.state.running = true;
+    tui.state.capture_on = !settings.reasoning_fields.is_empty();
+    tui.state.view = if args.thinking && tui.state.capture_on {
+        llmhelper::tui::request_app::ThinkingView::Both
+    } else {
+        llmhelper::tui::request_app::ThinkingView::Answer
+    };
     let start = std::time::Instant::now();
     while tui.state.running {
         if let Ok(event) = rx.try_recv() {
             if let Some(delta) = llmhelper::request::extract_delta_content(&event) {
-                if tui.state.body_lines.is_empty() {
-                    tui.state.body_lines.push(String::new());
+                append_chunk(&mut tui.state.body_lines, &delta);
+            }
+            let mut reasoning_chunk = String::new();
+            for field in &settings.reasoning_fields {
+                if let Some(r) = llmhelper::request::extract_text_by_path(&event, field) {
+                    reasoning_chunk.push_str(&r);
                 }
-                if let Some(l) = tui.state.body_lines.last_mut() {
-                    l.push_str(&delta);
-                }
-                if tui
-                    .state
-                    .body_lines
-                    .last()
-                    .is_some_and(|l| l.ends_with('\n'))
-                {
-                    tui.state.body_lines.push(String::new());
-                }
+            }
+            if !reasoning_chunk.is_empty() {
+                append_chunk(&mut tui.state.reasoning_lines, &reasoning_chunk);
+                tui.state.follow_reasoning_tail();
             }
             if let Some(usage) = llmhelper::request::extract_stream_usage(&event) {
                 if let Some(total) = usage.get("total_tokens").and_then(|v| v.as_u64()) {
                     tui.state.meta.usage_tokens = Some(total);
                 }
             }
-            if tui.state.follow {
-                let max_scroll = tui
-                    .state
-                    .content_length()
-                    .saturating_sub(tui.state.viewport_height());
-                tui.state.set_scroll(max_scroll);
-            }
+            tui.state.note_event(
+                llmhelper::request::extract_delta_content(&event).is_some(),
+                !reasoning_chunk.is_empty(),
+            );
+            follow_tail(&mut tui.state);
         }
         tui.state.meta.duration_ms = start.elapsed().as_millis();
         tui.terminal.draw(|frame| {
@@ -1325,46 +1785,44 @@ fn run_request_stream_tui(
         })?;
         if rx.is_closed() {
             tui.state.meta.stream_state = llmhelper::tui::request_app::StreamState::Done;
+            tui.state.meta.gen_state = llmhelper::tui::request_app::GenerationState::Done;
         }
         if crossterm::event::poll(std::time::Duration::from_millis(200))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                match key.code {
-                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
-                        tui.state.quit();
-                    }
-                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                        tui.state.scroll_down();
-                    }
-                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                        tui.state.scroll_up();
-                        tui.state.follow = false;
-                    }
-                    crossterm::event::KeyCode::PageDown => tui.state.page_down(),
-                    crossterm::event::KeyCode::PageUp => {
-                        tui.state.page_up();
-                        tui.state.follow = false;
-                    }
-                    crossterm::event::KeyCode::Home | crossterm::event::KeyCode::Char('g') => {
-                        tui.state.scroll_top();
-                        tui.state.follow = false;
-                    }
-                    crossterm::event::KeyCode::End | crossterm::event::KeyCode::Char('G') => {
-                        tui.state.scroll_bottom();
-                        tui.state.follow = true;
-                    }
-                    _ => {}
-                }
+                llmhelper::tui::request_app::handle_request_key(&mut tui.state, key.code);
             }
         }
     }
+    let view = tui.state.view;
+    let content = tui.state.body_lines.join("\n");
+    let reasoning = tui.state.reasoning_lines.join("\n");
     tui.exit()?;
-    Ok(())
+    Ok((view, content, reasoning))
 }
 
 /// Interactive viewer over a completed request response, mirroring the
-/// report TUI: static body, scroll keys, no background refresh.
-fn run_request_tui(meta: &RequestMeta, body: &str) -> anyhow::Result<()> {
+/// report TUI: static body, scroll keys, no background refresh. Returns the
+/// view the user left on, so a follow-up `--copy` can take the channel that
+/// was actually shown.
+fn run_request_tui(
+    meta: &RequestMeta,
+    body: &str,
+    reasoning: Option<&str>,
+    args: &RequestArgs,
+    capture_on: bool,
+) -> anyhow::Result<llmhelper::tui::request_app::ThinkingView> {
     let mut tui = RequestTuiApp::new(meta.clone(), body)?;
+    tui.state.capture_on = capture_on;
+    tui.state.view = if args.thinking && tui.state.capture_on {
+        llmhelper::tui::request_app::ThinkingView::Both
+    } else {
+        llmhelper::tui::request_app::ThinkingView::Answer
+    };
+    if let Some(r) = reasoning {
+        tui.state.reasoning_lines = r.lines().map(str::to_string).collect();
+    }
+    // The response is already complete, so the header reports it as done.
+    tui.state.meta.gen_state = llmhelper::tui::request_app::GenerationState::Done;
     tui.state.running = true;
     while tui.state.running {
         tui.terminal.draw(|frame| {
@@ -1373,41 +1831,24 @@ fn run_request_tui(meta: &RequestMeta, body: &str) -> anyhow::Result<()> {
 
         if crossterm::event::poll(std::time::Duration::from_millis(200))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                match key.code {
-                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
-                        tui.state.quit();
-                    }
-                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                        tui.state.scroll_down();
-                    }
-                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                        tui.state.scroll_up();
-                    }
-                    crossterm::event::KeyCode::PageDown => tui.state.page_down(),
-                    crossterm::event::KeyCode::PageUp => tui.state.page_up(),
-                    crossterm::event::KeyCode::Home | crossterm::event::KeyCode::Char('g') => {
-                        tui.state.scroll_top();
-                    }
-                    crossterm::event::KeyCode::End | crossterm::event::KeyCode::Char('G') => {
-                        tui.state.scroll_bottom();
-                    }
-                    _ => {}
-                }
+                llmhelper::tui::request_app::handle_request_key(&mut tui.state, key.code);
             }
         }
     }
+    let view = tui.state.view;
     tui.exit()?;
-    Ok(())
+    Ok(view)
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let config_path = cli.config;
     match cli.command {
-        Command::Usage(args) => run_usage(args),
-        Command::Diff(args) => run_diff(args),
-        Command::Sessions(args) => run_sessions(args),
-        Command::Report(args) => run_report(args),
-        Command::Request(args) => run_request(args),
-        Command::Search(args) => run_search(args),
+        Command::Usage(args) => run_usage(args, &config_path),
+        Command::Diff(args) => run_diff(args, &config_path),
+        Command::Sessions(args) => run_sessions(args, &config_path),
+        Command::Report(args) => run_report(args, &config_path),
+        Command::Request(args) => run_request(args, &config_path),
+        Command::Search(args) => run_search(args, &config_path),
     }
 }

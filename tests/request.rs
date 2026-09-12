@@ -449,3 +449,368 @@ fn request_one_shot_payload_omits_stream_fields() {
     assert!(received.get("stream").is_none());
     assert!(received.get("stream_options").is_none());
 }
+
+/// A `--tools` file containing a JSON array is embedded verbatim under the
+/// payload's top-level `tools` key, with no client-side reshaping.
+#[test]
+fn request_tools_file_is_passed_through_verbatim() {
+    let tools =
+        r#"[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]"#;
+    let dir = tempfile::tempdir().unwrap();
+    let tools_path = dir.path().join("tools.json");
+    std::fs::write(&tools_path, tools).unwrap();
+
+    let (addr, handle) = start_server("200 OK", OK_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    args.push("--tools".into());
+    args.push(tools_path.to_string_lossy().into_owned());
+    let output = run_with_args(&args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let received = body_of(&handle.join().unwrap());
+    assert_eq!(
+        received["tools"],
+        serde_json::from_str::<serde_json::Value>(tools).unwrap()
+    );
+}
+
+/// Without `--tools` the `tools` key must be absent entirely, not `null`/`[]`.
+#[test]
+fn request_omits_tools_key_when_flag_absent() {
+    let (addr, handle) = start_server("200 OK", OK_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    let output = run_with_args(&args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let received = body_of(&handle.join().unwrap());
+    assert!(received.get("tools").is_none());
+}
+
+/// A `--tools` file that is valid JSON but not an array is a usage error and
+/// must exit 1 like the other CLI validation failures, without ever
+/// contacting the endpoint.
+#[test]
+fn request_rejects_non_array_tools_file_with_exit_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools_path = dir.path().join("tools.json");
+    std::fs::write(&tools_path, r#"{"not":"an array"}"#).unwrap();
+
+    let mut args = base_args(&"127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap());
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    args.push("--tools".into());
+    args.push(tools_path.to_string_lossy().into_owned());
+    let output = run_with_args(&args);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("JSON array"));
+}
+
+/// HTTP non-2xx is a request-level failure and maps to exit 1.
+#[test]
+fn request_http_error_exits_1() {
+    let (addr, handle) = start_server("500 Internal Server Error", r#"{"error":"boom"}"#);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    let output = run_with_args(&args);
+    assert_eq!(output.status.code(), Some(1));
+    let _req = handle.join().unwrap();
+}
+
+/// A connection that cannot be established is a client-level failure and
+/// maps to exit 2.
+#[test]
+fn request_connection_failure_exits_2() {
+    let mut args = base_args(&"127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap());
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    let output = run_with_args(&args);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("client error"));
+}
+
+const REASONING_BODY: &str = r#"{"id":"x","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"the answer","reasoning":"because I said so"}}],"usage":{"total_tokens":9}}"#;
+
+#[test]
+fn request_reasoning_field_captured_into_text() {
+    let (addr, handle) = start_server("200 OK", REASONING_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    args.push("--reasoning-field".into());
+    args.push("choices.0.message.reasoning".into());
+    let output = run_with_args(&args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("the answer\n"), "stdout: {}", stdout);
+    assert!(stdout.contains("[reasoning]\nbecause I said so"));
+    let _req = handle.join().unwrap();
+}
+
+#[test]
+fn request_text_thinking_prints_reasoning_only() {
+    let (addr, handle) = start_server("200 OK", REASONING_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--thinking".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    args.push("--reasoning-field".into());
+    args.push("choices.0.message.reasoning".into());
+    let output = run_with_args(&args);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "because I said so\n"
+    );
+    let _req = handle.join().unwrap();
+}
+
+#[test]
+fn request_reasoning_field_json_envelope() {
+    let (addr, handle) = start_server("200 OK", REASONING_BODY);
+    let mut args = base_args(&addr);
+    args.push("--json".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    args.push("--reasoning-field".into());
+    args.push("choices.0.message.reasoning".into());
+    let output = run_with_args(&args);
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(parsed["reasoning"].as_str(), Some("because I said so"));
+    assert_eq!(
+        parsed["reasoning_fields"][0].as_str(),
+        Some("choices.0.message.reasoning")
+    );
+    assert_eq!(parsed["response"]["id"].as_str(), Some("x"));
+    let _req = handle.join().unwrap();
+}
+
+#[test]
+fn request_without_reasoning_field_keeps_raw_json() {
+    let (addr, handle) = start_server("200 OK", REASONING_BODY);
+    let mut args = base_args(&addr);
+    args.push("--json".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    let output = run_with_args(&args);
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(parsed["id"].as_str(), Some("x"));
+    assert!(parsed.get("response").is_none());
+    assert!(parsed.get("reasoning").is_none());
+    let _req = handle.join().unwrap();
+}
+
+/// A `[request] reasoning_fields` config key supplies the field list when the
+/// flag is absent, so capture works without naming the field on the command
+/// line. This exercises the resolution shared by every output path.
+#[test]
+fn request_reasoning_fields_config_key_enables_capture() {
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let llm = cfg_dir.path().join("llmhelper");
+    std::fs::create_dir_all(&llm).unwrap();
+    std::fs::write(
+        llm.join("config.toml"),
+        "[request]\nreasoning_fields = [\"choices.0.message.reasoning\"]\n",
+    )
+    .unwrap();
+    let (addr, handle) = start_server("200 OK", REASONING_BODY);
+    let output = Command::new(bin())
+        .env("XDG_CONFIG_HOME", cfg_dir.path())
+        .args([
+            "request",
+            "--json",
+            "--prompt",
+            "hi",
+            "--model",
+            "gpt-4",
+            "--base-url",
+            &format!("http://{}", addr),
+        ])
+        .output()
+        .unwrap();
+    let _req = handle.join().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(parsed["reasoning"].as_str(), Some("because I said so"));
+    assert_eq!(
+        parsed["reasoning_fields"][0].as_str(),
+        Some("choices.0.message.reasoning")
+    );
+}
+
+#[test]
+fn request_reasoning_field_missing_is_empty_not_an_error() {
+    let (addr, handle) = start_server("200 OK", OK_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    args.push("--reasoning-field".into());
+    args.push("does.not.exist".into());
+    let output = run_with_args(&args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "Hello back\n");
+    let _req = handle.join().unwrap();
+}
+
+/// A `--reasoning` file is embedded verbatim as the payload's `reasoning` key.
+#[test]
+fn request_reasoning_file_is_passed_through_verbatim() {
+    let dir = tempfile::tempdir().unwrap();
+    let reasoning_path = dir.path().join("reasoning.json");
+    let body = r#"{"effort":"high","exclude":true}"#;
+    std::fs::write(&reasoning_path, body).unwrap();
+
+    let (addr, handle) = start_server("200 OK", OK_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    args.push("--reasoning".into());
+    args.push(reasoning_path.to_string_lossy().into_owned());
+    let output = run_with_args(&args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let received = body_of(&handle.join().unwrap());
+    assert_eq!(
+        received["reasoning"],
+        serde_json::from_str::<serde_json::Value>(body).unwrap()
+    );
+}
+
+#[test]
+fn request_omits_reasoning_key_when_flag_absent() {
+    let (addr, handle) = start_server("200 OK", OK_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    let output = run_with_args(&args);
+    assert!(output.status.success());
+    let received = body_of(&handle.join().unwrap());
+    assert!(received.get("reasoning").is_none());
+}
+
+#[test]
+fn request_rejects_non_object_reasoning_file_with_exit_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let reasoning_path = dir.path().join("reasoning.json");
+    std::fs::write(&reasoning_path, r#"["not","object"]"#).unwrap();
+
+    let mut args = base_args(&"127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap());
+    args.push("--text".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    args.push("--reasoning".into());
+    args.push(reasoning_path.to_string_lossy().into_owned());
+    let output = run_with_args(&args);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("JSON object"));
+}
+
+/// Interleaved reasoning + content SSE frames. Reasoning deltas use the
+/// `delta.reasoning_content` field, matching the dotted-path capture the flag
+/// accepts when applied to an event.
+const REASONING_STREAM_BODY: &str = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"the answer\"}}]}\n\ndata: [DONE]\n\n";
+
+#[test]
+fn request_stream_json_annotates_channel() {
+    let (addr, handle) = start_server("200 OK", REASONING_STREAM_BODY);
+    let mut args = base_args(&addr);
+    args.push("--json".into());
+    args.push("--stream".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    args.push("--reasoning-field".into());
+    args.push("choices.0.delta.reasoning_content".into());
+    let output = run_with_args(&args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["@channel"].as_str(), Some("reasoning"));
+    assert_eq!(lines[1]["@channel"].as_str(), Some("content"));
+    assert_eq!(
+        lines[0]["choices"][0]["delta"]["reasoning_content"].as_str(),
+        Some("let me think")
+    );
+    let _req = handle.join().unwrap();
+}
+
+#[test]
+fn request_stream_text_splits_reasoning_to_stderr() {
+    let (addr, handle) = start_server("200 OK", REASONING_STREAM_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--stream".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    args.push("--reasoning-field".into());
+    args.push("choices.0.delta.reasoning_content".into());
+    let output = run_with_args(&args);
+    assert!(output.status.success());
+    // stdout carries only the answer; the thinking went to stderr.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "the answer\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("let me think"));
+    let _req = handle.join().unwrap();
+}
+
+#[test]
+fn request_stream_text_thinking_prints_reasoning_only() {
+    let (addr, handle) = start_server("200 OK", REASONING_STREAM_BODY);
+    let mut args = base_args(&addr);
+    args.push("--text".into());
+    args.push("--thinking".into());
+    args.push("--stream".into());
+    args.push("--prompt".into());
+    args.push("hi".into());
+    args.push("--reasoning-field".into());
+    args.push("choices.0.delta.reasoning_content".into());
+    let output = run_with_args(&args);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "let me think\n");
+    let _req = handle.join().unwrap();
+}
