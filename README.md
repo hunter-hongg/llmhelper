@@ -68,6 +68,29 @@ Cost is source-scoped and never summed across sources.
 
 `report` and `usage` also accept the budget flags `--budget`, `--budget-window`, and `--budget-name` (see [Budgets](#budgets)). When budgets are configured, `report` gains a `## Budget` section and `usage` flags over-budget Source rows.
 
+### watch
+A live, self-refreshing usage monitor.
+```bash
+# Reload every 5 seconds (the default), showing the last 30 days
+llmhelper watch --last 30d
+
+# Today only, refreshing every 10s, with an over-budget warning
+llmhelper watch --calendar --last 1d --interval 10 --budget kilo:5.00 --budget-window 1d
+
+# One frame, exactly as `usage --json` — for scripts and sampling
+llmhelper watch --last 7d --json
+```
+
+`watch` reads the same data, applies the same window and the same filters as `usage`, then keeps re-reading it on a timer instead of exiting. It answers "what is happening right now" rather than "what happened in this period": each refresh records a new frame, and every row is annotated with how much it moved since the previous one.
+
+The header carries the freshness of the data — the clock time it was read at, a countdown to the next read, and how long the deltas span. On the first frame there is nothing to compare against, so the span reads `active — (first frame)` and every delta is `—` rather than a fabricated `+0`. A delta is shown only when both frames measured the value; a source that reports no cost in either frame gets a `—` in `Δcost`, never a `0` that would claim it was free.
+
+Deltas are annotated `+`/`-` and coloured by sign (up green, down red). When `--budget`/`--budget-window` are given, an over-budget source is flagged in the sources strip and summarised in the header.
+
+Keys: `r` reload immediately, `q` or `Esc` quit. That is deliberately the whole set — `watch` is a monitor, not a browser, so there is no row selection, no detail view and no `Tab` group cycling. Use `usage`'s TUI for those.
+
+`--interval <seconds>` sets the reload period (default `5`; `0` is rejected). `--json` writes exactly one frame — byte-for-byte the same output as `usage --json` for the same flags — and exits, so a sampling script needs no second code path. There is no `--csv` for `watch`: a CSV has nowhere to record when the frame was read, when the next read is due, or what the deltas are measured against.
+
 ### request
 Send an OpenAI-compatible Chat Completions request with TUI or CLI output.
 ```bash
@@ -296,4 +319,4 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 ## Specs
-See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget, message-export, diff-calendar and usage-report-calendar specifications. Architecture notes in `docs/adr/`.
+See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget, message-export, diff-calendar, usage-report-calendar and watch specifications. Architecture notes in `docs/adr/`.

@@ -160,6 +160,8 @@ pub enum Command {
     Search(SearchArgs),
     /// Export normalized Session records for downstream tools.
     Export(ExportArgs),
+    /// Continuously monitor usage, cost and budget status.
+    Watch(WatchArgs),
 }
 
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
@@ -1195,6 +1197,150 @@ impl SourcePathArgs for ExportArgs {
     }
     fn kilo_db(&self) -> Option<&Vec<PathBuf>> {
         self.kilo_db.as_ref()
+    }
+}
+
+/// The live monitor. It consumes the same filter, window and budget vocabulary
+/// as `usage`; the only genuinely new knob is how often it re-reads the sources.
+#[derive(Parser, Debug, Clone)]
+pub struct WatchArgs {
+    /// Claude Code projects directory (defaults to ~/.claude/projects).
+    #[arg(long = "claude-dir")]
+    pub claude_dir: Option<std::path::PathBuf>,
+
+    /// OpenCode database path(s). Can be specified multiple times.
+    #[arg(long = "opencode-db")]
+    pub opencode_db: Option<Vec<std::path::PathBuf>>,
+
+    /// OMP sessions directory (defaults to ~/.omp/agent/sessions).
+    #[arg(long = "omp-dir")]
+    pub omp_dir: Option<std::path::PathBuf>,
+
+    /// Kilo Code database path(s). Can be specified multiple times.
+    #[arg(long = "kilo-db")]
+    pub kilo_db: Option<Vec<std::path::PathBuf>>,
+
+    /// Only include sessions started at or after this RFC 3339 timestamp.
+    #[arg(long = "since")]
+    pub since: Option<DateTime<Utc>>,
+
+    /// Only include sessions from the last N days/hours (e.g. "7d", "4h").
+    /// Mutually exclusive with --since. Errors on unparseable input.
+    #[arg(long = "last")]
+    pub last: Option<String>,
+
+    /// Align the window to a local calendar bucket instead of a rolling
+    /// duration, exactly as `usage --calendar` does. The bucket is re-anchored
+    /// on every reload, so a monitor left running across midnight rolls into
+    /// the new local day.
+    #[arg(long = "calendar")]
+    pub calendar: bool,
+
+    /// Filter by project path substring.
+    #[arg(long = "project")]
+    pub project: Option<String>,
+
+    /// Filter by model substring (case-insensitive).
+    #[arg(long = "model")]
+    pub model: Option<String>,
+
+    /// Filter by source name.
+    #[arg(long = "source")]
+    pub source: Option<SourceArg>,
+
+    /// Group the table by this dimension: source, project, or model.
+    #[arg(long = "group-by", default_value_t)]
+    pub group_by: GroupByArg,
+
+    /// Seconds between reloads. Must be at least 1; a zero interval would
+    /// busy-loop the sources.
+    #[arg(long = "interval", default_value_t = 5)]
+    pub interval: u64,
+
+    /// Dump exactly one frame as JSON and exit, instead of monitoring. The
+    /// frame is byte-identical to the `usage --json` frame for the same flags.
+    #[arg(long = "json")]
+    pub json: bool,
+
+    /// One-off spend budget as `<source>:<amount>`, e.g. `opencode:5.00`.
+    /// Repeatable. The window comes from --budget-window (default 1d).
+    #[arg(long = "budget")]
+    pub budget: Vec<String>,
+
+    /// Window applied to --budget one-offs (e.g. 1d, 7d, 30d, 1w, 1mo).
+    #[arg(long = "budget-window")]
+    pub budget_window: Option<String>,
+
+    /// Evaluate only these configured [budget.<name>] entries. Repeatable.
+    #[arg(long = "budget-name")]
+    pub budget_name: Vec<String>,
+}
+
+impl WatchArgs {
+    /// Reject an interval that cannot be honoured. Runs before any source is
+    /// read so a bad invocation fails instantly rather than after a disk scan.
+    pub fn validate_interval(&self) -> anyhow::Result<()> {
+        if self.interval == 0 {
+            anyhow::bail!("invalid --interval 0: must be at least 1 second");
+        }
+        Ok(())
+    }
+}
+
+impl FilterArgs for WatchArgs {
+    fn since(&self) -> Option<DateTime<Utc>> {
+        self.since
+    }
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+    fn source(&self) -> Option<&SourceArg> {
+        self.source.as_ref()
+    }
+}
+
+impl SourcePathArgs for WatchArgs {
+    fn claude_dir(&self) -> Option<&PathBuf> {
+        self.claude_dir.as_ref()
+    }
+    fn opencode_db(&self) -> Option<&Vec<PathBuf>> {
+        self.opencode_db.as_ref()
+    }
+    fn omp_dir(&self) -> Option<&PathBuf> {
+        self.omp_dir.as_ref()
+    }
+    fn kilo_db(&self) -> Option<&Vec<PathBuf>> {
+        self.kilo_db.as_ref()
+    }
+}
+
+impl BudgetArgs for WatchArgs {
+    fn budget(&self) -> &[String] {
+        &self.budget
+    }
+    fn budget_window(&self) -> Option<&str> {
+        self.budget_window.as_deref()
+    }
+    fn budget_name(&self) -> &[String] {
+        &self.budget_name
+    }
+}
+
+impl WindowArgs for WatchArgs {
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn since(&self) -> Option<DateTime<Utc>> {
+        self.since
+    }
+    fn calendar(&self) -> bool {
+        self.calendar
     }
 }
 

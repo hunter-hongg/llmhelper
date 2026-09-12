@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use llmhelper::cli::{
     merge_source_paths, BudgetArgs, Cli, Command, DiffArgs, ExportArgs, FilterArgs, ReportArgs,
-    RequestArgs, SearchArgs, SessionsArgs, UsageArgs, WindowArgs,
+    RequestArgs, SearchArgs, SessionsArgs, UsageArgs, WatchArgs, WindowArgs,
 };
 use llmhelper::config::Config;
 use llmhelper::diff::{compute_diff, fmt_window_len, window_pair, DiffMode};
@@ -37,6 +37,10 @@ struct TuiData {
     result: Option<AggregateResult>,
     source_statuses: Vec<SourceStatus>,
     budgets: Vec<llmhelper::budget::EvaluatedBudget>,
+    /// The `now` this frame was loaded at. The `watch` header renders it as
+    /// "updated …" and derives its countdown from it; a renderer must never
+    /// re-read the clock to describe data it did not measure.
+    updated_at: DateTime<Utc>,
 }
 
 /// Load and aggregate one frame of `usage` TUI data.
@@ -71,6 +75,7 @@ fn load_usage_data(
         result: Some(agg),
         source_statuses: statuses,
         budgets: evaluated,
+        updated_at: now,
     }
 }
 
@@ -1120,6 +1125,131 @@ fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
     Ok(())
 }
 
+/// `watch`: a continuously refreshing monitor. It reuses `usage`'s window,
+/// aggregation and budget machinery verbatim; what is new is only *when* the
+/// data is read and how the frame is annotated.
+fn run_watch(args: WatchArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
+    // Validate before touching the sources: a bad interval or window is a user
+    // error, and neither should cost a disk scan to discover.
+    args.validate_window()?;
+    args.validate_interval()?;
+
+    let group_by: GroupBy = args.group_by.clone().into();
+    let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
+    let registry = discover_sources(&config);
+    let base = base_filter(&args);
+    let mode = args.window_mode()?;
+    let budgets = args.resolve_budgets(&config.budgets)?;
+
+    if args.json {
+        // One frame, exactly the `usage --json` frame: `watch --json` samples
+        // the monitor, it does not define a second machine format.
+        let now = Utc::now();
+        let filter = window_filter(&base, mode, now).ok_or_else(|| {
+            anyhow::anyhow!("could not anchor the calendar window to local midnight")
+        })?;
+        let (records, source_statuses) = registry.load_all();
+        let agg = AggregateResult::from_records(&records, &filter, group_by);
+        let mut buf = Vec::new();
+        OutputRenderer.json(&agg.groups, &source_statuses, group_by.label(), &mut buf)?;
+        println!("{}", String::from_utf8(buf)?);
+        return Ok(());
+    }
+
+    run_watch_tui(registry, base, mode, group_by, budgets, args.interval)
+}
+
+/// The monitor loop. Unlike `run_tui` there is no shared grouping dimension to
+/// mutate (no `Tab`) and no reload trigger to debounce: one timer task reloads
+/// on schedule, the channel keeps only the latest frame, and `r` runs the same
+/// load synchronously on the UI thread.
+fn run_watch_tui(
+    registry: Registry,
+    base_filter: Filter,
+    mode: Option<llmhelper::domain::window::WindowMode>,
+    group_by: GroupBy,
+    budgets: Vec<llmhelper::budget::Budget>,
+    interval_secs: u64,
+) -> anyhow::Result<()> {
+    let rt = Runtime::new()?;
+
+    let (tx, mut rx) = mpsc::channel::<TuiData>(1);
+
+    let reg_arc = Arc::new(registry);
+    let reg_for_task = reg_arc.clone();
+    let filter_clone = base_filter.clone();
+    let budgets_for_task = Arc::new(budgets);
+    let budgets_clone = budgets_for_task.clone();
+    rt.spawn(async move {
+        use tokio::time::{interval, Duration};
+        let mut tick = interval(Duration::from_secs(interval_secs));
+        loop {
+            tick.tick().await;
+            let data =
+                load_usage_data(&reg_for_task, &filter_clone, mode, group_by, &budgets_clone);
+            let _ = tx.send(data).await;
+        }
+    });
+
+    let mut tui = llmhelper::tui::WatchTuiApp::new()?;
+    tui.state.app.running = true;
+    tui.state.app.group_by = group_by;
+    tui.state.app.mode = mode;
+    tui.state.app.interval_secs = interval_secs;
+
+    let initial = load_usage_data(&reg_arc, &base_filter, mode, group_by, &budgets_for_task);
+    tui.state.apply_data(
+        initial.result,
+        initial.source_statuses,
+        initial.budgets,
+        initial.updated_at,
+    );
+
+    while tui.state.app.running {
+        if let Ok(data) = rx.try_recv() {
+            tui.state.apply_data(
+                data.result,
+                data.source_statuses,
+                data.budgets,
+                data.updated_at,
+            );
+        }
+
+        let now = Utc::now();
+        tui.terminal.draw(|frame| {
+            llmhelper::tui::watch_render::render(frame, &mut tui.state, now);
+        })?;
+
+        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                match key.code {
+                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
+                        tui.state.app.running = false;
+                    }
+                    crossterm::event::KeyCode::Char('r') => {
+                        let data = load_usage_data(
+                            &reg_arc,
+                            &base_filter,
+                            mode,
+                            group_by,
+                            &budgets_for_task,
+                        );
+                        tui.state.apply_data(
+                            data.result,
+                            data.source_statuses,
+                            data.budgets,
+                            data.updated_at,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    tui.exit()?;
+    Ok(())
+}
+
 fn run_diff(args: DiffArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
     let mode = diff_mode(&args)?;
@@ -2026,5 +2156,6 @@ fn main() -> anyhow::Result<()> {
         Command::Request(args) => run_request(args, &config_path),
         Command::Search(args) => run_search(args, &config_path),
         Command::Export(args) => run_export(args, &config_path),
+        Command::Watch(args) => run_watch(args, &config_path),
     }
 }

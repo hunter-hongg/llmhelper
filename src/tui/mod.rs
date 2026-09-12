@@ -15,6 +15,8 @@ pub mod sessions_render;
 pub mod table;
 pub mod terminal;
 pub mod viewer;
+pub mod watch_app;
+pub mod watch_render;
 
 pub use app::{App, TerminalApp, TuiState, View};
 pub use diff_app::{DiffApp, DiffTuiApp, DiffTuiState};
@@ -23,3 +25,4 @@ pub use report_app::{ReportTuiApp, ReportTuiState};
 pub use request_app::{RequestMeta, RequestTuiApp, RequestTuiState};
 pub use search_app::{SearchData, SearchTuiApp, SearchTuiState, SearchView};
 pub use sessions_app::{SessionsData, SessionsTuiApp, SessionsTuiState, SessionsView};
+pub use watch_app::{WatchApp, WatchTuiApp, WatchTuiState};
