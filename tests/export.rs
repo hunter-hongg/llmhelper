@@ -201,3 +201,171 @@ fn export_cost_null_for_claude_and_present_for_omp() {
     }
     assert!(saw_claude && saw_omp_cost);
 }
+
+// ---------------------------------------------------------------------------
+// `export --messages` — transcript-level export (spec 0016)
+// ---------------------------------------------------------------------------
+
+/// Run `export --messages ...` with the fixture source paths plus extra args.
+fn stdout_messages_ok(extra_args: &[&str]) -> String {
+    let mut args = vec!["--messages"];
+    args.extend_from_slice(extra_args);
+    stdout_ok(&args)
+}
+
+#[test]
+fn messages_emits_one_row_per_message_across_sources() {
+    let out = stdout_messages_ok(&[]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(!lines.is_empty(), "expected messages from fixtures");
+
+    let mut sources = std::collections::BTreeSet::new();
+    for line in &lines {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(v.is_object());
+        assert!(v["source"].is_string());
+        assert!(v["session_id"].is_string());
+        assert!(v["role"].is_string());
+        assert!(v["text"].is_string());
+        sources.insert(v["source"].as_str().unwrap().to_string());
+    }
+    // Every Source that stores text must contribute at least one message.
+    for name in ["claude", "opencode", "omp", "kilo"] {
+        assert!(sources.contains(name), "missing source {name}");
+    }
+}
+
+#[test]
+fn messages_role_filter_narrows_to_that_role() {
+    let all = stdout_messages_ok(&[]).lines().count();
+    let assistants = stdout_messages_ok(&["--role", "assistant"]);
+    let count = assistants.lines().count();
+    assert!(count > 0, "expected assistant messages");
+    assert!(count < all, "role filter should exclude other roles");
+    for line in assistants.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["role"], "assistant");
+    }
+}
+
+#[test]
+fn messages_role_filter_is_case_insensitive() {
+    let lower = stdout_messages_ok(&["--role", "assistant"]).lines().count();
+    let upper = stdout_messages_ok(&["--role", "ASSISTANT"]).lines().count();
+    assert_eq!(lower, upper);
+}
+
+#[test]
+fn messages_role_without_messages_flag_exits_one() {
+    let output = run_export(&["--role", "user"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--role"), "got: {stderr}");
+    assert!(stderr.contains("--messages"), "got: {stderr}");
+}
+
+#[test]
+fn messages_source_filter_narrows() {
+    let claude = stdout_messages_ok(&["--source", "claude"]);
+    assert!(claude.lines().count() > 0);
+    for line in claude.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["source"], "claude");
+    }
+}
+
+#[test]
+fn messages_project_filter_narrows() {
+    let out = stdout_messages_ok(&["--project", "omp-test"]);
+    assert!(out.lines().count() > 0, "expected omp-test messages");
+    for line in out.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(
+            v["project"].as_str().unwrap().contains("omp-test"),
+            "got: {}",
+            v["project"]
+        );
+    }
+}
+
+#[test]
+fn messages_last_filter_fails_closed_for_old_and_untimed_rows() {
+    // Fixtures are dated far in the past, so a 1-day window is empty.
+    let out = stdout_messages_ok(&["--last", "1d"]);
+    assert_eq!(out.lines().count(), 0);
+    // A wide window admits the whole corpus.
+    let wide = stdout_messages_ok(&["--last", "3650d"]);
+    assert!(wide.lines().count() > 0);
+}
+
+#[test]
+fn messages_fields_narrows_and_reorders() {
+    let out = stdout_messages_ok(&["--fields", "role,text", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let first = v.as_array().unwrap()[0].as_object().unwrap();
+    assert_eq!(first.len(), 2);
+    assert!(first.contains_key("role"));
+    assert!(first.contains_key("text"));
+    let line = out.lines().find(|l| l.contains("\"role\"")).unwrap();
+    assert!(line.find("\"role\"").unwrap() < line.find("\"text\"").unwrap());
+}
+
+#[test]
+fn messages_json_is_one_parseable_array() {
+    let out = stdout_messages_ok(&["--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v.is_array());
+    assert!(!v.as_array().unwrap().is_empty());
+}
+
+#[test]
+fn messages_csv_has_message_header() {
+    let out = stdout_messages_ok(&["--format", "csv"]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines.len() >= 2);
+    assert_eq!(
+        lines[0],
+        "source,session_id,project,model,role,timestamp,text"
+    );
+}
+
+#[test]
+fn messages_record_only_field_exits_one_naming_it() {
+    let output = run_export(&["--messages", "--fields", "cost"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cost"), "got: {stderr}");
+    assert!(stderr.contains("--messages"), "got: {stderr}");
+}
+
+#[test]
+fn messages_absent_model_and_timestamp_are_null_not_zero() {
+    let out = stdout_messages_ok(&["--fields", "model,timestamp,text"]);
+    let mut saw_null_model = false;
+    for line in out.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        // A user message commonly has no model; assert null, never "0".
+        if v["model"].is_null() {
+            saw_null_model = true;
+        }
+        assert!(!v["model"].is_number() || v["model"].as_f64() != Some(0.0));
+    }
+    assert!(
+        saw_null_model,
+        "fixtures must include a message without a model"
+    );
+}
+
+#[test]
+fn messages_zero_match_exits_zero_with_empty_shape() {
+    let output = run_export(&["--messages", "--role", "no-such-role"]);
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty(), "jsonl of nothing writes nothing");
+}
+
+#[test]
+fn messages_output_is_deterministic_across_runs() {
+    let a = stdout_messages_ok(&[]);
+    let b = stdout_messages_ok(&[]);
+    assert_eq!(a, b, "two identical exports must be byte-identical");
+}

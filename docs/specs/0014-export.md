@@ -161,8 +161,10 @@ there is no place to sum across Sources.
 - Aggregation, grouping, or totals inside export; that is `usage`/`report`.
 - Writing to a file path (`--output`); stdout redirection is the shell's job.
 - A TUI or interactive mode.
-- Exporting message text (`search`'s corpus) or reasoning content; export is
-  Record-level only.
+- Exporting message text (`search`'s corpus) or reasoning content; this spec is
+  Record-level only. Message export is now specified separately in
+  `docs/specs/0016-message-export.md` (`export --messages`), which reuses this
+  spec's format and `--fields` plumbing.
 - Cross-Source Cost totals or model-alias resolution (permanent project
   conventions).
 - Scheduling, streaming beyond stdout, or network destinations.

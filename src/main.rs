@@ -634,14 +634,29 @@ fn run_sessions_non_tui(args: &SessionsArgs, config_path: &Option<PathBuf>) -> a
 
 fn run_export(args: ExportArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
+    let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
+    let registry = discover_sources(&config);
+    let filter = build_filter(&args)?;
+
+    if args.messages {
+        run_export_messages(&args, &registry, &filter)
+    } else {
+        run_export_records(&args, &registry, &filter)
+    }
+}
+
+/// Record-level export: one row per Session. This is the original `export`
+/// behavior and is unchanged by the message path.
+fn run_export_records(
+    args: &ExportArgs,
+    registry: &Registry,
+    filter: &Filter,
+) -> anyhow::Result<()> {
     let fields = llmhelper::export::ExportOptions::resolve(&args.fields)?;
     let opts = ExportOptions {
         format: args.format.into(),
         fields,
     };
-    let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
-    let registry = discover_sources(&config);
-    let filter = build_filter(&args)?;
     let (records, source_statuses) = registry.load_all();
     for status in &source_statuses {
         if let Some(err) = &status.error {
@@ -652,6 +667,40 @@ fn run_export(args: ExportArgs, config_path: &Option<PathBuf>) -> anyhow::Result
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     llmhelper::export::render(&filtered, &opts, &mut lock)?;
+    Ok(())
+}
+
+/// Message-level export (`export --messages`): one row per transcript message,
+/// the corpus `search` reads. Fields resolve against the message set;
+/// `--role` narrows by an exact, case-insensitive role match.
+fn run_export_messages(
+    args: &ExportArgs,
+    registry: &Registry,
+    filter: &Filter,
+) -> anyhow::Result<()> {
+    let fields = llmhelper::export::MessageExportOptions::resolve(&args.fields)?;
+    let opts = llmhelper::export::MessageExportOptions {
+        format: args.format.into(),
+        fields,
+    };
+    let (messages, statuses) = registry.load_messages_all();
+    for status in &statuses {
+        if let Some(err) = &status.error {
+            eprintln!("warn: source {} error: {}", status.name, err);
+        }
+    }
+    let role = args.role.as_deref().map(|r| r.to_lowercase());
+    let filtered: Vec<Message> = messages
+        .into_iter()
+        .filter(|m| filter.matches_message(m))
+        .filter(|m| match &role {
+            Some(want) => m.role.to_lowercase() == *want,
+            None => true,
+        })
+        .collect();
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    llmhelper::export::render_messages(&filtered, &opts, &mut lock)?;
     Ok(())
 }
 

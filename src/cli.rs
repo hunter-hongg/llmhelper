@@ -1011,12 +1011,26 @@ pub struct ExportArgs {
     /// to every field in canonical order.
     #[arg(long = "fields", value_delimiter = ',')]
     pub fields: Vec<String>,
+
+    /// Export one row per transcript message instead of one row per session.
+    /// This is the corpus `search` reads; `--fields` then resolves against the
+    /// message field set (`source,session_id,project,model,role,timestamp,text`).
+    #[arg(long = "messages")]
+    pub messages: bool,
+
+    /// Only include messages with this role (e.g. user, assistant, thinking).
+    /// Requires --messages.
+    #[arg(long = "role")]
+    pub role: Option<String>,
 }
 
 impl ExportArgs {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.since.is_some() && self.last.is_some() {
             anyhow::bail!("--since and --last are mutually exclusive");
+        }
+        if self.role.is_some() && !self.messages {
+            anyhow::bail!("--role requires --messages");
         }
         Ok(())
     }

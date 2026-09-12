@@ -153,7 +153,36 @@ per-Record and never summed, and is `null` / an empty cell for Sources that
 record no spend (Claude Code). Source-load errors print a `warn:` line on
 stderr and never abort the export.
 
-Flags: `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db`, `--since`/`--last`, `--project`, `--model`, `--source`, `--format jsonl|json|csv|tsv`, `--fields`.
+#### Exporting message text
+
+`--messages` flips the unit of export from Session to transcript message — the
+same corpus [`search`](#search) reads, but with no query, so you get the whole
+thing. One row per message, in the same `--format`s, with `--fields` resolving
+against the **message** field set instead of the session one.
+```bash
+llmhelper export --messages --last 7d --role assistant   # every assistant reply this week
+llmhelper export --messages --fields session_id,role,text --format jsonl
+llmhelper export --messages --source claude --format csv
+```
+The message fields, in canonical order: `source`, `session_id`, `project`,
+`model`, `role`, `timestamp`, `text`. `role` is a new filter that narrows to one
+role (e.g. `user`, `assistant`, `thinking`); it requires `--messages` and is a
+case-insensitive exact match.
+
+Rows are grouped by `(source, session_id)` ascending and, within a session,
+ordered chronologically with a timestamp-less message sorted last — messages
+read as a transcript, so they come out in the order they happened. `model` and
+`timestamp` are `null` / an empty cell when the Source did not record them.
+Time filters fail closed: a message with no timestamp is excluded by
+`--since`/`--last` rather than admitted. `--fields` with a session-only name
+(e.g. `cost`) exits 1 naming it as invalid for messages, and vice versa.
+
+Tool-result and tool-use rows are excluded from the corpus, matching `search`.
+As with session export, a zero-match filter exits 0 (`[]` for JSON, a header
+row for CSV/TSV, nothing for JSONL), and Source errors warn on stderr without
+aborting.
+
+Flags: `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db`, `--since`/`--last`, `--project`, `--model`, `--source`, `--format jsonl|json|csv|tsv`, `--fields`, `--messages`, `--role`.
 
 ## Sources
 
@@ -241,4 +270,4 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 ## Specs
-See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export and budget specifications. Architecture notes in `docs/adr/`.
+See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget and message-export specifications. Architecture notes in `docs/adr/`.
