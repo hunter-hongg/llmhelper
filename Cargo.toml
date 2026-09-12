@@ -23,5 +23,10 @@ anyhow = "1"
 parking_lot = "0.12"
 reqwest = { version = "0.11", features = ["json", "stream"] }
 
+# Restore the default SIGPIPE disposition on Unix so `llmhelper ... | head`
+# terminates quietly instead of panicking on the first failed stdout write.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

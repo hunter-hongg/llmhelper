@@ -939,6 +939,7 @@ dependencies = [
  "csv",
  "dirs",
  "futures-util",
+ "libc",
  "parking_lot",
  "ratatui",
  "reqwest",

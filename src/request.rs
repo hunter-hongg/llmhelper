@@ -190,16 +190,26 @@ impl RequestSettings {
     }
 }
 
-/// Send the Chat Completions request and extract the fields the CLI/TUI
-/// need from the provider response. Non-2xx responses carry the body
-/// snippet in the error message.
-pub async fn send_chat_completion(
+/// Build the POST request for the Chat Completions endpoint, shared by the
+/// one-shot and streaming senders so the URL and auth wiring cannot drift.
+///
+/// `streaming` selects the client timeout policy: a one-shot request bounds
+/// the whole exchange with `timeout`, while a streaming request must stay
+/// open for as long as the server emits events and therefore only bounds the
+/// initial connection.
+fn build_request(
     settings: &RequestSettings,
     payload: &Value,
-) -> Result<RequestResponse, RequestError> {
+    streaming: bool,
+) -> Result<reqwest::RequestBuilder, RequestError> {
     let endpoint = format!("{}/v1/chat/completions", settings.base_url);
-    let client = reqwest::Client::builder()
-        .timeout(settings.timeout)
+    let builder = reqwest::Client::builder();
+    let builder = if streaming {
+        builder.connect_timeout(settings.timeout)
+    } else {
+        builder.timeout(settings.timeout)
+    };
+    let client = builder
         .build()
         .map_err(|e| RequestError::Client(format!("failed to set up HTTP client: {e}")))?;
     let mut req = client
@@ -209,6 +219,17 @@ pub async fn send_chat_completion(
     if let Some(key) = &settings.api_key {
         req = req.header("Authorization", format!("Bearer {}", key));
     }
+    Ok(req)
+}
+
+/// Send the Chat Completions request and extract the fields the CLI/TUI
+/// need from the provider response. Non-2xx responses carry the body
+/// snippet in the error message.
+pub async fn send_chat_completion(
+    settings: &RequestSettings,
+    payload: &Value,
+) -> Result<RequestResponse, RequestError> {
+    let req = build_request(settings, payload, false)?;
     let resp = req.send().await.map_err(|e| {
         RequestError::Client(format!(
             "failed to send request to OpenAI-compatible endpoint: {e}"
@@ -264,6 +285,33 @@ pub fn event_channel(event: &Value, reasoning_fields: &[String]) -> Option<&'sta
     None
 }
 
+/// Accumulates the observable state of an SSE stream: concatenated answer
+/// content, concatenated reasoning text from each configured field path, and
+/// the last usage object seen. Kept separate from the transport so the same
+/// fold applies to live chunks and to whatever `SseParser::finish` returns.
+#[derive(Default)]
+struct StreamAccumulator {
+    content: String,
+    reasoning: String,
+    usage: Option<Value>,
+}
+
+impl StreamAccumulator {
+    fn feed(&mut self, event: &Value, reasoning_fields: &[String]) {
+        if let Some(delta) = extract_delta_content(event) {
+            self.content.push_str(&delta);
+        }
+        for field in reasoning_fields {
+            if let Some(r) = extract_text_by_path(event, field) {
+                self.reasoning.push_str(&r);
+            }
+        }
+        if let Some(u) = extract_stream_usage(event) {
+            self.usage = Some(u);
+        }
+    }
+}
+
 /// Stream a Chat Completions request, feeding each parsed SSE event to `on_event`.
 /// The function returns the final HTTP status, the last usage object seen, and the
 /// concatenated content accumulated from all `delta.content` events.
@@ -276,18 +324,7 @@ where
     F: FnMut(Value),
 {
     use futures_util::StreamExt;
-    let endpoint = format!("{}/v1/chat/completions", settings.base_url);
-    let client = reqwest::Client::builder()
-        .connect_timeout(settings.timeout)
-        .build()
-        .map_err(|e| RequestError::Client(format!("failed to set up HTTP client: {e}")))?;
-    let mut req = client
-        .post(&endpoint)
-        .header("Content-Type", "application/json")
-        .json(payload);
-    if let Some(key) = &settings.api_key {
-        req = req.header("Authorization", format!("Bearer {}", key));
-    }
+    let req = build_request(settings, payload, true)?;
     let resp = req.send().await.map_err(|e| {
         RequestError::Client(format!(
             "failed to send request to OpenAI-compatible endpoint: {e}"
@@ -304,28 +341,15 @@ where
     }
     let mut stream = resp.bytes_stream();
     let mut parser = SseParser::new();
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut usage = None;
+    let mut acc = StreamAccumulator::default();
     loop {
         let maybe_chunk = stream.next().await;
         match maybe_chunk {
             Some(Ok(chunk)) => {
                 let text = String::from_utf8_lossy(&chunk);
-                let events = parser.feed(&text);
-                for event in events {
+                for event in parser.feed(&text) {
                     on_event(event.clone());
-                    if let Some(delta) = extract_delta_content(&event) {
-                        content.push_str(&delta);
-                    }
-                    for field in &settings.reasoning_fields {
-                        if let Some(r) = extract_text_by_path(&event, field) {
-                            reasoning.push_str(&r);
-                        }
-                    }
-                    if let Some(u) = extract_stream_usage(&event) {
-                        usage = Some(u);
-                    }
+                    acc.feed(&event, &settings.reasoning_fields);
                 }
             }
             Some(Err(e)) => {
@@ -334,26 +358,15 @@ where
             None => break,
         }
     }
-    let final_events = parser.finish();
-    for event in final_events {
+    for event in parser.finish() {
         on_event(event.clone());
-        if let Some(delta) = extract_delta_content(&event) {
-            content.push_str(&delta);
-        }
-        for field in &settings.reasoning_fields {
-            if let Some(r) = extract_text_by_path(&event, field) {
-                reasoning.push_str(&r);
-            }
-        }
-        if let Some(u) = extract_stream_usage(&event) {
-            usage = Some(u);
-        }
+        acc.feed(&event, &settings.reasoning_fields);
     }
     Ok(StreamResponse {
         status: status_code,
-        usage,
-        content,
-        reasoning,
+        usage: acc.usage,
+        content: acc.content,
+        reasoning: acc.reasoning,
     })
 }
 
@@ -459,23 +472,14 @@ pub fn load_tools_file(path: &std::path::Path) -> anyhow::Result<Value> {
 
 /// Resolve a flag-supplied path relative to the loaded config file's
 /// directory, so a `--config some/dir/config.toml` can carry `--reasoning
-/// thinking.json` meaning the file next to that config. An absolute path, or
-/// no existing config file, leaves the candidate untouched (relative to the
-/// working directory).
+/// thinking.json` meaning the file next to that config. Delegates to the
+/// shared resolver so flags and config-file values interpret paths the same
+/// way.
 pub fn resolve_path_against_config(
     config_path: Option<&std::path::Path>,
     candidate: std::path::PathBuf,
 ) -> std::path::PathBuf {
-    if candidate.is_absolute() {
-        return candidate;
-    }
-    match config_path {
-        Some(p) if p.exists() => match p.parent() {
-            Some(dir) => dir.join(candidate),
-            None => candidate,
-        },
-        _ => candidate,
-    }
+    crate::config::resolve_against_config(config_path, candidate)
 }
 
 /// Load a reasoning configuration file: a JSON object. The object is returned

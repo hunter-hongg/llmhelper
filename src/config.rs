@@ -189,24 +189,63 @@ struct RequestConfig {
     reasoning: Option<PathBuf>,
 }
 
-/// Resolve a path that appeared inside a config file. A relative path is
+/// Resolve a path against the directory of a config file. A relative path is
 /// interpreted relative to the config file's own directory, so a config and
 /// the files it references can be moved together; an absolute path is left
-/// alone.
-fn resolve_relative(config_path: &std::path::Path, candidate: PathBuf) -> PathBuf {
+/// alone, as is a candidate when there is no config file to anchor against
+/// (or the referenced config path does not exist).
+///
+/// Shared by config-file values and by `--reasoning`/`--tools` flags resolved
+/// against a `--config`, so both interpret paths identically.
+pub fn resolve_against_config(
+    config_path: Option<&std::path::Path>,
+    candidate: PathBuf,
+) -> PathBuf {
     if candidate.is_absolute() {
         return candidate;
     }
-    match config_path.parent() {
-        Some(dir) => dir.join(candidate),
-        None => candidate,
+    match config_path {
+        Some(p) if p.exists() => match p.parent() {
+            Some(dir) => dir.join(candidate),
+            None => candidate,
+        },
+        _ => candidate,
     }
+}
+
+/// Resolve a path that appeared inside a config file. The config file exists
+/// by construction, so this is `resolve_against_config` with a guaranteed
+/// anchor.
+fn resolve_relative(config_path: &std::path::Path, candidate: PathBuf) -> PathBuf {
+    resolve_against_config(Some(config_path), candidate)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn resolve_against_config_handles_anchor_presence() {
+        let dir = tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let rel = PathBuf::from("thinking.json");
+        let abs = PathBuf::from("/abs/thinking.json");
+
+        // Existing config anchors a relative path next to it.
+        assert_eq!(
+            resolve_against_config(Some(&cfg), rel.clone()),
+            dir.path().join("thinking.json")
+        );
+        // Absolute paths are never re-anchored.
+        assert_eq!(resolve_against_config(Some(&cfg), abs.clone()), abs);
+        // A config path that does not exist leaves the candidate alone.
+        let missing = dir.path().join("nope.toml");
+        assert_eq!(resolve_against_config(Some(&missing), rel.clone()), rel);
+        // No config at all leaves the candidate alone.
+        assert_eq!(resolve_against_config(None, rel.clone()), rel);
+    }
 
     #[test]
     fn config_loads_from_file() {

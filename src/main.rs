@@ -1864,7 +1864,26 @@ fn run_request_tui(
     Ok(view)
 }
 
+/// Restore the default `SIGPIPE` disposition on Unix.
+///
+/// The Rust runtime ignores `SIGPIPE`, which turns a closed downstream pipe
+/// (e.g. `llmhelper sessions --json | head`) into a panic-on-write with a
+/// stack trace. Resetting the handler makes the process die from `SIGPIPE`
+/// like any other Unix filter, so truncating the consumer exits quietly.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: setting a signal disposition to the default handler is
+    // async-signal-safe and has no preconditions beyond a valid signal number.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 fn main() -> anyhow::Result<()> {
+    restore_default_sigpipe();
     let cli = Cli::parse();
     let config_path = cli.config;
     match cli.command {

@@ -1589,3 +1589,31 @@ fn usage_rejects_bad_budget_syntax() {
     let output = cmd.output().expect("failed to run usage");
     assert!(!output.status.success());
 }
+
+#[test]
+#[cfg(unix)]
+fn truncating_pipe_does_not_panic() {
+    // A downstream reader that closes early (`| head -1`) must not turn the
+    // first failed stdout write into a panic-with-stack-trace. The binary
+    // should die from SIGPIPE (or exit cleanly) with no "panicked" message.
+    let bin = bin();
+    let script = format!(
+        "{} export --last 3650d --claude-dir {} --opencode-db {} --omp-dir {} --kilo-db {} 2>/tmp/llmhelper_pipe_stderr.txt | head -1 >/dev/null; cat /tmp/llmhelper_pipe_stderr.txt",
+        bin.display(),
+        fixture_dir().join("claude").display(),
+        fixture_dir().join("opencode").join("opencode.db").display(),
+        fixture_dir().join("omp").display(),
+        fixture_dir().join("kilo").join("kilo.db").display(),
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("failed to run pipeline");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stderr, String::from_utf8_lossy(&output.stdout));
+    assert!(
+        !combined.contains("panicked") && !combined.contains("Broken pipe"),
+        "truncating the output pipe should not panic; saw: {combined}"
+    );
+}
