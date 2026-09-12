@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::domain::message::Message;
 use crate::domain::record::Record;
+use crate::domain::window::{window_bounds, WindowMode};
 
 /// Pre-aggregation filters applied to a record set.
 /// All predicates AND-combine; an empty filter passes everything through.
@@ -32,6 +33,30 @@ impl Filter {
             ..Self::default()
         }
     }
+}
+
+/// Apply `mode`'s window, resolved at `now`, on top of a command's
+/// non-temporal predicates. Returns `None` only when a calendar bucket cannot
+/// be anchored (an impossible local midnight, e.g. a DST gap). `mode == None`
+/// means "no time bound" and yields the base filter unchanged.
+///
+/// `now` is a parameter rather than a clock read so callers can rebuild the
+/// window on every load: a calendar bucket then stays pinned to local midnight
+/// while `now` advances, instead of drifting with the current clock time.
+pub fn window_filter(
+    base: &Filter,
+    mode: Option<WindowMode>,
+    now: DateTime<Utc>,
+) -> Option<Filter> {
+    let Some(mode) = mode else {
+        return Some(base.clone());
+    };
+    let (since, until) = window_bounds(mode, now)?;
+    Some(Filter {
+        since: Some(since),
+        until: Some(until),
+        ..base.clone()
+    })
 }
 
 impl Filter {
@@ -328,5 +353,82 @@ mod tests {
             ..Default::default()
         };
         assert!(!since_f.matches_message(&message("a", "/p", None, None)));
+    }
+
+    /// A local-wall-clock instant on the machine's own timezone, converted to
+    /// UTC. Expectations derive from `Local`, so they hold on any machine.
+    fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        use chrono::{Local, TimeZone};
+        Local
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .single()
+            .or_else(|| Local.with_ymd_and_hms(y, mo, d, h, mi, 0).earliest())
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn window_filter_without_mode_leaves_base_unchanged() {
+        let base = Filter {
+            project: Some("proj".to_string()),
+            ..Default::default()
+        };
+        let got = window_filter(&base, None, local(2026, 9, 12, 20, 20)).unwrap();
+        assert_eq!(got.since, None);
+        assert_eq!(got.until, None);
+        assert_eq!(got.project.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn window_filter_rolling_spans_now_minus_last() {
+        let now = local(2026, 9, 12, 20, 20);
+        let last = chrono::Duration::hours(6);
+        let got = window_filter(&Filter::none(), Some(WindowMode::Rolling { last }), now).unwrap();
+        assert_eq!(got.since, Some(now - last));
+        assert_eq!(got.until, Some(now));
+    }
+
+    #[test]
+    fn window_filter_calendar_opens_at_local_midnight() {
+        let now = local(2026, 9, 12, 20, 20);
+        let got =
+            window_filter(&Filter::none(), Some(WindowMode::Calendar { days: 1 }), now).unwrap();
+        assert_eq!(got.since, Some(local(2026, 9, 12, 0, 0)));
+        assert_eq!(got.until, Some(now));
+    }
+
+    /// The whole point of carrying `WindowMode` instead of a pre-built window:
+    /// as the TUI refreshes and `now` advances past local midnight, the bucket
+    /// re-anchors to the *new* day rather than sliding with the clock.
+    #[test]
+    fn window_filter_rebuilds_a_calendar_bucket_per_load() {
+        let before_midnight = local(2026, 9, 12, 23, 59);
+        let after_midnight = local(2026, 9, 13, 0, 1);
+        let mode = Some(WindowMode::Calendar { days: 1 });
+
+        let first = window_filter(&Filter::none(), mode, before_midnight).unwrap();
+        let second = window_filter(&Filter::none(), mode, after_midnight).unwrap();
+
+        assert_eq!(first.since, Some(local(2026, 9, 12, 0, 0)));
+        assert_eq!(second.since, Some(local(2026, 9, 13, 0, 0)));
+        assert_ne!(first.since, second.since);
+    }
+
+    #[test]
+    fn window_filter_keeps_base_predicates() {
+        let base = Filter {
+            project: Some("proj".to_string()),
+            source: Some("claude".to_string()),
+            ..Default::default()
+        };
+        let got = window_filter(
+            &base,
+            Some(WindowMode::Calendar { days: 7 }),
+            local(2026, 9, 12, 20, 20),
+        )
+        .unwrap();
+        assert_eq!(got.project.as_deref(), Some("proj"));
+        assert_eq!(got.source.as_deref(), Some("claude"));
+        assert_eq!(got.since, Some(local(2026, 9, 6, 0, 0)));
     }
 }

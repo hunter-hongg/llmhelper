@@ -904,6 +904,210 @@ fn diff_calendar_rejects_a_rolling_duration_for_prev() {
     assert!(stderr.contains("2d"), "stderr was: {stderr}");
 }
 
+// --- calendar-aligned usage / report tests ---
+
+/// Run `llmhelper usage --json` against a fixture base that contains only a
+/// `claude` directory (built by [`build_calendar_fixture`]). Every other source
+/// is pointed at a nonexistent path under the same temp base, so no real user
+/// data leaks into the assertion.
+fn run_usage_calendar_json(base: &std::path::Path, extra_args: &[&str]) -> serde_json::Value {
+    let mut cmd = Command::new(bin());
+    cmd.args(["usage", "--json"]);
+    cmd.arg("--claude-dir").arg(base.join("claude"));
+    cmd.arg("--opencode-db").arg(base.join("absent.db"));
+    cmd.arg("--omp-dir").arg(base.join("absent-omp"));
+    cmd.arg("--kilo-db").arg(base.join("absent-kilo.db"));
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    let output = cmd.output().expect("failed to run llmhelper usage");
+    assert!(
+        output.status.success(),
+        "llmhelper usage exited with {}: stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap()
+}
+
+/// Total sessions across the *filtered* groups of a `usage --json` payload.
+///
+/// Note the `sources[].records` field counts records *loaded* per source, not
+/// records surviving the filter, so it cannot be used to observe a window.
+fn usage_total_sessions(json: &serde_json::Value) -> u64 {
+    json["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["sessions"].as_u64().unwrap())
+        .sum()
+}
+
+#[test]
+fn usage_calendar_window_selects_only_today() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    // `--calendar --last 1d` = today so far → only today's session.
+    let json = run_usage_calendar_json(dir.path(), &["--calendar", "--last", "1d"]);
+    assert_eq!(usage_total_sessions(&json), 1);
+    let groups = json["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["tokens"]["input"], 200);
+    assert_eq!(groups[0]["tokens"]["output"], 100);
+}
+
+#[test]
+fn usage_calendar_week_includes_yesterday_but_not_before() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    let json = run_usage_calendar_json(dir.path(), &["--calendar", "--last", "1w"]);
+    // The trailing 7 local days include today and yesterday.
+    assert_eq!(usage_total_sessions(&json), 2);
+}
+
+#[test]
+fn usage_without_calendar_includes_yesterday_in_a_rolling_day() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    // A rolling `2d` window always reaches back past yesterday's local midnight,
+    // so it includes the previous session — whereas the `1d` calendar window
+    // above did not. This shows the two derivations genuinely differ rather than
+    // the calendar path merely happening to match a rolling one.
+    let json = run_usage_calendar_json(dir.path(), &["--last", "2d"]);
+    assert_eq!(usage_total_sessions(&json), 2);
+}
+
+#[test]
+fn usage_calendar_rejects_a_rolling_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    let mut cmd = Command::new(bin());
+    cmd.args(["usage", "--json", "--claude-dir"])
+        .arg(dir.path().join("absent-claude"))
+        .args(["--opencode-db"])
+        .arg(dir.path().join("absent.db"))
+        .args(["--omp-dir"])
+        .arg(dir.path().join("absent-omp"))
+        .args(["--kilo-db"])
+        .arg(dir.path().join("absent-kilo.db"))
+        .args(["--calendar", "--last", "4h"]);
+    let output = cmd.output().expect("failed to run llmhelper usage");
+    assert!(!output.status.success(), "--calendar --last 4h should fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--last"), "stderr was: {stderr}");
+    assert!(stderr.contains("4h"), "stderr was: {stderr}");
+}
+
+#[test]
+fn usage_calendar_rejects_since() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    let mut cmd = Command::new(bin());
+    cmd.args(["usage", "--json", "--claude-dir"])
+        .arg(dir.path().join("absent-claude"))
+        .args(["--opencode-db"])
+        .arg(dir.path().join("absent.db"))
+        .args(["--omp-dir"])
+        .arg(dir.path().join("absent-omp"))
+        .args(["--kilo-db"])
+        .arg(dir.path().join("absent-kilo.db"))
+        .args(["--calendar", "--since", "2026-01-01T00:00:00Z"]);
+    let output = cmd.output().expect("failed to run llmhelper usage");
+    assert!(!output.status.success(), "--calendar --since should fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("mutually exclusive"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn usage_calendar_requires_last() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    let mut cmd = Command::new(bin());
+    cmd.args(["usage", "--json", "--claude-dir"])
+        .arg(dir.path().join("absent-claude"))
+        .args(["--opencode-db"])
+        .arg(dir.path().join("absent.db"))
+        .args(["--omp-dir"])
+        .arg(dir.path().join("absent-omp"))
+        .args(["--kilo-db"])
+        .arg(dir.path().join("absent-kilo.db"))
+        .arg("--calendar");
+    let output = cmd.output().expect("failed to run llmhelper usage");
+    assert!(!output.status.success(), "--calendar alone should fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("requires --last"), "stderr was: {stderr}");
+}
+
+#[test]
+fn report_calendar_header_names_the_local_midnight_anchor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let report_path = tmp.path().join("cal.md");
+    let mut cmd = Command::new(bin());
+    cmd.args(["report", "--output"])
+        .arg(&report_path)
+        .args(["--calendar", "--last", "1d"]);
+    for flag in report_source_flags() {
+        cmd.arg(flag);
+    }
+    let output = cmd.output().expect("failed to run llmhelper report");
+    assert!(
+        output.status.success(),
+        "report exited with {}: stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let md = std::fs::read_to_string(&report_path).unwrap();
+    assert!(
+        md.contains("last 1d (calendar, local midnight)"),
+        "report header missing calendar marker:\n{md}"
+    );
+}
+
+#[test]
+fn usage_calendar_matching_budget_is_not_reported_as_clipped() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+    // A `1d` budget and `--calendar --last 1d` describe the exact same window,
+    // so the report must not claim it only measured a clipped range.
+    let tmp = tempfile::tempdir().unwrap();
+    let report_path = tmp.path().join("budget.md");
+    let mut cmd = Command::new(bin());
+    cmd.args(["report", "--output"])
+        .arg(&report_path)
+        .args(["--calendar", "--last", "1d"])
+        .args(["--budget", "claude:5.00", "--budget-window", "1d"])
+        .arg("--claude-dir")
+        .arg(dir.path().join("claude"))
+        .arg("--opencode-db")
+        .arg(dir.path().join("nope.db"))
+        .arg("--omp-dir")
+        .arg(dir.path().join("nope-omp"))
+        .arg("--kilo-db")
+        .arg(dir.path().join("nope-kilo.db"));
+    let output = cmd.output().expect("failed to run llmhelper report");
+    assert!(
+        output.status.success(),
+        "report exited with {}: stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let md = std::fs::read_to_string(&report_path).unwrap();
+    assert!(md.contains("## Budget"), "budget section missing:\n{md}");
+    assert!(
+        !md.contains("only records from"),
+        "a 1d budget under --calendar --last 1d must not be flagged as clipped:\n{md}"
+    );
+}
+
 #[test]
 fn sessions_json_total_count() {
     let arr = run_sessions_json(&[]);
@@ -911,7 +1115,6 @@ fn sessions_json_total_count() {
     // 7 sessions across fixtures
     assert_eq!(sessions.len(), 7);
 }
-
 #[test]
 fn sessions_json_source_filter() {
     let arr = run_sessions_json(&["--source", "claude"]);

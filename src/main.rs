@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use llmhelper::cli::{
     merge_source_paths, BudgetArgs, Cli, Command, DiffArgs, ExportArgs, FilterArgs, ReportArgs,
-    RequestArgs, SearchArgs, SessionsArgs, UsageArgs,
+    RequestArgs, SearchArgs, SessionsArgs, UsageArgs, WindowArgs,
 };
 use llmhelper::config::Config;
 use llmhelper::diff::{compute_diff, fmt_window_len, window_pair, DiffMode};
@@ -18,7 +18,7 @@ use llmhelper::domain::group::GroupBy;
 use llmhelper::domain::message::Message;
 use llmhelper::domain::record::Record;
 use llmhelper::export::ExportOptions;
-use llmhelper::filter::Filter;
+use llmhelper::filter::{window_filter, Filter};
 use llmhelper::output::{format_tokens, render_diff_csv, render_diff_json, OutputRenderer};
 use llmhelper::report::{render_report, ReportMeta};
 use llmhelper::search::{search, SearchHit, SearchOptions};
@@ -39,19 +39,33 @@ struct TuiData {
     budgets: Vec<llmhelper::budget::EvaluatedBudget>,
 }
 
+/// Load and aggregate one frame of `usage` TUI data.
+///
+/// The window is rebuilt from `mode` at a single `now` read *per load*, so a
+/// calendar bucket stays pinned to local midnight while the clock advances (a
+/// session left open across midnight rolls into the new day's bucket rather
+/// than freezing at the window captured at startup). The same `now` is handed
+/// to the budget evaluation, so a budget whose window equals the command's is
+/// not spuriously flagged as clipped.
 fn load_usage_data(
     registry: &Registry,
-    filter: &Filter,
+    base_filter: &Filter,
+    mode: Option<llmhelper::domain::window::WindowMode>,
     group_by: GroupBy,
     budgets: &[llmhelper::budget::Budget],
-    command_since: Option<DateTime<Utc>>,
 ) -> TuiData {
+    let now = Utc::now();
+    let command_since = match mode {
+        Some(m) => llmhelper::domain::window::window_bounds(m, now).map(|(since, _)| since),
+        None => None,
+    };
+    let filter = window_filter(base_filter, mode, now).unwrap_or_else(|| base_filter.clone());
     let (records, statuses) = registry.load_all();
     let filtered: Vec<Record> = filter.apply(&records).into_iter().cloned().collect();
     let filtered_refs: Vec<&Record> = filtered.iter().collect();
     let agg = AggregateResult::from_filtered_refs(&filtered_refs, group_by);
     let evaluated =
-        llmhelper::budget::evaluate_with_measurement(budgets, &records, Utc::now(), command_since);
+        llmhelper::budget::evaluate_with_measurement(budgets, &records, now, command_since);
     TuiData {
         records: filtered,
         result: Some(agg),
@@ -113,34 +127,51 @@ fn build_filter<A: FilterArgs>(args: &A) -> anyhow::Result<Filter> {
     })
 }
 
+/// The non-temporal predicates shared by every read-only command, with **no**
+/// time bound. `usage`/`report` derive their window separately (see
+/// [`llmhelper::filter::window_filter`]) so a calendar bucket can be
+/// re-anchored on each load.
+fn base_filter<A: FilterArgs>(args: &A) -> Filter {
+    Filter {
+        since: None,
+        last: None,
+        until: None,
+        project: args.project().map(str::to_string),
+        model: args.model().map(str::to_string),
+        source: args.source().map(|s| s.to_string()),
+        fail_open: args.fail_open(),
+    }
+}
+
 /// The lower bound of the command's own time filter, in UTC, resolved against
 /// a caller-supplied `now`. Passing `now` in (rather than reading the clock
 /// here) keeps it identical to the `now` used to evaluate budgets, so a budget
 /// whose window equals the command's `--last` window is not spuriously reported
 /// as clipped by a few microseconds of clock drift.
-fn command_since<A: FilterArgs>(
+///
+/// In calendar mode this is the bucket's local-midnight start — the same
+/// instant `window_filter` uses — so a `1d` budget under `--calendar --last 1d`
+/// is measured over exactly the loaded window.
+fn command_since<A: WindowArgs>(
     args: &A,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Option<DateTime<Utc>>> {
     if let Some(since) = args.since() {
         return Ok(Some(since));
     }
-    match args.parse_last()? {
-        Some(d) => {
-            let d = chrono::Duration::from_std(d)?;
-            Ok(Some(now - d))
-        }
-        None => Ok(None),
-    }
+    let Some(mode) = args.window_mode()? else {
+        return Ok(None);
+    };
+    Ok(llmhelper::domain::window::window_bounds(mode, now).map(|(since, _)| since))
 }
 
 fn run_tui(
     registry: Registry,
-    filter: Filter,
+    base_filter: Filter,
+    mode: Option<llmhelper::domain::window::WindowMode>,
     group_by: GroupBy,
     refresh_secs: u64,
     budgets: Vec<llmhelper::budget::Budget>,
-    command_since: Option<DateTime<Utc>>,
 ) -> anyhow::Result<()> {
     let rt = Runtime::new()?;
 
@@ -157,7 +188,7 @@ fn run_tui(
     // Background refresh task
     let reg_arc = Arc::new(registry);
     let reg_for_task = reg_arc.clone();
-    let filter_clone = filter.clone();
+    let filter_clone = base_filter.clone();
     let budgets_for_task = Arc::new(budgets);
     let budgets_clone = budgets_for_task.clone();
     rt.spawn(async move {
@@ -168,9 +199,9 @@ fn run_tui(
             let data = load_usage_data(
                 &reg_for_task,
                 &filter_clone,
+                mode,
                 *group_by_clone.lock(),
                 &budgets_clone,
-                command_since,
             );
             // Bounded channel(1): drop stale data if TUI is busy
             let _ = tx.send(data).await;
@@ -184,10 +215,10 @@ fn run_tui(
     // Initial load
     let initial = load_usage_data(
         &reg_arc,
-        &filter,
+        &base_filter,
+        mode,
         tui.state.app.group_by,
         &budgets_for_task,
-        command_since,
     );
     tui.state.apply_data(
         initial.records,
@@ -233,10 +264,10 @@ fn run_tui(
                     crossterm::event::KeyCode::Char('r') => {
                         let data = load_usage_data(
                             &reg_arc,
-                            &filter,
+                            &base_filter,
+                            mode,
                             *group_by.lock(),
                             &budgets_for_task,
-                            command_since,
                         );
                         tui.state.apply_data(
                             data.records,
@@ -250,10 +281,10 @@ fn run_tui(
                         *group_by.lock() = tui.state.app.group_by;
                         let data = load_usage_data(
                             &reg_arc,
-                            &filter,
+                            &base_filter,
+                            mode,
                             tui.state.app.group_by,
                             &budgets_for_task,
-                            command_since,
                         );
                         tui.state.apply_data(
                             data.records,
@@ -1049,7 +1080,15 @@ fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
     let group_by: GroupBy = args.group_by.clone().into();
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
     let registry = discover_sources(&config);
-    let filter = build_filter(&args)?;
+
+    // The window is derived, not baked into the filter: `--calendar` re-anchors
+    // the bucket to local midnight on every load (the TUI path), and the
+    // non-temporal predicates stay constant.
+    let base = base_filter(&args);
+    let mode = args.window_mode()?;
+    let now = Utc::now();
+    let filter = window_filter(&base, mode, now)
+        .ok_or_else(|| anyhow::anyhow!("could not anchor the calendar window to local midnight"))?;
 
     // Resolve and validate budgets before branching on output format: a bad
     // budget flag is a user error regardless of whether the annotation is
@@ -1069,17 +1108,13 @@ fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
         renderer.csv(&agg.groups, &mut buf)?;
         println!("{}", String::from_utf8(buf)?);
     } else {
-        // Resolve the command's own lower bound against the same `now` the TUI
-        // will use for budget windows, so an equal-width window is not flagged
-        // as clipped by the microseconds between two clock reads.
-        let now = Utc::now();
         run_tui(
             registry,
-            filter,
+            base,
+            mode,
             group_by,
             config.refresh_interval_seconds,
             budgets,
-            command_since(&args, now)?,
         )?;
     }
     Ok(())
@@ -1144,7 +1179,13 @@ fn run_diff(args: DiffArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()>
 /// non-temporal filters that were applied.
 fn report_meta(args: &ReportArgs) -> ReportMeta {
     let window = if let Some(last) = &args.last {
-        format!("last {}", last)
+        if args.calendar {
+            // The bucket is a partial local day, so a duration would misstate
+            // it; name the keyword and the anchoring instead.
+            format!("last {} (calendar, local midnight)", last)
+        } else {
+            format!("last {}", last)
+        }
     } else if let Some(since) = args.since {
         format!("since {}", since.to_rfc3339())
     } else {
@@ -1174,23 +1215,24 @@ fn run_report(args: ReportArgs, config_path: &Option<PathBuf>) -> anyhow::Result
     let group_by: GroupBy = args.group_by.clone().into();
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
     let registry = discover_sources(&config);
-    let filter = build_filter(&args)?;
+    let base = base_filter(&args);
+    let mode = args.window_mode()?;
+
+    // One clock read for the whole run: the command's own window bound and the
+    // budgets' windows must be measured against the same `now`, otherwise a
+    // budget whose window equals the command's is flagged as clipped by the few
+    // microseconds between two `now()` calls.
+    let now = Utc::now();
+    let filter = window_filter(&base, mode, now)
+        .ok_or_else(|| anyhow::anyhow!("could not anchor the calendar window to local midnight"))?;
+    let command_since = command_since(&args, now)?;
 
     let (records, source_statuses) = registry.load_all();
     let agg = AggregateResult::from_records(&records, &filter, group_by);
     let meta = report_meta(&args);
     let budgets = args.resolve_budgets(&config.budgets)?;
-    // One clock read for the whole run: the command's own `--last` bound and the
-    // budgets' windows must be measured against the same `now`, otherwise a
-    // budget whose window equals the command's is flagged as clipped by the few
-    // microseconds between two `now()` calls.
-    let now = Utc::now();
-    let evaluated = llmhelper::budget::evaluate_with_measurement(
-        &budgets,
-        &records,
-        now,
-        command_since(&args, now)?,
-    );
+    let evaluated =
+        llmhelper::budget::evaluate_with_measurement(&budgets, &records, now, command_since);
     let markdown = render_report(&agg, &meta, &source_statuses, args.top, &evaluated);
     match args.output {
         Some(path) => std::fs::write(&path, markdown)

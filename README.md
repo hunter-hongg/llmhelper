@@ -12,6 +12,13 @@ llmhelper usage --project myproj --model auto --json
 ```
 Flags: `--since/--last`, `--project`, `--model`, `--source`, `--group-by source|project|model`, `--json/--csv`, `--budget <source:amount>` (repeatable), `--budget-window <spec>`, `--budget-name <name>` (repeatable).
 
+With `--calendar`, `--last` snaps to a local-calendar bucket instead of a rolling duration, and takes calendar keywords only — `1d` (today), `1w` (the trailing 7 local days), `1mo` (30 days). A rolling duration such as `--last 4h` is rejected in calendar mode.
+```bash
+llmhelper usage --calendar --last 1d --group-by source
+llmhelper usage --calendar --last 1w --json
+```
+Because the bucket is anchored at local midnight, the live TUI keeps showing *today* as the clock advances: each refresh re-anchors to the new day rather than sliding the window forward. `--calendar --last 1d` measures exactly the records a `1d` budget evaluates, so a matching budget is never flagged as clipped (see [Budgets](#budgets)).
+
 ### diff
 Sliding-window comparison between two periods.
 ```bash
@@ -49,10 +56,13 @@ Shareable Markdown summary with an interactive viewer.
 llmhelper report --last 7d --group-by project --top 10
 llmhelper report --since 2026-08-01 --source claude --model auto
 llmhelper report --last 7d --title "Team weekly LLM usage" --output weekly.md
+llmhelper report --calendar --last 1d --output today.md
 ```
 Without `--output`, `report` opens an interactive TUI that renders the Markdown report: scroll with `↑↓`/`j k` or PgUp/PgDn, jump with `g`/`G` (top/bottom), quit with `q`. The header shows the scroll position (`lines X-Y of N`).
 
 With `--output <path>` the report is written to the file instead (stdout stays empty), suitable for pasting into chat/PR/notes or committing. Header includes generation time, window and applied filters. Totals, per-source Cost, and a grouped usage table are rendered. `--top n` truncates the groups table with a `(+ k more …)` summary line; `--title <string>` replaces the default `# llmhelper report` heading.
+
+As with `usage`, `--calendar` snaps `--last` to a local-calendar bucket (`1d`/`1w`/`1mo`) anchored at local midnight; the generated header marks the window as `last <kw> (calendar, local midnight)`.
 
 Cost is source-scoped and never summed across sources.
 
@@ -286,4 +296,4 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 ## Specs
-See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget and message-export specifications. Architecture notes in `docs/adr/`.
+See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget, message-export, diff-calendar and usage-report-calendar specifications. Architecture notes in `docs/adr/`.

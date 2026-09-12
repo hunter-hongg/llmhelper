@@ -52,6 +52,64 @@ pub trait SourcePathArgs {
     fn kilo_db(&self) -> Option<&Vec<PathBuf>>;
 }
 
+/// The single-window scoping flags shared by the commands that take one time
+/// window (`usage`, `report`).
+///
+/// Both accept `--last`, optionally aligned to a calendar bucket with
+/// `--calendar`. Implementing this trait makes both commands derive their
+/// window the same way and reject the same conflicting combinations, so the two
+/// cannot drift.
+pub trait WindowArgs {
+    fn last(&self) -> Option<&str>;
+    fn since(&self) -> Option<DateTime<Utc>>;
+    fn calendar(&self) -> bool;
+
+    /// Validate the flag combination: `--since` and `--last` are mutually
+    /// exclusive, and `--calendar` names a lower bound of its own so it cannot
+    /// be combined with `--since` and must have a `--last` to anchor.
+    fn validate_window(&self) -> anyhow::Result<()> {
+        if self.since().is_some() && self.last().is_some() {
+            anyhow::bail!("--since and --last are mutually exclusive");
+        }
+        if self.calendar() {
+            if self.since().is_some() {
+                anyhow::bail!("--calendar and --since are mutually exclusive");
+            }
+            if self.last().is_none() {
+                anyhow::bail!("--calendar requires --last");
+            }
+        }
+        Ok(())
+    }
+
+    /// The window the command scopes its records to, resolved against `now`.
+    ///
+    /// Rolling mode parses `--last` as a duration (`7d`, `4h`). Calendar mode
+    /// accepts only the keywords shared with `budget` (`1d`/`1w`/`1mo`): a
+    /// rolling duration has no calendar meaning and is a loud error rather than
+    /// a silently misaligned window.
+    ///
+    /// Returns `None` when no window is requested (no `--last`).
+    fn window_mode(&self) -> anyhow::Result<Option<crate::domain::window::WindowMode>> {
+        let Some(last) = self.last() else {
+            return Ok(None);
+        };
+        if self.calendar() {
+            let days = crate::domain::window::calendar_days(last).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --last for --calendar: '{}' (expected calendar window: 1d, 1w, 1mo)",
+                    last
+                )
+            })?;
+            Ok(Some(crate::domain::window::WindowMode::Calendar { days }))
+        } else {
+            let d = parse_duration(last).map_err(|e| anyhow::anyhow!("invalid --last {}", e))?;
+            let d = chrono::Duration::from_std(d)?;
+            Ok(Some(crate::domain::window::WindowMode::Rolling { last: d }))
+        }
+    }
+}
+
 /// Apply CLI source-path overrides on top of a loaded config, with the CLI
 /// winning. Every non-overridden key is passed through untouched.
 pub fn merge_source_paths<A: SourcePathArgs>(
@@ -260,6 +318,14 @@ pub struct UsageArgs {
     #[arg(long = "last")]
     pub last: Option<String>,
 
+    /// Align the window to a local calendar bucket instead of a rolling
+    /// duration. With this flag `--last` must be a calendar keyword (`1d` =
+    /// today, `1w` = the trailing 7 local days, `1mo` = 30): the window runs
+    /// from the bucket's local-midnight start to now, so `--calendar --last 1d`
+    /// selects exactly the records a `1d` budget evaluates.
+    #[arg(long = "calendar")]
+    pub calendar: bool,
+
     /// Filter by project path substring.
     #[arg(long = "project")]
     pub project: Option<String>,
@@ -316,10 +382,20 @@ impl UsageArgs {
         if self.json && self.csv {
             anyhow::bail!("--json and --csv are mutually exclusive");
         }
-        if self.since.is_some() && self.last.is_some() {
-            anyhow::bail!("--since and --last are mutually exclusive");
-        }
+        self.validate_window()?;
         Ok(())
+    }
+}
+
+impl WindowArgs for UsageArgs {
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn since(&self) -> Option<DateTime<Utc>> {
+        self.since
+    }
+    fn calendar(&self) -> bool {
+        self.calendar
     }
 }
 
@@ -647,6 +723,14 @@ pub struct ReportArgs {
     #[arg(long = "last")]
     pub last: Option<String>,
 
+    /// Align the window to a local calendar bucket instead of a rolling
+    /// duration. With this flag `--last` must be a calendar keyword (`1d` =
+    /// today, `1w` = the trailing 7 local days, `1mo` = 30): the window runs
+    /// from the bucket's local-midnight start to now, so `--calendar --last 1d`
+    /// selects exactly the records a `1d` budget evaluates.
+    #[arg(long = "calendar")]
+    pub calendar: bool,
+
     /// Filter by project path substring.
     #[arg(long = "project")]
     pub project: Option<String>,
@@ -703,15 +787,25 @@ impl BudgetArgs for ReportArgs {
 
 impl ReportArgs {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.since.is_some() && self.last.is_some() {
-            anyhow::bail!("--since and --last are mutually exclusive");
-        }
+        self.validate_window()?;
         if let Some(top) = self.top {
             if top == 0 {
                 anyhow::bail!("--top must be at least 1");
             }
         }
         Ok(())
+    }
+}
+
+impl WindowArgs for ReportArgs {
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn since(&self) -> Option<DateTime<Utc>> {
+        self.since
+    }
+    fn calendar(&self) -> bool {
+        self.calendar
     }
 }
 

@@ -1,19 +1,46 @@
-//! Calendar-window vocabulary shared by `budget` and `diff`.
+//! Calendar-window vocabulary shared by `budget`, `diff`, `usage`, and
+//! `report`.
 //!
-//! Both commands need to answer "what is a day?" and must agree: a `1d` budget
-//! resets and a `1d` diff bucket starts at the **same** instant. Rather than
-//! define local-midnight math twice, the bucket helpers live here and both
-//! callers delegate.
+//! All four commands need to answer "what is a day?" and must agree: a `1d`
+//! budget resets, a `1d` diff bucket starts, and a `usage`/`report` calendar
+//! window opens at the **same** instant. Rather than define local-midnight math
+//! four times, the bucket helpers and the single-window derivation live here
+//! and every caller delegates.
 //!
 //! Everything is a pure function of `now`: no clock is read, so every boundary
 //! is testable with explicit timestamps.
 
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 
-/// The calendar keywords both `budget` and `diff` recognize, mapped to a bucket
-/// length in **local** days. `1d` is "today", `1w` is the trailing 7 local days
-/// inclusive of today, `1mo` is the trailing 30 local days. These are trailing
-/// windows ending at the current local day — not ISO weeks or calendar months.
+/// How a single window is anchored in time — the shared vocabulary behind
+/// `usage`/`report`'s `--calendar` and (composed pairwise) `diff`'s windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowMode {
+    /// A rolling window relative to `now`: `[now - last, now]`.
+    Rolling { last: Duration },
+    /// A trailing local-day bucket: `[calendar_bucket_start(now, days), now]`.
+    /// `days == 1` is "today so far" (local midnight → now).
+    Calendar { days: u32 },
+}
+
+/// The half-open `(since, until)` bounds for `mode` at `now`. Pure: reads no
+/// clock. Returns `None` only when a calendar bucket cannot be anchored (an
+/// impossible local midnight, e.g. a DST gap with no valid instant).
+pub fn window_bounds(
+    mode: WindowMode,
+    now: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    match mode {
+        WindowMode::Rolling { last } => Some((now - last, now)),
+        WindowMode::Calendar { days } => Some((calendar_bucket_start(now, days)?, now)),
+    }
+}
+
+/// The calendar keywords `budget`, `diff`, `usage`, and `report` recognize,
+/// mapped to a bucket length in **local** days. `1d` is "today", `1w` is the
+/// trailing 7 local days inclusive of today, `1mo` is the trailing 30 local
+/// days. These are trailing windows ending at the current local day — not ISO
+/// weeks or calendar months.
 pub fn calendar_days(s: &str) -> Option<u32> {
     match s {
         "1d" => Some(1),
@@ -130,6 +157,57 @@ mod tests {
     fn bucket_start_clamps_zero_days_to_one() {
         let now = local(2026, 9, 13, 14, 32);
         assert_eq!(calendar_bucket_start(now, 0), calendar_bucket_start(now, 1));
+    }
+
+    #[test]
+    fn rolling_bounds_start_at_now_minus_last() {
+        let now = local(2026, 9, 13, 14, 32);
+        let (since, until) = window_bounds(
+            WindowMode::Rolling {
+                last: Duration::days(7),
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(since, now - Duration::days(7));
+        assert_eq!(until, now);
+    }
+
+    #[test]
+    fn calendar_bounds_open_at_the_bucket_start() {
+        let now = local(2026, 9, 13, 14, 32);
+        // `1d` is "today so far": local midnight → now, *not* a rolling 24h.
+        let (since, until) = window_bounds(WindowMode::Calendar { days: 1 }, now).unwrap();
+        assert_eq!(since, local(2026, 9, 13, 0, 0));
+        assert_eq!(until, now);
+        assert_eq!(since, local_midnight(now).unwrap());
+    }
+
+    #[test]
+    fn calendar_bounds_for_a_week_trail_six_days() {
+        let now = local(2026, 9, 13, 14, 32);
+        let (since, until) = window_bounds(WindowMode::Calendar { days: 7 }, now).unwrap();
+        assert_eq!(since, local(2026, 9, 7, 0, 0));
+        assert_eq!(until, now);
+    }
+
+    #[test]
+    fn calendar_bounds_differ_from_rolling_at_a_day_boundary() {
+        // 00:30 local: a `1d` calendar window is just 30 minutes wide, while a
+        // `1d` rolling window reaches back into yesterday. The two must not be
+        // interchangeable — this is the whole point of `--calendar`.
+        let now = local(2026, 9, 13, 0, 30);
+        let (cal_since, _) = window_bounds(WindowMode::Calendar { days: 1 }, now).unwrap();
+        let (roll_since, _) = window_bounds(
+            WindowMode::Rolling {
+                last: Duration::days(1),
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(cal_since, local(2026, 9, 13, 0, 0));
+        assert_eq!(roll_since, local(2026, 9, 12, 0, 30));
+        assert!(cal_since > roll_since);
     }
 
     #[test]

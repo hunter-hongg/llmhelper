@@ -223,7 +223,8 @@ already tested.
   anchored to `now`.
 - **Changing sliding-window behavior.** The default path is frozen.
 - **Calendar alignment for `usage`/`report`.** This spec is scoped to `diff`;
-  `budget` already has its own calendar windows.
+  the single-window counterpart is spec 0018, and `budget` already has its own
+  calendar windows.
 - **A new calendar keyword vocabulary** beyond what `budget` recognizes. `1d`,
   `1w`, `1mo` only.
 

@@ -34,24 +34,38 @@ pub type WindowPair = (
 /// testable with explicit instants. Returns `None` only when a calendar bucket
 /// cannot be anchored (an impossible local midnight, e.g. a DST gap with no
 /// valid instant).
+///
+/// The **current** window is derived through the shared
+/// [`window_bounds`](crate::domain::window::window_bounds), so "what is a day"
+/// has one definition across `budget`, `diff`, `usage`, and `report`. The
+/// previous window then telescopes back from the current one.
 pub fn window_pair(mode: DiffMode, now: chrono::DateTime<chrono::Utc>) -> Option<WindowPair> {
     match mode {
         DiffMode::Sliding { last, prev } => {
-            let prev_until = now - last;
-            let curr_since = prev_until - prev;
-            Some((curr_since, prev_until, prev_until, now))
+            // `curr_since` is the rolling window's own start; the previous window
+            // is the equal-shape `prev` window immediately before it.
+            let (curr_since, curr_until) = crate::domain::window::window_bounds(
+                crate::domain::window::WindowMode::Rolling { last },
+                now,
+            )?;
+            let prev_until = curr_since;
+            let prev_since = prev_until - prev;
+            Some((prev_since, prev_until, curr_since, curr_until))
         }
         DiffMode::Calendar {
             last_days,
             prev_days,
         } => {
-            let curr_since = crate::domain::window::calendar_bucket_start(now, last_days)?;
+            let (curr_since, curr_until) = crate::domain::window::window_bounds(
+                crate::domain::window::WindowMode::Calendar { days: last_days },
+                now,
+            )?;
             // The previous bucket is exactly `prev_days` local days wide and ends
             // where the current bucket begins. Stepping back in local-day units
             // (via the shared helper) keeps the boundary on local midnight even
             // across a DST transition.
             let prev_since = crate::domain::window::calendar_bucket_before(curr_since, prev_days)?;
-            Some((prev_since, curr_since, curr_since, now))
+            Some((prev_since, curr_since, curr_since, curr_until))
         }
     }
 }
