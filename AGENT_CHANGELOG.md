@@ -115,3 +115,19 @@
 
 - 会话总结：把 `request --stream` 与 `search` 补进 README（含全部示例与 flags）、把 spec 0008 从"首次提交时的承诺"校准为"已发布的行为"（退出码、`--config`、`--refresh-interval`、TUI 只读、请求日志四处不实描述）、修正 spec 0009 elapsed-time 措辞、新增 3 个流式 wire 契约集成测试、关闭遗留文档尾票、修好 AGENT_CHANGELOG 的日期乱序（原 `2026-09-10` 段排在 `2026-09-09` 之前）。零 Rust 行为改动：lib 189 与 integration 71 项断言全部原样通过，request 11 → 14。
 
+- 落地 commit `2d15537` `docs(request): document --stream, sync spec 0008, add wire-contract tests`，6 文件 +250/-30；`git status` 干净。
+
+- 落地 spec `0012-request-enhancements.md` 的九项改动（`request --tools` 透传、`--log` 请求/响应日志、退出码拆分 0/1/2、全局 `--config`、`request --interactive` 多轮 TUI、`search --fail-open`、`--copy` OSC 52、`--refresh-interval` 文档核对、Cargo 元数据）。实现期把 `build_payload` 的四个采样参数收拢为 `SamplingParams`，消掉 clippy `too_many_arguments`（8/7）；`request_exit_code` 把 `RequestError::Client` 映射到 2、`Request` 到 1。修掉两处测试缺陷：base64 断言期望值算错（`aGVsbG8gd29yb3Jk=` → 正确的 `aGVsbG8gd29ybGQ=`）、日志断言写死了 serde_json 不输出的空格（`"direction": "request"` → `"direction":"request"`）。`--config` 与既有 usage error 一致：`--tools` 文件非法、互斥 flag 冲突等均走 exit 1，exit 2 专供连接/DNS/超时/流中断；base-url 仍是主机根，`/v1/chat/completions` 由程序拼接。新增 `tests/request.rs` 5 例（`--tools` 原样透传、缺省时 `tools` 键不存在、非数组 tools 文件 exit 1、HTTP 5xx exit 1、连接失败 exit 2）与 `osc52_sequence_wraps_base64_payload`，lib 197 → 198、integration 14 → 19。`cargo test` 288 全通过，clippy `-D warnings` 与 `cargo fmt --check` 干净。
+
+## 2026-09-12
+
+
+- 完成 spec `0013-request-reasoning.md` 的 TUI 思考面板与文档同步：`header_line` 新增 `gen: <label>` 段（Idle 整段省略、Thinking/Answering 用 ACCENT、Done 用 MUTED），`GenerationState` 四态（Idle/Thinking/Answering/Done）贯穿 one-shot、interactive、stream 三条渲染路径；新增 `request_render.rs` 3 例表头断言与 `request_app.rs` 9 例交互断言（`t` 在 Answer→Both→ThinkingOnly 间循环、interactive 模式不消费 `t`、thinking-only 只滚 `reasoning_scroll`、answer 视图只滚 `scroll`、两栏 `k`/`Up` 均断开 `follow`、`reset_reasoning` 清空行与偏移、`note_event` 状态迁移）。新增 `.scratch/request_reasoning_tui_smoke.py` PTY 冒烟（自建 HTTP server，12 项断言覆盖表头 gen 状态、tokens、footer `t` 提示、各视图窗格内容与退出码），默认与 `--thinking` 两种起始视图各 12/12 通过；为解决 ratatui 差分重绘导致读帧陈旧的问题，改为双维度 `TIOCSWINSZ` 触发全量重绘 + 0.25s 静默间隔收帧，稳定 20/20。
+
+- 本会话代码审查发现并修复一处真实缺陷：one-shot TUI 的 `capture_on` 原本内联为 `!args.reasoning_field.is_empty()`，漏掉了 `[request] reasoning_fields` 配置回退，导致仅靠配置文件启用捕获时思考面板不可用。改为 `run_request_tui` 接收 `capture_on: bool` 参数，one-shot 调用点传 `!settings.reasoning_fields.is_empty()`，与 interactive（`src/main.rs:1400`）和 stream TUI（`src/main.rs:1749`）保持一致；并补 `request_reasoning_fields_config_key_enables_capture` 集成测试锁死该路径。修掉 `request_app.rs` 的 clippy `collapsible_if`、删除 `viewer.rs` 死代码 `footer_line()`。审查另记录若干跨文件的既有重复（`send_chat_completion` 与流式版的请求构造、`resolve_path_against_config` 与 `config.rs::resolve_relative` 漂移、三个 `build_filter*` 变体等），均早于本特性、判定为范围外，仅记录不改动，以保持特性提交干净。
+
+- 调试记录：新增的 `request_reasoning_fields_config_key_enables_capture` 最初挂死（server 线程停在 `inet_csk_accept`、测试主线程停在 `handle.join()`）。根因是该测试写出的配置只有 `reasoning_fields`、缺 `default_model`，被测二进制在发起 HTTP 前即以 "model is required" exit 1，服务端永远等不到连接。补 `--model gpt-4` 后瞬过。此坑值得记住：`start_server` 夹具在客户端提前退出时会静默挂起，而非报错。
+
+- 同步文档：README 新增 `#### Reasoning capture` 小节（opt-in 表述、one-shot 与 streaming 可运行示例、重复 flag 按序 join 语义、`--reasoning <file>` 透传示例、五种输出契约表、TUI 面板与 `--copy` 行为、`[request] reasoning_fields`/`reasoning` 配置键及相对配置目录的路径规则）；spec 0008 补两处已被 0012 取代的失效描述（"没有 `--config` flag"与 Out of Scope 的"不写请求日志"）的指向说明；spec 0013 修正内部不一致——"第一个非空匹配胜出"改为与实现 `parse_response_with`（`matches.join("\n\n")`）一致的"每个字段都被查询、非空匹配按 flag 顺序拼接"。
+
+- 会话总结：为 `llmhelper request` 收尾 spec 0013 的推理捕获特性——补齐 TUI 思考面板（`gen:` 表头四态、`t` 三视图循环、双栏独立滚动、12 项 PTY 冒烟）与全部文档/spec 同步，代码审查修掉 one-shot `capture_on` 漏读 `[request] reasoning_fields` 配置回退的真实缺陷，并顺带修正 spec 0008 两处被 0012 取代的失效描述、spec 0013 一处与实现不符的匹配语义。因 spec 0012 的代码与 spec 0013 交错在同一批文件中，按一个 `feat(request)` 实现提交 + 一个 `docs(request)` 文档提交落地。`cargo test` 321 全通过（lib 219、集成 71 + 31），clippy 0 warning、`cargo fmt --check` 干净；PTY 冒烟默认与 `--thinking` 均 12/12。

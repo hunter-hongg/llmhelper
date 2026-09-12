@@ -68,7 +68,51 @@ llmhelper request --base-url https://api.example.com --model gpt-4 --messages me
 
 With `--stream` the payload carries `stream: true` and `stream_options.include_usage`, so providers following the OpenAI schema report token counts in a stream chunk. Without `--stream` the one-shot payload carries neither key. A provider that rejects unknown request fields surfaces that as an HTTP error with the provider's body snippet; there is no way to detect it proactively.
 
-Flags: `--base-url` (required unless in config), `--api-key` (env `LLMHELPER_API_KEY` fallback), `--model` (required), `--messages <path>` (JSON array of `{role, content}`), `--prompt <string>` (single user turn), `--json` prints full response, `--text` prints only assistant message content, `--stream` streams the response as SSE, `--temperature`, `--top-p`, `--max-tokens`, `--stop` (repeatable). Configuration via `[request]` section in `~/.config/llmhelper/config.toml`.
+#### Reasoning capture
+
+A reasoning model answers behind a chain-of-thought that lands in a response field the command does not read by default. `--reasoning-field` names that field as a dotted path, and `--thinking` surfaces the result: it expands the reasoning pane in the TUI, and prints the reasoning alone under `--text`. Both are opt-in: a run without them is byte-for-byte unchanged.
+
+```bash
+# One-shot: read the chain-of-thought from a provider-specific field
+llmhelper request --base-url https://api.example.com --model gpt-4 --prompt "Explain TCP" \
+  --reasoning-field choices.0.message.reasoning --text --thinking
+
+# Streaming: `choices.0.delta.reasoning_content` arrives alongside the answer deltas
+llmhelper request --base-url https://api.example.com --model gpt-4 --prompt "Explain TCP" \
+  --reasoning-field choices.0.delta.reasoning_content --text --stream
+```
+
+`--reasoning-field` is repeatable; every named field is consulted and the non-empty ones are joined in flag order. A dotted path walks nested objects and array indices (`choices.0.message.reasoning`), and a missing path contributes nothing rather than erroring. `--thinking` selects the view that shows the reasoning pane at launch; inside the TUI, `t` cycles the view between answer-only, both, and thinking-only, and the header reports whether the generation is `thinking`, `answering`, or `done`.
+
+`--reasoning <file>` is a separate concern: it passes a request-side configuration object (effort, budget, …) through to the provider. The file must contain a JSON object, which is embedded verbatim as the payload's `reasoning` key — the command does not interpret it.
+
+```json
+{ "effort": "high" }
+```
+
+The output contract per capture path:
+
+| Invocation | Output |
+|---|---|
+| `--json` | Wraps the provider response in an envelope: `{"response": <raw>, "reasoning": <joined text>, "reasoning_fields": [...]}`. Without capture the raw provider object is printed alone, as before. |
+| `--text` | Appends the reasoning after the answer under a `[reasoning]` heading. |
+| `--json --stream` | One SSE event per line with a sibling `"@channel"` key (`"content"` or `"reasoning"`) in a fixed position, so a consumer reading the raw keys is unaffected. |
+| `--text --stream` | Answer deltas go to stdout, reasoning deltas to stderr. |
+| `--text --thinking` / `--text --thinking --stream` | Prints the reasoning alone (to stdout under `--stream`). |
+
+In the TUI the reasoning renders in its own `thinking` pane with an independent scroll offset, and `--copy` copies whichever channel the current view shows. A run without reasoning keeps today's two-pane layout exactly.
+
+Configuration via `[request]` section in `~/.config/llmhelper/config.toml`:
+
+```toml
+[request]
+reasoning_fields = ["choices.0.message.reasoning"]
+reasoning = "reasoning.json"   # relative paths resolve against the config file's directory
+```
+
+Both keys are fallbacks: a CLI `--reasoning-field`/`--reasoning` overrides them. Relative paths in the config resolve against the config file's own directory so a config and the files it references move together; absolute paths are left alone.
+
+Flags: `--base-url` (required unless in config), `--api-key` (env `LLMHELPER_API_KEY` fallback), `--model` (required), `--messages <path>` (JSON array of `{role, content}`), `--prompt <string>` (single user turn), `--json` prints full response, `--text` prints only assistant message content, `--stream` streams the response as SSE, `--reasoning-field <path>` (repeatable) captures reasoning text from a response field, `--reasoning <file>` passes a reasoning configuration object through to the provider, `--thinking` expands the reasoning view in the TUI, `--temperature`, `--top-p`, `--max-tokens`, `--stop` (repeatable). Configuration via `[request]` section in `~/.config/llmhelper/config.toml`.
 
 ### search
 Full-text search across agent session message text.
@@ -97,4 +141,4 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 ## Specs
-See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream and search specifications. Architecture notes in `docs/adr/`.
+See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning and search specifications. Architecture notes in `docs/adr/`.

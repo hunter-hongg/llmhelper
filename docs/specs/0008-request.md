@@ -12,7 +12,7 @@ triage: ready-for-agent
 
 ## Solution
 
-Add a new subcommand `llmhelper request` that sends an OpenAI-compatible Chat Completions request and renders the response. Each of the three output modes — **TUI** (default), `--json`, and `--text` — has both a one-shot form and a streaming form selected by `--stream`. Streaming is specified by its companion document, `docs/specs/0009-request-stream.md`; this spec covers the one-shot contract. The command reuses `llmhelper` conventions: config file for defaults, path overrides, TUI default with `--json`/`--text` overrides, consistent error handling and Source-scoped thinking.
+Add a new subcommand `llmhelper request` that sends an OpenAI-compatible Chat Completions request and renders the response. Each of the three output modes — **TUI** (default), `--json`, and `--text` — has both a one-shot form and a streaming form selected by `--stream`. Streaming is specified by its companion document, `docs/specs/0009-request-stream.md`; this spec covers the one-shot contract. Reasoning (thinking) capture, the `--reasoning-field`/`--reasoning`/`--thinking` flags, and the TUI thinking pane are specified by the reasoning companion, `docs/specs/0013-request-reasoning.md`. The command reuses `llmhelper` conventions: config file for defaults, path overrides, TUI default with `--json`/`--text` overrides, consistent error handling and Source-scoped thinking.
 
 ## User Stories
 
@@ -35,7 +35,7 @@ Add a new subcommand `llmhelper request` that sends an OpenAI-compatible Chat Co
   - `--messages` JSON file path or `--prompt` string, mutually exclusive with each other
   - `--json`, `--text` output modes; TUI is default when neither is specified
   - `--temperature`, `--top-p`, `--max-tokens`, `--stop` (repeatable)
-  - Config discovery via `Config::load`, extended with a `[request]` section. There is no `--config` flag; the path is always `~/.config/llmhelper/config.toml`.
+  - Config discovery via `Config::load`, extended with a `[request]` section. There is no `--config` flag in this spec; a global `--config` flag was added later, see `docs/specs/0012-request-enhancements.md`. Without it the path is `~/.config/llmhelper/config.toml`.
 - New `src/request.rs` module:
   - `send_chat_completion` posts the payload to `/v1/chat/completions` following the OpenAI schema, using `reqwest` under a `tokio` runtime.
   - `RequestArgs` parsed via `clap` derives; JSON messages parsed with `serde_json::Value` for flexibility.
@@ -72,12 +72,14 @@ Add a new subcommand `llmhelper request` that sends an OpenAI-compatible Chat Co
 - Proxy configuration.
 - Multi-turn conversation persistence across invocations.
 - Automatic retry with exponential backoff.
-- Request logging. The request path writes no logs; debugging relies on the error message returned to the caller.
+- Request logging. The request path writes no logs; debugging relies on the error message returned to the caller. (Superseded: `request --log` was added in `docs/specs/0012-request-enhancements.md`.)
 - TUI message editing and interactive TUI message input. The viewer is read-only, and input must come from `--messages` or `--prompt`.
 - Displaying request or response headers in the TUI, and copy/share actions.
 
 ## Further Notes
 
 - Keep `request` read-only with respect to local usage data; it does not write into Source DBs.
+- Reasoning capture is not covered here; see `docs/specs/0013-request-reasoning.md`.
+- Tool pass-through (`--tools`), request logging (`--log`), split exit codes, the global `--config` flag, and interactive TUI mode are covered by `docs/specs/0012-request-enhancements.md`.
 - README documents the `request` subcommand with example usage, including the streaming forms.
 - Follow existing code conventions: `src/tui/` patterns, `Config::load`, `clap` derives, no comments in code per project norm.
