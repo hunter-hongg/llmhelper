@@ -398,6 +398,14 @@ pub struct DiffArgs {
     #[arg(long = "prev")]
     pub prev: Option<String>,
 
+    /// Align both windows to local calendar buckets instead of rolling
+    /// durations. With this flag `--last`/`--prev` must be calendar keywords
+    /// (`1d` = today, `1w` = the trailing 7 local days, `1mo` = 30): the current
+    /// window runs from the bucket's local-midnight start to `now`, and the
+    /// previous window is the adjacent bucket immediately before it.
+    #[arg(long = "calendar")]
+    pub calendar: bool,
+
     /// Claude Code projects directory (defaults to ~/.claude/projects).
     #[arg(long = "claude-dir")]
     pub claude_dir: Option<std::path::PathBuf>,
@@ -456,6 +464,33 @@ impl DiffArgs {
         };
         let prev = match &self.prev {
             Some(s) => parse_duration(s).map_err(|e| anyhow::anyhow!("invalid --prev {}", e))?,
+            None => anyhow::bail!("--prev is required"),
+        };
+        Ok((last, prev))
+    }
+
+    /// Parse `--last`/`--prev` as calendar bucket lengths, in local days.
+    ///
+    /// Only the calendar keywords shared with `budget` (`1d`, `1w`, `1mo`) are
+    /// accepted: a rolling duration like `4h` has no calendar meaning and must
+    /// be a loud error rather than a silently misaligned window.
+    pub fn parse_calendar_windows(&self) -> anyhow::Result<(u32, u32)> {
+        let last = match &self.last {
+            Some(s) => crate::domain::window::calendar_days(s).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --last for --calendar: '{}' (expected calendar window: 1d, 1w, 1mo)",
+                    s
+                )
+            })?,
+            None => anyhow::bail!("--last is required"),
+        };
+        let prev = match &self.prev {
+            Some(s) => crate::domain::window::calendar_days(s).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --prev for --calendar: '{}' (expected calendar window: 1d, 1w, 1mo)",
+                    s
+                )
+            })?,
             None => anyhow::bail!("--prev is required"),
         };
         Ok((last, prev))
@@ -1090,6 +1125,43 @@ mod tests {
             Command::Usage(args) => args,
             other => panic!("expected usage, got {other:?}"),
         }
+    }
+
+    fn diff_from(argv: &[&str]) -> DiffArgs {
+        let mut full = vec!["llmhelper", "diff"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full).unwrap().command {
+            Command::Diff(args) => args,
+            other => panic!("expected diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calendar_windows_parse_the_three_keywords() {
+        let args = diff_from(&["--calendar", "--last", "1d", "--prev", "1w"]);
+        assert_eq!(args.parse_calendar_windows().unwrap(), (1, 7));
+    }
+
+    #[test]
+    fn calendar_rejects_a_rolling_duration_for_last() {
+        let args = diff_from(&["--calendar", "--last", "4h", "--prev", "1d"]);
+        let err = args.parse_calendar_windows().unwrap_err().to_string();
+        assert!(err.contains("--last"), "{}", err);
+        assert!(err.contains("4h"), "{}", err);
+    }
+
+    #[test]
+    fn calendar_rejects_a_rolling_duration_for_prev() {
+        let args = diff_from(&["--calendar", "--last", "1d", "--prev", "2d"]);
+        let err = args.parse_calendar_windows().unwrap_err().to_string();
+        assert!(err.contains("--prev"), "{}", err);
+        assert!(err.contains("2d"), "{}", err);
+    }
+
+    #[test]
+    fn calendar_requires_both_windows() {
+        let args = diff_from(&["--calendar", "--last", "1d"]);
+        assert!(args.parse_calendar_windows().is_err());
     }
 
     #[test]

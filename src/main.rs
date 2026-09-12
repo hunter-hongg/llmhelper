@@ -13,7 +13,7 @@ use llmhelper::cli::{
     RequestArgs, SearchArgs, SessionsArgs, UsageArgs,
 };
 use llmhelper::config::Config;
-use llmhelper::diff::compute_diff;
+use llmhelper::diff::{compute_diff, fmt_window_len, window_pair, DiffMode};
 use llmhelper::domain::group::GroupBy;
 use llmhelper::domain::message::Message;
 use llmhelper::domain::record::Record;
@@ -326,17 +326,16 @@ fn to_chrono(d: std::time::Duration) -> chrono::Duration {
     chrono::Duration::milliseconds(d.as_millis() as i64)
 }
 
-/// Build the prev/curr filters for a fresh `now`: prev = [now-last-prev,
-/// now-last], curr = [now-last, now]. The non-temporal filters (project /
-/// model / source) are carried over from the CLI args.
+/// Build the prev/curr filters for `mode` at a fresh `now`: prev = [now-last-prev,
+/// now-last], curr = [now-last, now] for sliding windows — or, in calendar mode,
+/// today's local bucket vs the adjacent bucket before it. The non-temporal
+/// filters (project / model / source) are carried over from the CLI args.
 fn window_filters(
     now: chrono::DateTime<chrono::Utc>,
-    last_duration: std::time::Duration,
-    prev_duration: std::time::Duration,
+    mode: DiffMode,
     args: &DiffArgs,
-) -> (Filter, Filter) {
-    let prev_until = now - last_duration;
-    let curr_since = prev_until - prev_duration;
+) -> Option<(Filter, Filter)> {
+    let (prev_since, prev_until, curr_since, curr_until) = window_pair(mode, now)?;
     let non_temporal =
         |since: chrono::DateTime<chrono::Utc>, until: chrono::DateTime<chrono::Utc>| -> Filter {
             Filter {
@@ -348,25 +347,60 @@ fn window_filters(
                 ..Default::default()
             }
         };
-    (
-        non_temporal(curr_since, prev_until),
-        non_temporal(prev_until, now),
-    )
+    Some((
+        non_temporal(prev_since, prev_until),
+        non_temporal(curr_since, curr_until),
+    ))
+}
+
+/// The window mode selected by the CLI: calendar-aligned when `--calendar` is
+/// set, otherwise the two rolling durations. In calendar mode the keywords are
+/// validated here (a rolling duration is a loud error); anchoring failures are
+/// surfaced later, where the pair is built (`window_filters` returns `None`).
+fn diff_mode(args: &DiffArgs) -> anyhow::Result<DiffMode> {
+    if args.calendar {
+        let (last_days, prev_days) = args.parse_calendar_windows()?;
+        Ok(DiffMode::Calendar {
+            last_days,
+            prev_days,
+        })
+    } else {
+        let (last, prev) = args.parse_windows()?;
+        Ok(DiffMode::Sliding {
+            last: to_chrono(last),
+            prev: to_chrono(prev),
+        })
+    }
+}
+
+/// The `(last, prev)` window labels shown in the diff header. Sliding windows
+/// are rendered as a compact duration (`"1d"`, `"4h"`); calendar windows keep
+/// the keyword the user typed (`"1w"`, `"1mo"`) because the current bucket is a
+/// partial day and a duration would overstate it.
+fn window_labels(args: &DiffArgs, mode: DiffMode) -> (String, String) {
+    match mode {
+        DiffMode::Sliding { last, prev } => (fmt_window_len(last), fmt_window_len(prev)),
+        DiffMode::Calendar { .. } => (
+            args.last.clone().unwrap_or_default(),
+            args.prev.clone().unwrap_or_default(),
+        ),
+    }
 }
 
 fn run_diff_tui(
     registry: Registry,
     args: &DiffArgs,
     group_by: GroupBy,
-    last_duration: std::time::Duration,
-    prev_duration: std::time::Duration,
+    mode: DiffMode,
+    last_label: String,
+    prev_label: String,
     refresh_secs: u64,
 ) -> anyhow::Result<()> {
     let rt = Runtime::new()?;
 
     // The window *boundaries* slide with `now` on every refresh, so filters
-    // are rebuilt at each load from the fixed durations instead of being
-    // captured once at startup.
+    // are rebuilt at each load from the fixed mode instead of being captured
+    // once at startup.
     let group_by = Arc::new(Mutex::new(group_by));
     let group_by_clone = group_by.clone();
 
@@ -381,8 +415,9 @@ fn run_diff_tui(
         loop {
             tick.tick().await;
             let now = chrono::Utc::now();
-            let (prev_filter, curr_filter) =
-                window_filters(now, last_duration, prev_duration, &args_clone);
+            let Some((prev_filter, curr_filter)) = window_filters(now, mode, &args_clone) else {
+                continue;
+            };
             let data = load_window_data(
                 &reg_for_task,
                 &prev_filter,
@@ -396,18 +431,20 @@ fn run_diff_tui(
     let mut tui = DiffTuiApp::new()?;
     tui.state.app.running = true;
     tui.state.app.group_by = *group_by.lock();
-    tui.state.app.last_duration = Some(to_chrono(last_duration));
-    tui.state.app.prev_duration = Some(to_chrono(prev_duration));
+    tui.state.app.mode = mode;
+    tui.state.app.last_label = last_label;
+    tui.state.app.prev_label = prev_label;
 
     let now = chrono::Utc::now();
-    let (prev_filter, curr_filter) = window_filters(now, last_duration, prev_duration, args);
-    let data = load_window_data(
-        &reg_arc,
-        &prev_filter,
-        &curr_filter,
-        &tui.state.app.group_by,
-    );
-    apply_window_data(&mut tui.state.app, data);
+    if let Some((prev_filter, curr_filter)) = window_filters(now, mode, args) {
+        let data = load_window_data(
+            &reg_arc,
+            &prev_filter,
+            &curr_filter,
+            &tui.state.app.group_by,
+        );
+        apply_window_data(&mut tui.state.app, data);
+    }
 
     let reg_arc_read = reg_arc;
 
@@ -432,15 +469,15 @@ fn run_diff_tui(
                             *group_by.lock() = tui.state.app.group_by;
                         }
                         let now = chrono::Utc::now();
-                        let (prev_filter, curr_filter) =
-                            window_filters(now, last_duration, prev_duration, args);
-                        let data = load_window_data(
-                            &reg_arc_read,
-                            &prev_filter,
-                            &curr_filter,
-                            &tui.state.app.group_by,
-                        );
-                        apply_window_data(&mut tui.state.app, data);
+                        if let Some((prev_filter, curr_filter)) = window_filters(now, mode, args) {
+                            let data = load_window_data(
+                                &reg_arc_read,
+                                &prev_filter,
+                                &curr_filter,
+                                &tui.state.app.group_by,
+                            );
+                            apply_window_data(&mut tui.state.app, data);
+                        }
                     }
                     crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
                         tui.state.select_next();
@@ -1050,10 +1087,13 @@ fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
 
 fn run_diff(args: DiffArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
-    let (last_duration, prev_duration) = args.parse_windows()?;
+    let mode = diff_mode(&args)?;
+    let (last_label, prev_label) = window_labels(&args, mode);
 
     let now = chrono::Utc::now();
-    let (prev_filter, curr_filter) = window_filters(now, last_duration, prev_duration, &args);
+    let (prev_filter, curr_filter) = window_filters(now, mode, &args).ok_or_else(|| {
+        anyhow::anyhow!("could not anchor the calendar windows to local midnight")
+    })?;
     let prev_since = prev_filter.since.unwrap();
     let prev_until = prev_filter.until.unwrap();
     let curr_since = curr_filter.since.unwrap();
@@ -1090,8 +1130,9 @@ fn run_diff(args: DiffArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()>
             registry,
             &args,
             group_by,
-            last_duration,
-            prev_duration,
+            mode,
+            last_label,
+            prev_label,
             config.refresh_interval_seconds,
         )?;
     }

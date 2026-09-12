@@ -5,6 +5,78 @@ use serde::Serialize;
 use crate::aggregator::{AggregateResult, Group};
 use crate::domain::record::TokenBreakdown;
 
+/// How the two comparison windows are anchored in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffMode {
+    /// Two rolling windows relative to `now`: current `[now-last, now]`,
+    /// previous `[now-last-prev, now-last]`.
+    Sliding {
+        last: chrono::Duration,
+        prev: chrono::Duration,
+    },
+    /// Two adjacent calendar buckets anchored to local midnight: the current
+    /// bucket runs from its start to `now`, and the previous bucket is the
+    /// `prev_days`-long block immediately before it.
+    Calendar { last_days: u32, prev_days: u32 },
+}
+
+/// The two half-open window bounds for a comparison:
+/// `(prev_since, prev_until, curr_since, curr_until)`.
+pub type WindowPair = (
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+);
+
+/// The two half-open window bounds `(prev_since, prev_until, curr_since,
+/// curr_until)` for `mode` at `now`. Pure: reads no clock, so it is fully
+/// testable with explicit instants. Returns `None` only when a calendar bucket
+/// cannot be anchored (an impossible local midnight, e.g. a DST gap with no
+/// valid instant).
+pub fn window_pair(mode: DiffMode, now: chrono::DateTime<chrono::Utc>) -> Option<WindowPair> {
+    match mode {
+        DiffMode::Sliding { last, prev } => {
+            let prev_until = now - last;
+            let curr_since = prev_until - prev;
+            Some((curr_since, prev_until, prev_until, now))
+        }
+        DiffMode::Calendar {
+            last_days,
+            prev_days,
+        } => {
+            let curr_since = crate::domain::window::calendar_bucket_start(now, last_days)?;
+            // The previous bucket is exactly `prev_days` local days wide and ends
+            // where the current bucket begins. Stepping back in local-day units
+            // (via the shared helper) keeps the boundary on local midnight even
+            // across a DST transition.
+            let prev_since = crate::domain::window::calendar_bucket_before(curr_since, prev_days)?;
+            Some((prev_since, curr_since, curr_since, now))
+        }
+    }
+}
+
+/// Human-readable window length for sliding windows: `"1d"`, `"12h"`, `"45m"`
+/// (whichever is whole, most significant first). Calendar windows carry their
+/// keyword (`1d`/`1w`/`1mo`) instead, since their current bucket is partial.
+pub fn fmt_window_len(d: chrono::Duration) -> String {
+    let s = d.num_seconds();
+    let days = s / 86_400;
+    let hours = (s % 86_400) / 3_600;
+    let mins = (s % 3_600) / 60;
+    if days > 0 && hours == 0 && mins == 0 {
+        format!("{}d", days)
+    } else if hours > 0 && mins == 0 {
+        format!("{}h", hours)
+    } else if days > 0 {
+        format!("{}d {}h", days, hours)
+    } else if mins > 0 {
+        format!("{}m", mins)
+    } else {
+        format!("{}h", hours)
+    }
+}
+
 /// Which windows a Group key appears in.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -301,5 +373,83 @@ mod tests {
             grand_sessions: 0,
             groups: agg_groups,
         }
+    }
+
+    use chrono::TimeZone;
+
+    fn local(y: i32, mo: u32, d: u32, h: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Local
+            .with_ymd_and_hms(y, mo, d, h, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn sliding_pair_matches_the_documented_windows() {
+        let now = local(2026, 9, 13, 14);
+        let (ps, pe, cs, ce) = window_pair(
+            DiffMode::Sliding {
+                last: chrono::Duration::days(7),
+                prev: chrono::Duration::days(7),
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(ce, now);
+        assert_eq!(cs, now - chrono::Duration::days(7));
+        assert_eq!(pe, cs);
+        assert_eq!(ps, now - chrono::Duration::days(14));
+    }
+
+    #[test]
+    fn calendar_pair_is_adjacent_and_local_midnight_anchored() {
+        let now = local(2026, 9, 13, 14);
+        let (ps, pe, cs, ce) = window_pair(
+            DiffMode::Calendar {
+                last_days: 1,
+                prev_days: 1,
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(ce, now);
+        // Current bucket starts at today's local midnight.
+        assert_eq!(cs, local(2026, 9, 13, 0));
+        // Adjacent: the previous window ends exactly where the current begins.
+        assert_eq!(pe, cs);
+        assert_eq!(ps, local(2026, 9, 12, 0));
+    }
+
+    #[test]
+    fn calendar_pair_supports_unequal_buckets() {
+        let now = local(2026, 9, 13, 14);
+        let (ps, pe, cs, ce) = window_pair(
+            DiffMode::Calendar {
+                last_days: 1,
+                prev_days: 7,
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(cs, local(2026, 9, 13, 0));
+        assert_eq!(ce, now);
+        assert_eq!(pe, cs);
+        // Seven local days before today's midnight is 09-06.
+        assert_eq!(ps, local(2026, 9, 6, 0));
+    }
+
+    #[test]
+    fn calendar_pair_week_bucket_trails_six_days() {
+        let now = local(2026, 9, 13, 14);
+        let (ps, _pe, cs, _ce) = window_pair(
+            DiffMode::Calendar {
+                last_days: 7,
+                prev_days: 7,
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(cs, local(2026, 9, 7, 0));
+        assert_eq!(ps, local(2026, 8, 31, 0));
     }
 }

@@ -19,6 +19,22 @@ llmhelper diff --last 7d --prev 7d --group-by project
 llmhelper diff --last 30d --prev 30d --json
 ```
 
+By default both windows are rolling durations relative to now: current `[now-last, now]` and previous `[now-last-prev, now-last]`.
+
+#### Calendar-aligned windows
+Pass `--calendar` to snap both windows to local calendar boundaries instead. `--last`/`--prev` then take calendar keywords only — `1d` (today), `1w` (the trailing 7 local days), `1mo` (30 days) — and the comparison becomes *today vs the adjacent bucket before it*, anchored at local midnight rather than to the current clock time.
+```bash
+# Today vs yesterday (local midnight to now, and the full day before)
+llmhelper diff --calendar --last 1d --prev 1d --group-by project
+
+# Today vs the previous 7 days
+llmhelper diff --calendar --last 1d --prev 1w --json
+
+# This week so far vs the week before
+llmhelper diff --calendar --last 1w --prev 1w
+```
+The two windows are always adjacent and non-overlapping: the previous window ends exactly where the current one begins. Because the current bucket is partial (local midnight → now), the header shows the keyword (`1d`) rather than a computed duration. A rolling duration such as `--last 4h` is rejected in calendar mode with a clear error; omit `--calendar` for rolling windows.
+
 ### sessions
 List sessions with paging and detail.
 ```bash

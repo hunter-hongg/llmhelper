@@ -10,7 +10,7 @@
 //! clock and touches no Source, so every boundary is testable with explicit
 //! timestamps.
 
-use chrono::{DateTime, Duration, Local, TimeZone, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::domain::record::Record;
 
@@ -60,17 +60,11 @@ impl BudgetWindow {
         match self {
             BudgetWindow::Duration(d, _) => Some(now - *d),
             BudgetWindow::Unparsed(_) => None,
+            // Calendar buckets reset at *local* midnight, so a "daily" budget
+            // means the user's day, not UTC's. The bucket math is shared with
+            // `diff` via `domain::window` so the two commands cannot drift.
             BudgetWindow::Calendar { days, .. } => {
-                // Calendar buckets reset at *local* midnight, so a "daily"
-                // budget means the user's day, not UTC's.
-                let local_now = now.with_timezone(&Local);
-                let start_local = local_now.date_naive().and_hms_opt(0, 0, 0)?
-                    - Duration::days((*days as i64) - 1);
-                let start_local = Local
-                    .from_local_datetime(&start_local)
-                    .single()
-                    .or_else(|| Local.from_local_datetime(&start_local).earliest())?;
-                Some(start_local.with_timezone(&Utc))
+                crate::domain::window::calendar_bucket_start(now, *days)
             }
         }
     }
@@ -79,26 +73,11 @@ impl BudgetWindow {
     /// duration vocabulary (`30m`, `4h`, `7d`) plus the calendar keywords
     /// `1d`, `1w`, and `1mo`.
     pub fn parse(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "1d" => {
-                return Ok(BudgetWindow::Calendar {
-                    days: 1,
-                    label: s.to_string(),
-                })
-            }
-            "1w" => {
-                return Ok(BudgetWindow::Calendar {
-                    days: 7,
-                    label: s.to_string(),
-                })
-            }
-            "1mo" => {
-                return Ok(BudgetWindow::Calendar {
-                    days: 30,
-                    label: s.to_string(),
-                })
-            }
-            _ => {}
+        if let Some(days) = crate::domain::window::calendar_days(s) {
+            return Ok(BudgetWindow::Calendar {
+                days,
+                label: s.to_string(),
+            });
         }
         let d = crate::cli::parse_duration(s)?;
         Ok(BudgetWindow::Duration(
@@ -305,7 +284,7 @@ pub fn validate_all(budgets: &[Budget]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::domain::record::TokenBreakdown;
-    use chrono::TimeZone;
+    use chrono::{Local, TimeZone};
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)

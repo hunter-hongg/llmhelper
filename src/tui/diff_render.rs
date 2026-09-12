@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use ratatui::{
     layout::{Alignment, Constraint, Layout},
     style::{Color, Modifier, Style},
@@ -60,26 +60,6 @@ fn fmt_ts(t: &DateTime<Utc>) -> String {
     t.format("%m-%d %H:%M").to_string()
 }
 
-/// Human-readable window length: "1d", "12h", "45m" (whichever is whole, most
-/// significant first).
-fn fmt_dur(d: Duration) -> String {
-    let s = d.num_seconds();
-    let days = s / 86_400;
-    let hours = (s % 86_400) / 3_600;
-    let mins = (s % 3_600) / 60;
-    if days > 0 && hours == 0 && mins == 0 {
-        format!("{}d", days)
-    } else if hours > 0 && mins == 0 {
-        format!("{}h", hours)
-    } else if days > 0 {
-        format!("{}d {}h", days, hours)
-    } else if mins > 0 {
-        format!("{}m", mins)
-    } else {
-        format!("{}h", hours)
-    }
-}
-
 pub fn render(frame: &mut Frame, state: &mut DiffTuiState) {
     let area = frame.area();
     frame.render_widget(Paragraph::new("").style(Style::default().bg(BG)), area);
@@ -112,19 +92,14 @@ fn render_header(state: &DiffTuiState) -> Paragraph<'_> {
         ),
     ])];
 
-    if let Some((ps, pe, cs, ce, d_prev, d_curr)) = state.app.window_bounds() {
+    if let Some((ps, pe, cs, ce, prev_label, curr_label)) = state.app.window_bounds() {
         lines.push(Line::from(vec![
             Span::styled(
                 "prev  ",
                 Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(
-                    "{} → {}  ({}  earlier)",
-                    fmt_ts(ps),
-                    fmt_ts(pe),
-                    fmt_dur(*d_prev)
-                ),
+                format!("{} → {}  ({}  earlier)", fmt_ts(ps), fmt_ts(pe), prev_label),
                 Style::default().fg(MUTED),
             ),
         ]));
@@ -134,12 +109,7 @@ fn render_header(state: &DiffTuiState) -> Paragraph<'_> {
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(
-                    "{} → {}  (last {})",
-                    fmt_ts(cs),
-                    fmt_ts(ce),
-                    fmt_dur(*d_curr)
-                ),
+                format!("{} → {}  (last {})", fmt_ts(cs), fmt_ts(ce), curr_label),
                 Style::default().fg(TEXT),
             ),
         ]));

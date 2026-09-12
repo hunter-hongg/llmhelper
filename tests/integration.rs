@@ -1,7 +1,7 @@
 //! Integration tests driven via the real `usage --json` CLI binary.
 //! This is the single testing seam from the spec.
 
-use chrono::Utc;
+use chrono::{Local, TimeZone, Utc};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -322,18 +322,10 @@ fn cli_rejects_unknown_source() {
 
 // --- diff integration tests ---
 
-/// Helper: run `llmhelper diff --json` with ephemeral fixtures.
-/// Timestamps are computed relative to `Utc::now()` at test-run time, so
-/// they reliably fall into the prev / curr windows regardless of wall clock.
-/// Windows use `--last {window}s --prev {window}s`.
-fn run_diff_json(
-    fixture_base: &std::path::Path,
-    window: u64, // seconds for --last / --prev
-    extra_args: &[&str],
-) -> serde_json::Value {
-    // Ensure all three source dirs exist (even if empty) so discover_sources
-    // does NOT fall back to the real user's ~/.local/share/opencode/ or
-    // ~/.omp/agent/sessions/ and pollute the diff with unrelated rows.
+/// Create the four source dirs under `fixture_base` (even if empty) so
+/// `discover_sources` does NOT fall back to the real user's stores, and point a
+/// `Command` at them. Shared by the sliding and calendar diff helpers.
+fn diff_cmd(fixture_base: &std::path::Path) -> Command {
     let claude_dir = fixture_base.join("claude");
     let omp_dir = fixture_base.join("omp");
     let opencode_dir = fixture_base.join("opencode");
@@ -347,15 +339,28 @@ fn run_diff_json(
 
     let mut cmd = Command::new(bin());
     cmd.args(["diff", "--json"]);
-    let dur = format!("{}s", window);
-    cmd.arg("--last").arg(&dur);
-    cmd.arg("--prev").arg(&dur);
     cmd.arg("--claude-dir").arg(claude_dir.to_str().unwrap());
     cmd.arg("--omp-dir").arg(omp_dir.to_str().unwrap());
     cmd.arg("--opencode-db")
         .arg(opencode_dir.join("opencode.db").to_str().unwrap());
     cmd.arg("--kilo-db")
         .arg(kilo_dir.join("kilo.db").to_str().unwrap());
+    cmd
+}
+
+/// Helper: run `llmhelper diff --json` with ephemeral fixtures.
+/// Timestamps are computed relative to `Utc::now()` at test-run time, so
+/// they reliably fall into the prev / curr windows regardless of wall clock.
+/// Windows use `--last {window}s --prev {window}s`.
+fn run_diff_json(
+    fixture_base: &std::path::Path,
+    window: u64, // seconds for --last / --prev
+    extra_args: &[&str],
+) -> serde_json::Value {
+    let mut cmd = diff_cmd(fixture_base);
+    let dur = format!("{}s", window);
+    cmd.arg("--last").arg(&dur);
+    cmd.arg("--prev").arg(&dur);
     for arg in extra_args {
         cmd.arg(arg);
     }
@@ -363,6 +368,31 @@ fn run_diff_json(
     assert!(
         output.status.success(),
         "llmhelper diff exited with {}: stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    serde_json::from_str(&stdout).unwrap()
+}
+
+/// Helper: run `llmhelper diff --json --calendar` with the given keywords.
+fn run_diff_json_calendar(
+    fixture_base: &std::path::Path,
+    last: &str,
+    prev: &str,
+    extra_args: &[&str],
+) -> serde_json::Value {
+    let mut cmd = diff_cmd(fixture_base);
+    cmd.arg("--calendar");
+    cmd.arg("--last").arg(last);
+    cmd.arg("--prev").arg(prev);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    let output = cmd.output().expect("failed to run llmhelper");
+    assert!(
+        output.status.success(),
+        "llmhelper diff --calendar exited with {}: stderr={}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
@@ -733,6 +763,145 @@ fn diff_json_all_windows_empty() {
     let json = run_diff_json(dir.path(), DIFF_WINDOW_SECS, &[]);
     let rows = json["rows"].as_array().unwrap();
     assert!(rows.is_empty());
+}
+
+// --- calendar-aligned diff tests ---
+
+/// Format an instant the way session fixtures expect (`%Y-%m-%dT%H:%M:%S.000Z`).
+fn iso(ts: chrono::DateTime<Utc>) -> String {
+    ts.format("%Y-%m-%dT%H:%M:%S.000Z").to_string()
+}
+
+/// The instant of local midnight `days_ago` days before today, in UTC.
+fn local_midnight_days_ago(days_ago: i64) -> chrono::DateTime<Utc> {
+    let today = Local::now().date_naive();
+    let date = today - chrono::Duration::days(days_ago);
+    let naive = date.and_hms_opt(0, 0, 0).unwrap();
+    Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+/// Two Claude sessions: one inside yesterday's local day, one inside today's.
+fn build_calendar_fixture(base: &std::path::Path) {
+    // A few hours after yesterday's local midnight and a few hours after
+    // today's — both safely inside their respective `1d` buckets.
+    let prev_ts = local_midnight_days_ago(1) + chrono::Duration::hours(9);
+    let curr_ts = local_midnight_days_ago(0) + chrono::Duration::minutes(1);
+    make_session(
+        base,
+        "-home-hunter-proj-cal",
+        "session-prev.jsonl",
+        &iso(prev_ts),
+        100,
+        50,
+    );
+    make_session(
+        base,
+        "-home-hunter-proj-cal",
+        "session-curr.jsonl",
+        &iso(curr_ts),
+        200,
+        100,
+    );
+}
+
+#[test]
+fn diff_calendar_windows_are_adjacent_and_midnight_anchored() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    let json = run_diff_json_calendar(dir.path(), "1d", "1d", &[]);
+    let prev_until = json["windows"]["previous"]["until"].as_str().unwrap();
+    let curr_since = json["windows"]["current"]["since"].as_str().unwrap();
+    let prev_since = json["windows"]["previous"]["since"].as_str().unwrap();
+
+    // Adjacent and non-overlapping: prev ends exactly where current begins.
+    assert_eq!(prev_until, curr_since);
+    // Anchored to local midnight today (current) and yesterday (previous).
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(curr_since).unwrap(),
+        local_midnight_days_ago(0)
+    );
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(prev_since).unwrap(),
+        local_midnight_days_ago(1)
+    );
+    // The yesterday session falls in the previous bucket, today's in current.
+    let rows = json["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["presence"], "both");
+    assert_eq!(rows[0]["delta"]["tokens"]["input"], 100);
+}
+
+#[test]
+fn diff_calendar_unequal_buckets_widen_the_previous_window() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    let json = run_diff_json_calendar(dir.path(), "1d", "1w", &[]);
+    let prev_since = json["windows"]["previous"]["since"].as_str().unwrap();
+    // A `1w` previous bucket is the 7 local days before today's midnight.
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(prev_since).unwrap(),
+        local_midnight_days_ago(7)
+    );
+}
+
+#[test]
+fn diff_calendar_group_by_project_still_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    let json = run_diff_json_calendar(dir.path(), "1d", "1d", &["--group-by", "project"]);
+    assert_eq!(json["group_by"], "project");
+    let rows = json["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["key"].as_str().unwrap().contains("cal"));
+}
+
+#[test]
+fn diff_without_calendar_stays_sliding_not_midnight_anchored() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    let json = run_diff_json(dir.path(), DIFF_WINDOW_SECS, &[]);
+    let curr_since = json["windows"]["current"]["since"].as_str().unwrap();
+    let curr_since = chrono::DateTime::parse_from_rfc3339(curr_since).unwrap();
+    // A rolling `1d` window ends "now minus a day", which is almost never local
+    // midnight — proving the calendar anchoring did not leak in.
+    assert_ne!(curr_since, local_midnight_days_ago(0));
+    assert_ne!(curr_since, local_midnight_days_ago(1));
+}
+
+#[test]
+fn diff_calendar_rejects_a_rolling_duration_for_last() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    let mut cmd = diff_cmd(dir.path());
+    cmd.args(["--calendar", "--last", "4h", "--prev", "1d"]);
+    let output = cmd.output().expect("failed to run llmhelper diff");
+    assert!(!output.status.success(), "--calendar --last 4h should fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--last"), "stderr was: {stderr}");
+    assert!(stderr.contains("4h"), "stderr was: {stderr}");
+}
+
+#[test]
+fn diff_calendar_rejects_a_rolling_duration_for_prev() {
+    let dir = tempfile::tempdir().unwrap();
+    build_calendar_fixture(dir.path());
+
+    let mut cmd = diff_cmd(dir.path());
+    cmd.args(["--calendar", "--last", "1d", "--prev", "2d"]);
+    let output = cmd.output().expect("failed to run llmhelper diff");
+    assert!(!output.status.success(), "--calendar --prev 2d should fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--prev"), "stderr was: {stderr}");
+    assert!(stderr.contains("2d"), "stderr was: {stderr}");
 }
 
 #[test]
