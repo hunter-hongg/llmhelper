@@ -8,14 +8,15 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use llmhelper::cli::{
-    merge_source_paths, Cli, Command, DiffArgs, FilterArgs, ReportArgs, RequestArgs, SearchArgs,
-    SessionsArgs, UsageArgs,
+    merge_source_paths, Cli, Command, DiffArgs, ExportArgs, FilterArgs, ReportArgs, RequestArgs,
+    SearchArgs, SessionsArgs, UsageArgs,
 };
 use llmhelper::config::Config;
 use llmhelper::diff::compute_diff;
 use llmhelper::domain::group::GroupBy;
 use llmhelper::domain::message::Message;
 use llmhelper::domain::record::Record;
+use llmhelper::export::ExportOptions;
 use llmhelper::filter::Filter;
 use llmhelper::output::{format_tokens, render_diff_csv, render_diff_json, OutputRenderer};
 use llmhelper::report::{render_report, ReportMeta};
@@ -552,6 +553,29 @@ fn run_sessions_non_tui(args: &SessionsArgs, config_path: &Option<PathBuf>) -> a
             );
         }
     }
+    Ok(())
+}
+
+fn run_export(args: ExportArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
+    args.validate()?;
+    let fields = llmhelper::export::ExportOptions::resolve(&args.fields)?;
+    let opts = ExportOptions {
+        format: args.format.into(),
+        fields,
+    };
+    let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
+    let registry = discover_sources(&config);
+    let filter = build_filter(&args)?;
+    let (records, source_statuses) = registry.load_all();
+    for status in &source_statuses {
+        if let Some(err) = &status.error {
+            eprintln!("warn: source {} error: {}", status.name, err);
+        }
+    }
+    let filtered: Vec<Record> = filter.apply(&records).into_iter().cloned().collect();
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    llmhelper::export::render(&filtered, &opts, &mut lock)?;
     Ok(())
 }
 
@@ -1746,5 +1770,6 @@ fn main() -> anyhow::Result<()> {
         Command::Report(args) => run_report(args, &config_path),
         Command::Request(args) => run_request(args, &config_path),
         Command::Search(args) => run_search(args, &config_path),
+        Command::Export(args) => run_export(args, &config_path),
     }
 }

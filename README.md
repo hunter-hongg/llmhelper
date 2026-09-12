@@ -1,6 +1,6 @@
 # llmhelper
 
-A Rust + Clap CLI for agent/LLM usage introspection. Reads local usage data from Claude Code, OpenCode, OMP and Kilo Code and renders it via ratatui TUI or Markdown reports.
+A Rust + Clap CLI for agent/LLM usage introspection. Reads local usage data from Claude Code, OpenCode, OMP and Kilo Code and renders it via ratatui TUI, Markdown reports, or machine-readable exports.
 
 ## Subcommands
 
@@ -124,6 +124,35 @@ Without `--json`/`--csv`/`--text`, `search` opens an interactive TUI: select a h
 
 Flags: `--source`, `--project`, `--model`, `--role`, `--since`/`--last`, `--context` (snippet context, default 80), `--limit` (default 100), `--case-sensitive`, `--json`/`--csv`/`--text`. Messages without a timestamp never match a time filter. Tool output and image/patch blocks are excluded from the searchable corpus.
 
+### export
+Flat, machine-oriented dump of the filtered Session records — one row per
+Session, no aggregation. The program-facing counterpart to `report`.
+```bash
+llmhelper export --last 30d                     # one JSON object per line (default)
+llmhelper export --format json                  # a single JSON array
+llmhelper export --format csv --fields source,project,model,input,output,cost
+llmhelper export --source omp --format tsv      # tab-separated
+```
+`--format` selects `jsonl` (default), `json`, `csv`, or `tsv`. JSONL is the
+default because export's consumer is always a pipe or a file; a zero-match
+filter exits 0 and writes nothing, so a scoped export that matches nothing is
+not an error.
+
+`--fields` picks the columns and their order (comma-separated and/or repeated);
+with no `--fields`, every field is emitted in canonical order:
+`source`, `session_id`, `project`, `model`, `agent`, `started_at`, `ended_at`,
+`messages`, `input`, `output`, `cache_read`, `cache_write`, `cost`. An unknown
+field name exits 1 and lists the valid names.
+
+Rows are ordered by `started_at` descending, tie-broken by `(source,
+session_id)`, so two exports of identical data are byte-identical. Token cells
+are raw integers (not the `K/M/B` form) so a spreadsheet sees numbers; cost is
+per-Record and never summed, and is `null` / an empty cell for Sources that
+record no spend (Claude Code). Source-load errors print a `warn:` line on
+stderr and never abort the export.
+
+Flags: `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db`, `--since`/`--last`, `--project`, `--model`, `--source`, `--format jsonl|json|csv|tsv`, `--fields`.
+
 ## Sources
 
 - claude – transcript JSONL
@@ -141,4 +170,4 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 ## Specs
-See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning and search specifications. Architecture notes in `docs/adr/`.
+See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search and export specifications. Architecture notes in `docs/adr/`.

@@ -100,6 +100,8 @@ pub enum Command {
     Request(RequestArgs),
     /// Search message text across Agent/LLM transcripts.
     Search(SearchArgs),
+    /// Export normalized Session records for downstream tools.
+    Export(ExportArgs),
 }
 
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
@@ -782,6 +784,132 @@ impl FilterArgs for SearchArgs {
 }
 
 impl SourcePathArgs for SearchArgs {
+    fn claude_dir(&self) -> Option<&PathBuf> {
+        self.claude_dir.as_ref()
+    }
+    fn opencode_db(&self) -> Option<&Vec<PathBuf>> {
+        self.opencode_db.as_ref()
+    }
+    fn omp_dir(&self) -> Option<&PathBuf> {
+        self.omp_dir.as_ref()
+    }
+    fn kilo_db(&self) -> Option<&Vec<PathBuf>> {
+        self.kilo_db.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
+pub enum ExportFormatArg {
+    /// One compact JSON object per line.
+    #[default]
+    Jsonl,
+    /// A single pretty-printed JSON array.
+    Json,
+    /// Comma-separated, with a header row.
+    Csv,
+    /// Tab-separated, with a header row.
+    Tsv,
+}
+
+impl From<ExportFormatArg> for crate::export::ExportFormat {
+    fn from(v: ExportFormatArg) -> Self {
+        match v {
+            ExportFormatArg::Jsonl => Self::Jsonl,
+            ExportFormatArg::Json => Self::Json,
+            ExportFormatArg::Csv => Self::Csv,
+            ExportFormatArg::Tsv => Self::Tsv,
+        }
+    }
+}
+
+impl std::fmt::Display for ExportFormatArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Jsonl => write!(f, "jsonl"),
+            Self::Json => write!(f, "json"),
+            Self::Csv => write!(f, "csv"),
+            Self::Tsv => write!(f, "tsv"),
+        }
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ExportArgs {
+    /// Claude Code projects directory (defaults to ~/.claude/projects).
+    #[arg(long = "claude-dir")]
+    pub claude_dir: Option<std::path::PathBuf>,
+
+    /// OpenCode database path(s). Can be specified multiple times.
+    #[arg(long = "opencode-db")]
+    pub opencode_db: Option<Vec<std::path::PathBuf>>,
+
+    /// OMP sessions directory (defaults to ~/.omp/agent/sessions).
+    #[arg(long = "omp-dir")]
+    pub omp_dir: Option<std::path::PathBuf>,
+
+    /// Kilo Code database path(s). Can be specified multiple times.
+    #[arg(long = "kilo-db")]
+    pub kilo_db: Option<Vec<std::path::PathBuf>>,
+
+    /// Only include sessions started at or after this RFC 3339 timestamp.
+    #[arg(long = "since")]
+    pub since: Option<DateTime<Utc>>,
+
+    /// Only include sessions from the last N days/hours (e.g. "7d", "4h").
+    /// Mutually exclusive with --since.
+    #[arg(long = "last")]
+    pub last: Option<String>,
+
+    /// Filter by project path substring.
+    #[arg(long = "project")]
+    pub project: Option<String>,
+
+    /// Filter by model substring (case-insensitive).
+    #[arg(long = "model")]
+    pub model: Option<String>,
+
+    /// Filter by source name.
+    #[arg(long = "source")]
+    pub source: Option<SourceArg>,
+
+    /// Output encoding. Defaults to jsonl.
+    #[arg(long = "format", default_value_t)]
+    pub format: ExportFormatArg,
+
+    /// Columns to emit, in order. Comma-separated and/or repeated. Defaults
+    /// to every field in canonical order.
+    #[arg(long = "fields", value_delimiter = ',')]
+    pub fields: Vec<String>,
+}
+
+impl ExportArgs {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.since.is_some() && self.last.is_some() {
+            anyhow::bail!("--since and --last are mutually exclusive");
+        }
+        Ok(())
+    }
+}
+
+impl FilterArgs for ExportArgs {
+    fn since(&self) -> Option<DateTime<Utc>> {
+        self.since
+    }
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+    fn source(&self) -> Option<&SourceArg> {
+        self.source.as_ref()
+    }
+}
+
+impl SourcePathArgs for ExportArgs {
     fn claude_dir(&self) -> Option<&PathBuf> {
         self.claude_dir.as_ref()
     }

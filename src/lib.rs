@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod diff;
 pub mod domain;
+pub mod export;
 pub mod filter;
 pub mod output;
 pub mod report;
