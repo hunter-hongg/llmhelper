@@ -1363,3 +1363,229 @@ fn search_rejects_since_and_last_together() {
         .unwrap();
     assert!(!output.status.success());
 }
+
+// --- Budget annotation -------------------------------------------------------
+
+/// The opencode fixture records 0.17 total Cost; omp records 1.5. Claude
+/// records none. These thresholds therefore produce `over`, `over`, and
+/// `not measured` respectively once the window is wide enough to see them.
+fn run_report_raw(extra_args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd.args([
+        "report",
+        "--output",
+        "/dev/stdout",
+        "--claude-dir",
+        fixture_dir().join("claude").to_str().unwrap(),
+        "--opencode-db",
+        fixture_dir()
+            .join("opencode")
+            .join("opencode.db")
+            .to_str()
+            .unwrap(),
+        "--omp-dir",
+        fixture_dir().join("omp").to_str().unwrap(),
+        "--kilo-db",
+        fixture_dir().join("kilo").join("kilo.db").to_str().unwrap(),
+    ]);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    cmd.output().expect("failed to run llmhelper report")
+}
+
+#[test]
+fn report_without_budgets_omits_budget_section() {
+    let out = run_report(&["--last", "30d"]);
+    assert!(!out.contains("## Budget"));
+}
+
+#[test]
+fn report_budget_section_reports_over() {
+    let out = run_report(&[
+        "--last",
+        "4000d",
+        "--budget",
+        "opencode:0.01",
+        "--budget-window",
+        "4000d",
+    ]);
+    assert!(out.contains("## Budget"), "{out}");
+    assert!(
+        out.contains("| cli:opencode | opencode | 4000d | 0.170000 | 0.010000 | over |"),
+        "{out}"
+    );
+}
+
+#[test]
+fn report_budget_section_reports_not_measured_for_claude() {
+    let out = run_report(&[
+        "--last",
+        "4000d",
+        "--budget",
+        "claude:5.00",
+        "--budget-window",
+        "4000d",
+    ]);
+    assert!(
+        out.contains("| cli:claude | claude | 4000d | — | 5.000000 | not measured |"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("| cli:claude | claude | 4000d | 0.000000 |"),
+        "{out}"
+    );
+}
+
+#[test]
+fn report_budget_sits_after_cost_and_before_usage() {
+    let out = run_report(&[
+        "--last",
+        "4000d",
+        "--budget",
+        "opencode:0.01",
+        "--budget-window",
+        "4000d",
+    ]);
+    let cost = out.find("## Cost by source").unwrap();
+    let budget = out.find("## Budget").unwrap();
+    let usage = out.find("## Usage by").unwrap();
+    assert!(cost < budget && budget < usage, "{out}");
+}
+
+#[test]
+fn report_unclipped_budget_has_no_caveat() {
+    let out = run_report(&[
+        "--last",
+        "4000d",
+        "--budget",
+        "opencode:0.01",
+        "--budget-window",
+        "4000d",
+    ]);
+    assert!(
+        !out.contains("measured over the loaded range only"),
+        "{out}"
+    );
+}
+
+#[test]
+fn report_wider_budget_window_emits_caveat() {
+    let out = run_report(&[
+        "--last",
+        "2d",
+        "--budget",
+        "opencode:0.01",
+        "--budget-window",
+        "4000d",
+    ]);
+    assert!(out.contains("cli:opencode: only records from"), "{out}");
+}
+
+#[test]
+fn budget_name_selects_one_configured_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(
+        &config,
+        "[budget.oc]\nsource = \"opencode\"\nwindow = \"4000d\"\nmax_cost = 0.01\n\
+         [budget.omp]\nsource = \"omp\"\nwindow = \"4000d\"\nmax_cost = 0.01\n",
+    )
+    .unwrap();
+    let tmp2 = tempfile::tempdir().unwrap();
+    let path = tmp2.path().join("report.md");
+    let mut cmd = Command::new(bin());
+    cmd.args(["report", "--output"]).arg(&path);
+    cmd.args(["--config"]).arg(&config);
+    for flag in report_source_flags() {
+        cmd.arg(flag);
+    }
+    cmd.args(["--last", "4000d", "--budget-name", "oc"]);
+    let output = cmd.output().expect("failed to run report");
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = fs::read_to_string(&path).unwrap();
+    // Scope the assertions to the Budget section: "omp" also appears in the
+    // Usage-by-source table below it.
+    let budget_section = out
+        .split("## Budget")
+        .nth(1)
+        .and_then(|s| s.split("## Usage by").next())
+        .unwrap_or("");
+    assert!(budget_section.contains("| oc | opencode |"), "{out}");
+    assert!(!budget_section.contains("| omp |"), "{out}");
+}
+
+#[test]
+fn unknown_budget_name_errors_listing_configured_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(
+        &config,
+        "[budget.oc]\nsource = \"opencode\"\nwindow = \"1d\"\nmax_cost = 5.0\n",
+    )
+    .unwrap();
+    let out = run_report_raw(&[
+        "--config",
+        config.to_str().unwrap(),
+        "--budget-name",
+        "nope",
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown --budget-name 'nope'"), "{stderr}");
+    assert!(stderr.contains("oc"), "{stderr}");
+}
+
+#[test]
+fn bad_budget_syntax_errors() {
+    let out = run_report_raw(&["--budget", "nocolon"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("expected <source>:<amount>"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn budget_with_unknown_source_errors() {
+    let out = run_report_raw(&["--budget", "bogus:5"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown source 'bogus'"));
+}
+
+#[test]
+fn budget_with_non_positive_amount_errors() {
+    let out = run_report_raw(&["--budget", "opencode:0"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("positive finite number"));
+}
+
+#[test]
+fn bad_budget_window_errors() {
+    let out = run_report_raw(&["--budget", "opencode:5", "--budget-window", "fortnight"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid --budget-window"));
+}
+
+#[test]
+fn usage_without_budgets_is_unaffected() {
+    // A no-budget run must still parse and emit the usual JSON shape.
+    let json = run_usage_json(&[]);
+    assert!(json["sources"].is_array());
+}
+
+#[test]
+fn usage_rejects_bad_budget_syntax() {
+    let mut cmd = Command::new(bin());
+    cmd.args(["usage", "--json", "--budget", "nocolon"]);
+    for flag in report_source_flags() {
+        cmd.arg(flag);
+    }
+    let output = cmd.output().expect("failed to run usage");
+    assert!(!output.status.success());
+}

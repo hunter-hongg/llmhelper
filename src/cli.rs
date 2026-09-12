@@ -152,6 +152,87 @@ impl std::fmt::Display for SourceArg {
     }
 }
 
+/// The three budget flags shared by the commands that display budgets
+/// (`usage` and `report`). Kept off [`FilterArgs`] deliberately: a budget is
+/// not a record predicate, it is an annotation applied to already-filtered
+/// records, so the two concerns stay separate.
+pub trait BudgetArgs {
+    /// One-off budgets spelled `source:amount`, repeatable.
+    fn budget(&self) -> &[String];
+    /// Window applied to `--budget` one-offs. `None` means the default `1d`.
+    fn budget_window(&self) -> Option<&str>;
+    /// Restrict evaluation to these configured budget names, repeatable.
+    fn budget_name(&self) -> &[String];
+
+    /// Resolve the effective budget list: the named configured budgets (or all
+    /// of them when no name is given) plus any `--budget` one-offs. Every
+    /// returned budget is validated here so a bad flag fails before loading.
+    fn resolve_budgets(
+        &self,
+        configured: &[crate::budget::Budget],
+    ) -> anyhow::Result<Vec<crate::budget::Budget>> {
+        let mut out: Vec<crate::budget::Budget> = Vec::new();
+
+        let names = self.budget_name();
+        if names.is_empty() {
+            out.extend(configured.iter().cloned());
+        } else {
+            for name in names {
+                let found = configured.iter().find(|b| &b.name == name).ok_or_else(|| {
+                    let known = if configured.is_empty() {
+                        "(none configured)".to_string()
+                    } else {
+                        configured
+                            .iter()
+                            .map(|b| b.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    anyhow::anyhow!(
+                        "unknown --budget-name '{}' (configured budgets: {})",
+                        name,
+                        known
+                    )
+                })?;
+                out.push(found.clone());
+            }
+            // Sort the selected configured budgets by name so the rendered
+            // order depends on the config, not the order the names were typed.
+            // One-offs below keep their flag order, which the user chose.
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+
+        let window_text = self.budget_window().unwrap_or("1d");
+        for spec in self.budget() {
+            out.push(parse_budget_spec(spec, window_text)?);
+        }
+
+        crate::budget::validate_all(&out)?;
+        Ok(out)
+    }
+}
+
+/// Parse a `--budget <source:amount>` one-off. The window comes from
+/// `--budget-window` (default `1d`).
+fn parse_budget_spec(spec: &str, window: &str) -> anyhow::Result<crate::budget::Budget> {
+    let (source, amount) = spec.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("invalid --budget '{}': expected <source>:<amount>", spec)
+    })?;
+    let max_cost: f64 = amount.parse().map_err(|_| {
+        anyhow::anyhow!("invalid --budget '{}': '{}' is not a number", spec, amount)
+    })?;
+    let window = crate::budget::BudgetWindow::parse(window)
+        .map_err(|e| anyhow::anyhow!("invalid --budget-window '{}': {}", window, e))?;
+    let budget = crate::budget::Budget {
+        name: format!("cli:{}", source),
+        source: source.to_string(),
+        window,
+        max_cost,
+    };
+    crate::budget::validate(&budget)?;
+    Ok(budget)
+}
+
 #[derive(Parser, Debug, Clone, Default)]
 pub struct UsageArgs {
     /// Claude Code projects directory (defaults to ~/.claude/projects).
@@ -202,6 +283,31 @@ pub struct UsageArgs {
     /// Output as CSV instead of the interactive TUI.
     #[arg(long = "csv")]
     pub csv: bool,
+
+    /// One-off spend budget as `<source>:<amount>`, e.g. `opencode:5.00`.
+    /// Repeatable. The window comes from --budget-window (default 1d).
+    #[arg(long = "budget")]
+    pub budget: Vec<String>,
+
+    /// Window applied to --budget one-offs (e.g. 1d, 7d, 30d, 1w, 1mo).
+    #[arg(long = "budget-window")]
+    pub budget_window: Option<String>,
+
+    /// Evaluate only these configured [budget.<name>] entries. Repeatable.
+    #[arg(long = "budget-name")]
+    pub budget_name: Vec<String>,
+}
+
+impl BudgetArgs for UsageArgs {
+    fn budget(&self) -> &[String] {
+        &self.budget
+    }
+    fn budget_window(&self) -> Option<&str> {
+        self.budget_window.as_deref()
+    }
+    fn budget_name(&self) -> &[String] {
+        &self.budget_name
+    }
 }
 
 impl UsageArgs {
@@ -533,6 +639,31 @@ pub struct ReportArgs {
     /// Write the rendered report to this file instead of stdout.
     #[arg(long = "output")]
     pub output: Option<std::path::PathBuf>,
+
+    /// One-off spend budget as `<source>:<amount>`, e.g. `opencode:5.00`.
+    /// Repeatable. The window comes from --budget-window (default 1d).
+    #[arg(long = "budget")]
+    pub budget: Vec<String>,
+
+    /// Window applied to --budget one-offs (e.g. 1d, 7d, 30d, 1w, 1mo).
+    #[arg(long = "budget-window")]
+    pub budget_window: Option<String>,
+
+    /// Evaluate only these configured [budget.<name>] entries. Repeatable.
+    #[arg(long = "budget-name")]
+    pub budget_name: Vec<String>,
+}
+
+impl BudgetArgs for ReportArgs {
+    fn budget(&self) -> &[String] {
+        &self.budget
+    }
+    fn budget_window(&self) -> Option<&str> {
+        self.budget_window.as_deref()
+    }
+    fn budget_name(&self) -> &[String] {
+        &self.budget_name
+    }
 }
 
 impl ReportArgs {
@@ -921,5 +1052,173 @@ impl SourcePathArgs for ExportArgs {
     }
     fn kilo_db(&self) -> Option<&Vec<PathBuf>> {
         self.kilo_db.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::budget::{Budget, BudgetWindow};
+
+    fn configured(name: &str) -> Budget {
+        Budget {
+            name: name.to_string(),
+            source: "opencode".to_string(),
+            window: BudgetWindow::parse("7d").unwrap(),
+            max_cost: 10.0,
+        }
+    }
+
+    fn usage_from(argv: &[&str]) -> UsageArgs {
+        let mut full = vec!["llmhelper", "usage"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full).unwrap().command {
+            Command::Usage(args) => args,
+            other => panic!("expected usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budget_flag_parses_source_and_amount() {
+        let args = usage_from(&["--budget", "opencode:5.00"]);
+        let resolved = args.resolve_budgets(&[]).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].source, "opencode");
+        assert_eq!(resolved[0].max_cost, 5.00);
+    }
+
+    #[test]
+    fn budget_flag_defaults_window_to_one_day() {
+        let args = usage_from(&["--budget", "opencode:5.00"]);
+        let resolved = args.resolve_budgets(&[]).unwrap();
+        assert_eq!(resolved[0].window, BudgetWindow::parse("1d").unwrap());
+    }
+
+    #[test]
+    fn budget_window_applies_to_one_offs() {
+        let args = usage_from(&["--budget", "opencode:5.00", "--budget-window", "30d"]);
+        let resolved = args.resolve_budgets(&[]).unwrap();
+        assert_eq!(resolved[0].window, BudgetWindow::parse("30d").unwrap());
+    }
+
+    #[test]
+    fn budget_flag_is_repeatable() {
+        let args = usage_from(&["--budget", "opencode:5", "--budget", "omp:2"]);
+        let resolved = args.resolve_budgets(&[]).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].source, "opencode");
+        assert_eq!(resolved[1].source, "omp");
+    }
+
+    #[test]
+    fn budget_without_colon_is_rejected() {
+        let args = usage_from(&["--budget", "opencode"]);
+        let err = args.resolve_budgets(&[]).unwrap_err().to_string();
+        assert!(err.contains("expected <source>:<amount>"), "{err}");
+    }
+
+    #[test]
+    fn budget_with_non_numeric_amount_is_rejected() {
+        let args = usage_from(&["--budget", "opencode:abc"]);
+        let err = args.resolve_budgets(&[]).unwrap_err().to_string();
+        assert!(err.contains("is not a number"), "{err}");
+    }
+
+    #[test]
+    fn budget_with_unknown_source_is_rejected() {
+        let args = usage_from(&["--budget", "bogus:5"]);
+        let err = args.resolve_budgets(&[]).unwrap_err().to_string();
+        assert!(err.contains("unknown source 'bogus'"), "{err}");
+    }
+
+    #[test]
+    fn budget_with_non_positive_amount_is_rejected() {
+        let args = usage_from(&["--budget", "opencode:0"]);
+        let err = args.resolve_budgets(&[]).unwrap_err().to_string();
+        assert!(err.contains("positive finite number"), "{err}");
+    }
+
+    #[test]
+    fn bad_budget_window_is_rejected() {
+        let args = usage_from(&["--budget", "opencode:5", "--budget-window", "fortnight"]);
+        let err = args.resolve_budgets(&[]).unwrap_err().to_string();
+        assert!(err.contains("invalid --budget-window"), "{err}");
+    }
+
+    #[test]
+    fn no_budget_flags_yields_configured_budgets() {
+        let args = usage_from(&[]);
+        let resolved = args.resolve_budgets(&[configured("daily")]).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "daily");
+    }
+
+    #[test]
+    fn budget_name_selects_one_configured_budget() {
+        let args = usage_from(&["--budget-name", "weekly"]);
+        let resolved = args
+            .resolve_budgets(&[configured("daily"), configured("weekly")])
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "weekly");
+    }
+
+    #[test]
+    fn unknown_budget_name_lists_configured_names() {
+        let args = usage_from(&["--budget-name", "nope"]);
+        let err = args
+            .resolve_budgets(&[configured("daily"), configured("weekly")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown --budget-name 'nope'"), "{err}");
+        assert!(err.contains("daily, weekly"), "{err}");
+    }
+
+    #[test]
+    fn unknown_budget_name_with_nothing_configured_says_so() {
+        let args = usage_from(&["--budget-name", "nope"]);
+        let err = args.resolve_budgets(&[]).unwrap_err().to_string();
+        assert!(err.contains("(none configured)"), "{err}");
+    }
+
+    #[test]
+    fn named_selection_is_sorted_by_name_not_flag_order() {
+        let args = usage_from(&["--budget-name", "weekly", "--budget-name", "daily"]);
+        let resolved = args
+            .resolve_budgets(&[configured("weekly"), configured("daily")])
+            .unwrap();
+        assert_eq!(
+            resolved.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            vec!["daily", "weekly"]
+        );
+    }
+
+    #[test]
+    fn configured_and_one_off_budgets_combine() {
+        let args = usage_from(&["--budget", "omp:2"]);
+        let resolved = args.resolve_budgets(&[configured("daily")]).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "daily");
+        assert_eq!(resolved[1].source, "omp");
+    }
+
+    #[test]
+    fn report_accepts_the_same_budget_flags() {
+        let cli = Cli::try_parse_from([
+            "llmhelper",
+            "report",
+            "--budget",
+            "opencode:5",
+            "--budget-window",
+            "1d",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Report(args) => {
+                let resolved = args.resolve_budgets(&[]).unwrap();
+                assert_eq!(resolved[0].source, "opencode");
+            }
+            other => panic!("expected report, got {other:?}"),
+        }
     }
 }

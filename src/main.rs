@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use llmhelper::aggregator::AggregateResult;
 use parking_lot::Mutex;
@@ -8,8 +9,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use llmhelper::cli::{
-    merge_source_paths, Cli, Command, DiffArgs, ExportArgs, FilterArgs, ReportArgs, RequestArgs,
-    SearchArgs, SessionsArgs, UsageArgs,
+    merge_source_paths, BudgetArgs, Cli, Command, DiffArgs, ExportArgs, FilterArgs, ReportArgs,
+    RequestArgs, SearchArgs, SessionsArgs, UsageArgs,
 };
 use llmhelper::config::Config;
 use llmhelper::diff::compute_diff;
@@ -35,17 +36,27 @@ struct TuiData {
     records: Vec<Record>,
     result: Option<AggregateResult>,
     source_statuses: Vec<SourceStatus>,
+    budgets: Vec<llmhelper::budget::EvaluatedBudget>,
 }
 
-fn load_usage_data(registry: &Registry, filter: &Filter, group_by: GroupBy) -> TuiData {
+fn load_usage_data(
+    registry: &Registry,
+    filter: &Filter,
+    group_by: GroupBy,
+    budgets: &[llmhelper::budget::Budget],
+    command_since: Option<DateTime<Utc>>,
+) -> TuiData {
     let (records, statuses) = registry.load_all();
     let filtered: Vec<Record> = filter.apply(&records).into_iter().cloned().collect();
     let filtered_refs: Vec<&Record> = filtered.iter().collect();
     let agg = AggregateResult::from_filtered_refs(&filtered_refs, group_by);
+    let evaluated =
+        llmhelper::budget::evaluate_with_measurement(budgets, &records, Utc::now(), command_since);
     TuiData {
         records: filtered,
         result: Some(agg),
         source_statuses: statuses,
+        budgets: evaluated,
     }
 }
 
@@ -102,11 +113,34 @@ fn build_filter<A: FilterArgs>(args: &A) -> anyhow::Result<Filter> {
     })
 }
 
+/// The lower bound of the command's own time filter, in UTC, resolved against
+/// a caller-supplied `now`. Passing `now` in (rather than reading the clock
+/// here) keeps it identical to the `now` used to evaluate budgets, so a budget
+/// whose window equals the command's `--last` window is not spuriously reported
+/// as clipped by a few microseconds of clock drift.
+fn command_since<A: FilterArgs>(
+    args: &A,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<DateTime<Utc>>> {
+    if let Some(since) = args.since() {
+        return Ok(Some(since));
+    }
+    match args.parse_last()? {
+        Some(d) => {
+            let d = chrono::Duration::from_std(d)?;
+            Ok(Some(now - d))
+        }
+        None => Ok(None),
+    }
+}
+
 fn run_tui(
     registry: Registry,
     filter: Filter,
     group_by: GroupBy,
     refresh_secs: u64,
+    budgets: Vec<llmhelper::budget::Budget>,
+    command_since: Option<DateTime<Utc>>,
 ) -> anyhow::Result<()> {
     let rt = Runtime::new()?;
 
@@ -124,12 +158,20 @@ fn run_tui(
     let reg_arc = Arc::new(registry);
     let reg_for_task = reg_arc.clone();
     let filter_clone = filter.clone();
+    let budgets_for_task = Arc::new(budgets);
+    let budgets_clone = budgets_for_task.clone();
     rt.spawn(async move {
         use tokio::time::{interval, Duration};
         let mut tick = interval(Duration::from_secs(refresh_secs));
         loop {
             tick.tick().await;
-            let data = load_usage_data(&reg_for_task, &filter_clone, *group_by_clone.lock());
+            let data = load_usage_data(
+                &reg_for_task,
+                &filter_clone,
+                *group_by_clone.lock(),
+                &budgets_clone,
+                command_since,
+            );
             // Bounded channel(1): drop stale data if TUI is busy
             let _ = tx.send(data).await;
         }
@@ -140,16 +182,30 @@ fn run_tui(
     tui.state.app.group_by = *group_by.lock();
 
     // Initial load
-    let initial = load_usage_data(&reg_arc, &filter, tui.state.app.group_by);
-    tui.state
-        .apply_data(initial.records, initial.result, initial.source_statuses);
+    let initial = load_usage_data(
+        &reg_arc,
+        &filter,
+        tui.state.app.group_by,
+        &budgets_for_task,
+        command_since,
+    );
+    tui.state.apply_data(
+        initial.records,
+        initial.result,
+        initial.source_statuses,
+        initial.budgets,
+    );
 
     // Main loop: poll channel each frame for background updates
     while tui.state.app.running {
         // Check for background refresh data
         if let Ok(data) = rx.try_recv() {
-            tui.state
-                .apply_data(data.records, data.result, data.source_statuses);
+            tui.state.apply_data(
+                data.records,
+                data.result,
+                data.source_statuses,
+                data.budgets,
+            );
         }
 
         tui.terminal.draw(|frame| {
@@ -175,16 +231,36 @@ fn run_tui(
                         }
                     }
                     crossterm::event::KeyCode::Char('r') => {
-                        let data = load_usage_data(&reg_arc, &filter, *group_by.lock());
-                        tui.state
-                            .apply_data(data.records, data.result, data.source_statuses);
+                        let data = load_usage_data(
+                            &reg_arc,
+                            &filter,
+                            *group_by.lock(),
+                            &budgets_for_task,
+                            command_since,
+                        );
+                        tui.state.apply_data(
+                            data.records,
+                            data.result,
+                            data.source_statuses,
+                            data.budgets,
+                        );
                     }
                     crossterm::event::KeyCode::Tab => {
                         tui.state.cycle_group();
                         *group_by.lock() = tui.state.app.group_by;
-                        let data = load_usage_data(&reg_arc, &filter, tui.state.app.group_by);
-                        tui.state
-                            .apply_data(data.records, data.result, data.source_statuses);
+                        let data = load_usage_data(
+                            &reg_arc,
+                            &filter,
+                            tui.state.app.group_by,
+                            &budgets_for_task,
+                            command_since,
+                        );
+                        tui.state.apply_data(
+                            data.records,
+                            data.result,
+                            data.source_statuses,
+                            data.budgets,
+                        );
                     }
                     crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
                         tui.state.select_next();
@@ -889,6 +965,11 @@ fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
     let registry = discover_sources(&config);
     let filter = build_filter(&args)?;
 
+    // Resolve and validate budgets before branching on output format: a bad
+    // budget flag is a user error regardless of whether the annotation is
+    // rendered, and `--json`/`--csv` must not silently accept a flag they ignore.
+    let budgets = args.resolve_budgets(&config.budgets)?;
+
     let (records, source_statuses) = registry.load_all();
     let agg = AggregateResult::from_records(&records, &filter, group_by);
 
@@ -902,7 +983,18 @@ fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
         renderer.csv(&agg.groups, &mut buf)?;
         println!("{}", String::from_utf8(buf)?);
     } else {
-        run_tui(registry, filter, group_by, config.refresh_interval_seconds)?;
+        // Resolve the command's own lower bound against the same `now` the TUI
+        // will use for budget windows, so an equal-width window is not flagged
+        // as clipped by the microseconds between two clock reads.
+        let now = Utc::now();
+        run_tui(
+            registry,
+            filter,
+            group_by,
+            config.refresh_interval_seconds,
+            budgets,
+            command_since(&args, now)?,
+        )?;
     }
     Ok(())
 }
@@ -997,7 +1089,19 @@ fn run_report(args: ReportArgs, config_path: &Option<PathBuf>) -> anyhow::Result
     let (records, source_statuses) = registry.load_all();
     let agg = AggregateResult::from_records(&records, &filter, group_by);
     let meta = report_meta(&args);
-    let markdown = render_report(&agg, &meta, &source_statuses, args.top);
+    let budgets = args.resolve_budgets(&config.budgets)?;
+    // One clock read for the whole run: the command's own `--last` bound and the
+    // budgets' windows must be measured against the same `now`, otherwise a
+    // budget whose window equals the command's is flagged as clipped by the few
+    // microseconds between two `now()` calls.
+    let now = Utc::now();
+    let evaluated = llmhelper::budget::evaluate_with_measurement(
+        &budgets,
+        &records,
+        now,
+        command_since(&args, now)?,
+    );
+    let markdown = render_report(&agg, &meta, &source_statuses, args.top, &evaluated);
     match args.output {
         Some(path) => std::fs::write(&path, markdown)
             .map_err(|e| anyhow::anyhow!("failed to write report to {}: {}", path.display(), e))?,

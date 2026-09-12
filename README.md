@@ -10,7 +10,7 @@ Interactive TUI aggregate view.
 llmhelper usage --last 7d --group-by project
 llmhelper usage --project myproj --model auto --json
 ```
-Flags: `--since/--last`, `--project`, `--model`, `--source`, `--group-by source|project|model`, `--json/--csv`.
+Flags: `--since/--last`, `--project`, `--model`, `--source`, `--group-by source|project|model`, `--json/--csv`, `--budget <source:amount>` (repeatable), `--budget-window <spec>`, `--budget-name <name>` (repeatable).
 
 ### diff
 Sliding-window comparison between two periods.
@@ -39,6 +39,8 @@ Without `--output`, `report` opens an interactive TUI that renders the Markdown 
 With `--output <path>` the report is written to the file instead (stdout stays empty), suitable for pasting into chat/PR/notes or committing. Header includes generation time, window and applied filters. Totals, per-source Cost, and a grouped usage table are rendered. `--top n` truncates the groups table with a `(+ k more …)` summary line; `--title <string>` replaces the default `# llmhelper report` heading.
 
 Cost is source-scoped and never summed across sources.
+
+`report` and `usage` also accept the budget flags `--budget`, `--budget-window`, and `--budget-name` (see [Budgets](#budgets)). When budgets are configured, `report` gains a `## Budget` section and `usage` flags over-budget Source rows.
 
 ### request
 Send an OpenAI-compatible Chat Completions request with TUI or CLI output.
@@ -162,6 +164,75 @@ Flags: `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db`, `--since`/`--l
 
 Auto-discovered at defaults; override with `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db` or config file.
 
+## Budgets
+
+A budget is a spend ceiling for exactly one Source. It answers "has this Source
+cost more than I allowed, over this window?" — and nothing else. Budgets are
+**annotation only**: they change what the report and `usage` TUI display, never
+the exit code, so they are safe to leave configured.
+
+Because Cost is always source-scoped (a group of records from mixed Sources has
+no single meaningful Cost), a budget binds to one Source and is never summed
+across Sources. Claude Code records no Cost at all, so a budget on it reports
+`not measured` rather than a misleading `ok`.
+
+Budget flags are accepted by `report` and `usage`. The annotation appears in the
+report Markdown (including `report --output`) and in the `usage` TUI;
+`usage --json`/`--csv` still validate the flags but emit no budget data, since
+those are machine formats with a fixed shape.
+
+### Declaring a budget
+
+In `~/.config/llmhelper/config.toml`:
+
+```toml
+[budget.opencode-daily]
+source   = "opencode"
+window   = "1d"
+max_cost = 5.00
+```
+
+`window` accepts a calendar or a free duration: `1d`, `7d`, `30d`, `1w`,
+`1mo`, `12h`, `30m`. A calendar window (`1d`, `1w`, `1mo`) is anchored at local
+midnight and never counts across that boundary: `1d` is today, `1w` the last 7
+local days, `1mo` the last 30 local days (trailing windows, not ISO weeks or
+calendar months). A free duration (`12h`, `30m`) is a rolling window from the
+current instant.
+
+### One-off budgets on the command line
+
+`--budget <source>:<amount>` declares a budget without editing config, and is
+repeatable. `--budget-window` sets its window (default `1d`).
+`--budget-name <name>` restricts evaluation to configured budgets by name (all
+configured budgets are used when no name is given).
+
+```bash
+# A $5/day ceiling on OpenCode, alongside any configured budgets
+llmhelper report --last 7d --budget opencode:5.00
+
+# A $20 rolling 12h ceiling on omp
+llmhelper usage --budget omp:20 --budget-window 12h
+
+# Only the configured budget named "opencode-daily"
+llmhelper report --budget-name opencode-daily
+```
+
+### Reading the status
+
+| status | meaning |
+|---|---|
+| `over` | the Source records Cost, and spend is **strictly greater** than `max_cost` |
+| `ok` | the Source records Cost, and spend is at or below `max_cost` |
+| `not measured` | the Source records no Cost (Claude Code), or contributed no records |
+
+The boundary is strictly greater on purpose: spend exactly equal to the ceiling
+has not crossed it.
+
+A budget's window is its own property, not the command's `--last` window. When
+the command loads a narrower range than the budget declares (a `30d` budget
+inside a `--last 7d` run), the `## Budget` section says so and names the bound,
+because the spend can then only be measured over the data that was loaded.
+
 ## Build & Test
 ```bash
 cargo build --release
@@ -170,4 +241,4 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 ## Specs
-See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search and export specifications. Architecture notes in `docs/adr/`.
+See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export and budget specifications. Architecture notes in `docs/adr/`.

@@ -1,4 +1,5 @@
 use crate::aggregator::AggregateResult;
+use crate::budget::{BudgetState, EvaluatedBudget};
 use crate::output::format_tokens;
 use crate::source::SourceStatus;
 
@@ -33,12 +34,69 @@ fn cost_cell(cost: Option<f64>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
+/// The lowercase status word used in the Budget table.
+pub fn budget_state_label(state: BudgetState) -> &'static str {
+    match state {
+        BudgetState::Over => "over",
+        BudgetState::Under => "ok",
+        BudgetState::NotMeasured => "not measured",
+    }
+}
+
+/// Append the `## Budget` section. One row per budget; a Source that records
+/// no Cost shows `—`, never `0.000000`. When a budget's window reaches further
+/// back than the data the command loaded, a note says so, because the spend
+/// figure is then measured over less than the budget's declared window.
+///
+/// The caveat is per-budget and derived: it names *that* budget's declared
+/// window and the narrower bound the command actually loaded, so the reader
+/// can tell a full-window measurement from a clipped one. A caveat is printed
+/// only for budgets that were actually clipped.
+fn render_budget_section(out: &mut String, budgets: &[EvaluatedBudget]) {
+    out.push_str("## Budget\n\n");
+    out.push_str("| budget | source | window | spend | max | status |\n");
+    out.push_str("|---|---|---|---|---|---|\n");
+    for b in budgets {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {:.6} | {} |\n",
+            md_cell(&b.status.budget.name),
+            md_cell(&b.status.budget.source),
+            md_cell(b.status.budget.window.label()),
+            cost_cell(b.status.spend),
+            b.status.budget.max_cost,
+            budget_state_label(b.status.state),
+        ));
+    }
+    out.push('\n');
+    out.push_str(
+        "_Status is `over` only when spend is strictly greater than `max`; \
+         a Source that records no Cost is `not measured` rather than `ok`._\n",
+    );
+    for b in budgets {
+        if let Some(clipped) = b.measurement.clipped_by {
+            out.push_str(&format!(
+                "_{}: only records from {} onward were loaded, so its {} window \
+                 is measured over the loaded range only._\n",
+                md_cell(&b.status.budget.name),
+                clipped.format("%Y-%m-%dT%H:%M:%SZ"),
+                md_cell(b.status.budget.window.label()),
+            ));
+        }
+    }
+    out.push('\n');
+}
+
 /// Render the complete Markdown report as a string. Pure: no I/O.
+///
+/// `budgets` carries each budget's evaluation and how it was measured. When
+/// empty the `## Budget` section is omitted entirely, so a run with no budgets
+/// configured renders exactly as it did before the feature existed.
 pub fn render_report(
     agg: &AggregateResult,
     meta: &ReportMeta,
     statuses: &[SourceStatus],
     top: Option<usize>,
+    budgets: &[EvaluatedBudget],
 ) -> String {
     let mut out = String::new();
 
@@ -100,6 +158,11 @@ pub fn render_report(
             out.push_str(&format!("| {} | {:.6} |\n", md_cell(source), c));
         }
         out.push('\n');
+    }
+
+    // --- Budgets (source-scoped ceilings; never cross-source) ---
+    if !budgets.is_empty() {
+        render_budget_section(&mut out, budgets);
     }
 
     // --- Usage groups ---
@@ -228,7 +291,13 @@ mod tests {
 
     #[test]
     fn header_echoes_window_and_filters() {
-        let report = render_report(&agg_with(vec![]), &meta(), &[ok_status("claude", 0)], None);
+        let report = render_report(
+            &agg_with(vec![]),
+            &meta(),
+            &[ok_status("claude", 0)],
+            None,
+            &[],
+        );
         assert!(report.starts_with("# llmhelper report\n"));
         assert!(report.contains("window: last 7d"));
         assert!(report.contains("project=/proj/a"));
@@ -241,7 +310,7 @@ mod tests {
             title: Some("Team weekly LLM usage".to_string()),
             ..meta()
         };
-        let report = render_report(&agg_with(vec![]), &m, &[], None);
+        let report = render_report(&agg_with(vec![]), &m, &[], None, &[]);
         assert!(report.starts_with("# Team weekly LLM usage\n"));
     }
 
@@ -251,7 +320,7 @@ mod tests {
             title: Some("Team|Weekly".to_string()),
             ..meta()
         };
-        let report = render_report(&agg_with(vec![]), &m, &[], None);
+        let report = render_report(&agg_with(vec![]), &m, &[], None, &[]);
         assert!(report.starts_with("# Team\\|Weekly\n"));
     }
 
@@ -264,7 +333,7 @@ mod tests {
             filters: vec![],
             title: None,
         };
-        let report = render_report(&agg_with(vec![]), &m, &[], None);
+        let report = render_report(&agg_with(vec![]), &m, &[], None, &[]);
         assert!(report.contains("filters: (none)"));
         assert!(report.contains("window: all time"));
         assert!(report.contains("## Usage by project"));
@@ -276,7 +345,7 @@ mod tests {
             group("claude", "claude", 1_000, None),
             group("opencode", "opencode", 250, Some(0.5)),
         ]);
-        let report = render_report(&agg, &meta(), &[], None);
+        let report = render_report(&agg, &meta(), &[], None, &[]);
         assert!(report.contains("## Totals"));
         // grand: sessions 2+2=4, messages 4+4=8, input 1250 -> 1.2K,
         // output 625, cache_read 2, cache_write 2.
@@ -291,7 +360,7 @@ mod tests {
             group("big-pickle", "opencode", 300, Some(1.0)),
             group("omp", "omp", 50, Some(0.2)),
         ]);
-        let report = render_report(&agg, &meta(), &[], None);
+        let report = render_report(&agg, &meta(), &[], None, &[]);
         assert!(report.contains("## Cost by source"));
         assert!(report.contains("| opencode | 1.500000 |"));
         assert!(report.contains("| omp | 0.200000 |"));
@@ -302,7 +371,7 @@ mod tests {
     #[test]
     fn cost_by_source_empty_when_none_record_cost() {
         let agg = agg_with(vec![group("claude", "claude", 100, None)]);
-        let report = render_report(&agg, &meta(), &[], None);
+        let report = render_report(&agg, &meta(), &[], None, &[]);
         assert!(report.contains("(no source records cost)"));
     }
 
@@ -313,7 +382,7 @@ mod tests {
             group("big", "claude", 10_000, None),
             group("mid", "claude", 500, None),
         ]);
-        let report = render_report(&agg, &meta(), &[], None);
+        let report = render_report(&agg, &meta(), &[], None, &[]);
         let big = report.find("| big ").unwrap();
         let mid = report.find("| mid ").unwrap();
         let small = report.find("| small ").unwrap();
@@ -327,7 +396,7 @@ mod tests {
             group("b", "claude", 200, None),
             group("c", "claude", 700, None),
         ]);
-        let report = render_report(&agg, &meta(), &[], Some(1));
+        let report = render_report(&agg, &meta(), &[], Some(1), &[]);
         assert!(report.contains("| c |"));
         assert!(!report.contains("| a |"));
         assert!(!report.contains("| b |"));
@@ -339,7 +408,7 @@ mod tests {
     #[test]
     fn unavailable_cost_renders_em_dash_not_zero() {
         let agg = agg_with(vec![group("claude", "claude", 100, None)]);
-        let report = render_report(&agg, &meta(), &[], None);
+        let report = render_report(&agg, &meta(), &[], None, &[]);
         let row = report.lines().find(|l| l.starts_with("| claude ")).unwrap();
         assert!(row.ends_with("| — |"));
         assert!(!row.contains("| 0.000000 |"));
@@ -347,7 +416,7 @@ mod tests {
 
     #[test]
     fn empty_aggregate_renders_no_match_note() {
-        let report = render_report(&agg_with(vec![]), &meta(), &[], None);
+        let report = render_report(&agg_with(vec![]), &meta(), &[], None, &[]);
         assert!(report.contains("no sessions matched the current filters"));
         assert!(report.contains("## Sources"));
     }
@@ -359,14 +428,14 @@ mod tests {
             record_count: 0,
             error: Some(SourceError::Absent("/missing/db".to_string())),
         }];
-        let report = render_report(&agg_with(vec![]), &meta(), &statuses, None);
+        let report = render_report(&agg_with(vec![]), &meta(), &statuses, None, &[]);
         assert!(report.contains("| opencode | 0 | absent: /missing/db |"));
     }
 
     #[test]
     fn pipe_in_project_key_is_escaped() {
         let agg = agg_with(vec![group("a|b", "claude", 100, None)]);
-        let report = render_report(&agg, &meta(), &[], None);
+        let report = render_report(&agg, &meta(), &[], None, &[]);
         assert!(report.contains("| a\\|b |"));
     }
 
@@ -375,5 +444,197 @@ mod tests {
         assert!(is_truncation_note("_(+ 2 more — 300 input tokens)_"));
         assert!(!is_truncation_note("plain text"));
         assert!(!is_truncation_note("_(unclosed"));
+    }
+    use crate::budget::{
+        Budget, BudgetState, BudgetStatus, BudgetWindow, EvaluatedBudget, Measurement,
+    };
+
+    fn at(s: &str) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn budget(name: &str, source: &str, max: f64) -> Budget {
+        Budget {
+            name: name.to_string(),
+            source: source.to_string(),
+            window: BudgetWindow::parse("7d").unwrap(),
+            max_cost: max,
+        }
+    }
+
+    fn evaluated(
+        name: &str,
+        source: &str,
+        state: BudgetState,
+        spend: Option<f64>,
+        clipped_by: Option<chrono::DateTime<Utc>>,
+    ) -> EvaluatedBudget {
+        EvaluatedBudget {
+            status: BudgetStatus {
+                budget: budget(name, source, 5.0),
+                spend,
+                state,
+            },
+            measurement: Measurement {
+                lower_bound: None,
+                clipped_by,
+            },
+        }
+    }
+
+    #[test]
+    fn budget_section_is_omitted_when_no_budgets() {
+        let report = render_report(&agg_with(vec![]), &meta(), &[], None, &[]);
+        assert!(!report.contains("## Budget"));
+    }
+
+    #[test]
+    fn budget_section_sits_between_cost_and_usage() {
+        let e = evaluated("daily", "opencode", BudgetState::Under, Some(1.0), None);
+        let report = render_report(&agg_with(vec![]), &meta(), &[], None, &[e]);
+        let cost = report.find("## Cost by source").unwrap();
+        let budget = report.find("## Budget").unwrap();
+        let usage = report.find("## Usage by").unwrap();
+        assert!(cost < budget && budget < usage, "{report}");
+    }
+
+    #[test]
+    fn under_budget_row_reads_ok() {
+        let e = evaluated("daily", "opencode", BudgetState::Under, Some(1.0), None);
+        let report = render_report(&agg_with(vec![]), &meta(), &[], None, &[e]);
+        assert!(
+            report.contains("| daily | opencode | 7d | 1.000000 | 5.000000 | ok |"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn over_budget_row_reads_over() {
+        let e = evaluated("daily", "opencode", BudgetState::Over, Some(9.0), None);
+        let report = render_report(&agg_with(vec![]), &meta(), &[], None, &[e]);
+        assert!(
+            report.contains("| daily | opencode | 7d | 9.000000 | 5.000000 | over |"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn not_measured_row_shows_dash_not_zero() {
+        let e = evaluated("cc", "claude", BudgetState::NotMeasured, None, None);
+        let report = render_report(&agg_with(vec![]), &meta(), &[], None, &[e]);
+        assert!(
+            report.contains("| cc | claude | 7d | — | 5.000000 | not measured |"),
+            "{report}"
+        );
+        assert!(!report.contains("| cc | claude | 7d | 0.000000 |"));
+    }
+
+    #[test]
+    fn clipped_budget_emits_a_derived_caveat() {
+        let e = evaluated(
+            "monthly",
+            "opencode",
+            BudgetState::Under,
+            Some(1.0),
+            Some(at("2026-09-06T00:00:00Z")),
+        );
+        let report = render_report(&agg_with(vec![]), &meta(), &[], None, &[e]);
+        assert!(report.contains("monthly: only records from"), "{report}");
+        assert!(report.contains("2026-09-06T00:00:00Z"), "{report}");
+        assert!(report.contains("its 7d window"), "{report}");
+    }
+
+    #[test]
+    fn unclipped_budget_emits_no_caveat() {
+        let e = evaluated("daily", "opencode", BudgetState::Under, Some(1.0), None);
+        let report = render_report(&agg_with(vec![]), &meta(), &[], None, &[e]);
+        assert!(
+            !report.contains("measured over the loaded range only"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn only_clipped_budgets_get_the_caveat() {
+        let clipped = evaluated(
+            "monthly",
+            "omp",
+            BudgetState::Under,
+            Some(1.0),
+            Some(at("2026-09-06T00:00:00Z")),
+        );
+        let whole = evaluated("daily", "opencode", BudgetState::Under, Some(1.0), None);
+        let report = render_report(&agg_with(vec![]), &meta(), &[], None, &[clipped, whole]);
+        assert!(report.contains("monthly: only records from"));
+        assert!(!report.contains("daily: only records from"));
+    }
+
+    #[test]
+    fn budget_rows_keep_the_order_they_were_given() {
+        let a = evaluated("alpha", "opencode", BudgetState::Under, Some(1.0), None);
+        let b = evaluated("beta", "omp", BudgetState::Under, Some(1.0), None);
+        let report = render_report(&agg_with(vec![]), &meta(), &[], None, &[a, b]);
+        let alpha = report.find("| alpha |").unwrap();
+        let beta = report.find("| beta |").unwrap();
+        assert!(alpha < beta);
+    }
+
+    #[test]
+    fn no_budget_output_is_byte_identical_to_the_pre_budget_document() {
+        // The literal below is the exact document `render_report` produced
+        // before the budget feature. If an empty budget list ever leaks a
+        // trailing blank line or a stray legend, this catches it.
+        let m = ReportMeta {
+            generated_at: chrono::DateTime::parse_from_rfc3339("2026-09-13T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            window: "last 30d".to_string(),
+            group_by: "source".to_string(),
+            filters: vec![],
+            title: None,
+        };
+        let agg = agg_with(vec![group("opencode", "opencode", 100, Some(1.5))]);
+        let actual = render_report(&agg, &m, &[ok_status("opencode", 1)], None, &[]);
+        let expected = "\
+# llmhelper report
+
+- generated: 2026-09-13T00:00:00Z
+- window: last 30d
+- filters: (none)
+
+## Totals
+
+| sessions | messages | input | output | cache read | cache write |
+|---|---|---|---|---|---|
+| 2 | 4 | 100 | 50 | 1 | 1 |
+
+## Cost by source
+
+| source | cost |
+|---|---|
+| opencode | 1.500000 |
+
+## Usage by source
+
+| key | sessions | messages | input | output | cache read | cache write | cost |
+|---|---|---|---|---|---|---|---|
+| opencode | 2 | 4 | 100 | 50 | 1 | 1 | 1.500000 |
+
+## Sources
+
+| source | records | status |
+|---|---|---|
+| opencode | 1 | ok |
+";
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn budget_state_label_vocabulary() {
+        assert_eq!(budget_state_label(BudgetState::Over), "over");
+        assert_eq!(budget_state_label(BudgetState::Under), "ok");
+        assert_eq!(budget_state_label(BudgetState::NotMeasured), "not measured");
     }
 }

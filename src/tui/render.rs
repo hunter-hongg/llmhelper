@@ -156,6 +156,20 @@ fn render_header(state: &TuiState) -> Paragraph<'_> {
                 state.app.group_by.label().to_string(),
                 Style::default().fg(ACCENT2).add_modifier(Modifier::BOLD),
             ),
+            // Budget indicator rides on the same line so the header height is
+            // unchanged; only present when budgets are configured.
+            match state.app.budget_indicator() {
+                Some(indicator) => {
+                    let over = indicator.contains("over");
+                    Span::styled(
+                        format!("   {}", indicator),
+                        Style::default()
+                            .fg(if over { RED } else { MUTED })
+                            .add_modifier(Modifier::BOLD),
+                    )
+                }
+                None => Span::raw(""),
+            },
         ]));
     }
 
@@ -451,6 +465,8 @@ fn render_table(state: &mut TuiState) -> Table<'static> {
                 BG
             };
 
+            let over_budget = state.app.source_is_over_budget(&g.source);
+
             let num = |s: String, fg: Color, right: bool| -> Cell {
                 if right {
                     Cell::from(Text::from(s).alignment(Alignment::Right))
@@ -465,6 +481,16 @@ fn render_table(state: &mut TuiState) -> Table<'static> {
                     Cell::new(format!("▶ {}", g.key)).style(
                         Style::default()
                             .fg(ACCENT)
+                            .add_modifier(Modifier::BOLD)
+                            .bg(row_bg),
+                    )
+                } else if over_budget {
+                    // Flag the over-budget source without adding a column: the
+                    // two-char marker occupies the same width as the plain
+                    // selection gutter, so the layout never shifts.
+                    Cell::new(format!("⚠ {}", g.key)).style(
+                        Style::default()
+                            .fg(RED)
                             .add_modifier(Modifier::BOLD)
                             .bg(row_bg),
                     )

@@ -13,6 +13,9 @@ pub struct Config {
     pub request_timeout_seconds: Option<u64>,
     pub request_reasoning_fields: Option<Vec<String>>,
     pub request_reasoning: Option<PathBuf>,
+    /// Source-scoped spend budgets declared under `[budget.<name>]`, in the
+    /// file's declaration order. Empty when the table is absent.
+    pub budgets: Vec<crate::budget::Budget>,
 }
 
 impl Default for Config {
@@ -29,6 +32,7 @@ impl Default for Config {
             request_timeout_seconds: None,
             request_reasoning_fields: None,
             request_reasoning: None,
+            budgets: Vec::new(),
         }
     }
 }
@@ -103,6 +107,20 @@ impl Config {
                 .as_ref()
                 .and_then(|r| r.reasoning.clone())
                 .map(|p| resolve_relative(&path, p)),
+            budgets: parsed
+                .budget
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, b)| {
+                    let window = crate::budget::BudgetWindow::parse_or_unparsed(&b.window);
+                    crate::budget::Budget {
+                        name,
+                        source: b.source,
+                        window,
+                        max_cost: b.max_cost,
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -117,6 +135,15 @@ struct ConfigTable {
     source: Option<SourceConfig>,
     ui: Option<UiConfig>,
     request: Option<RequestConfig>,
+    /// `[budget.<name>]` tables, in declaration order.
+    budget: Option<std::collections::BTreeMap<String, BudgetConfig>>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct BudgetConfig {
+    source: String,
+    window: String,
+    max_cost: f64,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -257,5 +284,116 @@ refresh_interval_seconds = 10
         let default_cfg = Config::default();
         assert!(default_cfg.claude_dir.is_none());
         assert_eq!(default_cfg.refresh_interval_seconds, 5);
+    }
+
+    #[test]
+    fn budget_table_parses_into_ordered_budgets() {
+        let parsed: ConfigTable = toml::from_str(
+            r#"
+[budget.zebra]
+source = "omp"
+window = "30d"
+max_cost = 40.0
+
+[budget.alpha]
+source = "opencode"
+window = "1d"
+max_cost = 5.0
+"#,
+        )
+        .unwrap();
+        let budgets = parsed.budget.unwrap();
+        // BTreeMap: declaration order does not matter, name order does.
+        let names: Vec<&String> = budgets.keys().collect();
+        assert_eq!(names, vec!["alpha", "zebra"]);
+        assert_eq!(budgets["alpha"].source, "opencode");
+        assert_eq!(budgets["alpha"].window, "1d");
+        assert_eq!(budgets["alpha"].max_cost, 5.0);
+    }
+
+    #[test]
+    fn budget_table_absent_yields_empty() {
+        let parsed: ConfigTable = toml::from_str("[ui]\nrefresh_interval_seconds = 5\n").unwrap();
+        assert!(parsed.budget.is_none());
+    }
+
+    #[test]
+    fn config_load_produces_budgets_with_parsed_windows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[budget.daily]
+source = "opencode"
+window = "1d"
+max_cost = 5.0
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load_with(Some(&path));
+        assert_eq!(cfg.budgets.len(), 1);
+        assert_eq!(cfg.budgets[0].name, "daily");
+        assert_eq!(
+            cfg.budgets[0].window,
+            crate::budget::BudgetWindow::Calendar {
+                days: 1,
+                label: "1d".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_budget_window_is_carried_for_validation_to_reject() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[budget.bad]
+source = "opencode"
+window = "soon"
+max_cost = 5.0
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load_with(Some(&path));
+        // Loading succeeds; validation is what rejects it, naming the value.
+        assert!(crate::budget::validate_all(&cfg.budgets).is_err());
+        let err = crate::budget::validate_all(&cfg.budgets)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("soon") && err.contains("bad"), "{}", err);
+    }
+
+    #[test]
+    fn malformed_budget_source_and_amount_are_rejected_by_validation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[budget.badsrc]
+source = "gemini"
+window = "1d"
+max_cost = 5.0
+
+[budget.badamt]
+source = "opencode"
+window = "1d"
+max_cost = 0.0
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load_with(Some(&path));
+        let err = crate::budget::validate_all(&cfg.budgets)
+            .unwrap_err()
+            .to_string();
+        // BTreeMap order: badamt before badsrc.
+        assert!(
+            err.contains("badamt") && err.contains("max_cost"),
+            "{}",
+            err
+        );
     }
 }

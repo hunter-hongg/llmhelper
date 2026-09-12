@@ -1,4 +1,5 @@
 pub mod aggregator;
+pub mod budget;
 pub mod cli;
 pub mod config;
 pub mod diff;

@@ -29,11 +29,48 @@ pub struct App {
     pub source_statuses: Vec<SourceStatus>,
     pub view: View,
     pub detail: Option<GroupDetail>,
+    /// Evaluated spend budgets for this run. Empty means no budget was
+    /// configured, in which case the TUI renders exactly as it did before the
+    /// budget feature existed.
+    pub budgets: Vec<crate::budget::EvaluatedBudget>,
 }
 
 impl App {
     pub fn cycle_group(&mut self) {
         self.group_by = self.group_by.next();
+    }
+
+    /// A short budget summary for the header, or `None` when nothing is
+    /// configured. `over` counts wins reporting precision over brevity: the
+    /// reader needs the count that matters.
+    pub fn budget_indicator(&self) -> Option<String> {
+        if self.budgets.is_empty() {
+            return None;
+        }
+        let over = self
+            .budgets
+            .iter()
+            .filter(|b| b.status.state == crate::budget::BudgetState::Over)
+            .count();
+        let measured = self
+            .budgets
+            .iter()
+            .filter(|b| b.status.state != crate::budget::BudgetState::NotMeasured)
+            .count();
+        if over > 0 {
+            Some(format!("budget: {} over", over))
+        } else if measured == 0 {
+            Some("budget: not measured".to_string())
+        } else {
+            Some("budget: ok".to_string())
+        }
+    }
+
+    /// Whether the given Source has an `over` budget, so its row is highlighted.
+    pub fn source_is_over_budget(&self, source: &str) -> bool {
+        self.budgets.iter().any(|b| {
+            b.status.budget.source == source && b.status.state == crate::budget::BudgetState::Over
+        })
     }
 }
 
@@ -70,12 +107,14 @@ impl TuiState {
         records: Vec<Record>,
         result: Option<AggregateResult>,
         source_statuses: Vec<SourceStatus>,
+        budgets: Vec<crate::budget::EvaluatedBudget>,
     ) {
         let detail = self.app.detail.take();
         let detail_selection = self.detail_state.selected().unwrap_or(0);
         self.app.records = records;
         self.app.result = result;
         self.app.source_statuses = source_statuses;
+        self.app.budgets = budgets;
         self.sync_group_selection();
 
         if let Some(detail) = detail {
@@ -242,7 +281,7 @@ mod tests {
         let result = AggregateResult::from_records(records, &Filter::none(), group_by);
         let mut state = TuiState::default();
         state.app.group_by = group_by;
-        state.apply_data(records.to_vec(), Some(result), Vec::new());
+        state.apply_data(records.to_vec(), Some(result), Vec::new(), Vec::new());
         state
     }
 
@@ -380,13 +419,13 @@ mod tests {
 
         let one = vec![record("new", "claude", "/p", "auto", now, None)];
         let one_result = AggregateResult::from_records(&one, &Filter::none(), GroupBy::Source);
-        state.apply_data(one, Some(one_result), Vec::new());
+        state.apply_data(one, Some(one_result), Vec::new(), Vec::new());
         assert_eq!(state.app.view, View::Detail);
         assert_eq!(state.detail_state.selected(), Some(0));
 
         let empty = Vec::<Record>::new();
         let empty_result = AggregateResult::from_records(&empty, &Filter::none(), GroupBy::Source);
-        state.apply_data(empty, Some(empty_result), Vec::new());
+        state.apply_data(empty, Some(empty_result), Vec::new(), Vec::new());
         assert_eq!(state.app.view, View::Groups);
         assert!(state.app.detail.is_none());
     }
@@ -438,5 +477,85 @@ mod tests {
         }
         assert_eq!(state.detail_state.selected(), Some(0));
         assert_eq!(state.detail_state.offset(), 0);
+    }
+
+    fn evaluated(
+        source: &str,
+        state: crate::budget::BudgetState,
+    ) -> crate::budget::EvaluatedBudget {
+        crate::budget::EvaluatedBudget {
+            status: crate::budget::BudgetStatus {
+                budget: crate::budget::Budget {
+                    name: source.to_string(),
+                    source: source.to_string(),
+                    window: crate::budget::BudgetWindow::Calendar {
+                        days: 1,
+                        label: "calendar".to_string(),
+                    },
+                    max_cost: 5.0,
+                },
+                spend: Some(6.0),
+                state,
+            },
+            measurement: crate::budget::Measurement {
+                lower_bound: None,
+                clipped_by: None,
+            },
+        }
+    }
+
+    #[test]
+    fn no_budgets_configured_renders_no_indicator() {
+        let state = load_state(&[], GroupBy::Source);
+        assert_eq!(state.app.budget_indicator(), None);
+    }
+
+    #[test]
+    fn over_budget_indicator_counts_over_budgets() {
+        let mut state = load_state(&[], GroupBy::Source);
+        state.app.budgets = vec![
+            evaluated("opencode", crate::budget::BudgetState::Over),
+            evaluated("omp", crate::budget::BudgetState::Under),
+        ];
+        assert_eq!(
+            state.app.budget_indicator().as_deref(),
+            Some("budget: 1 over")
+        );
+    }
+
+    #[test]
+    fn all_under_budget_indicator_reads_ok() {
+        let mut state = load_state(&[], GroupBy::Source);
+        state.app.budgets = vec![evaluated("opencode", crate::budget::BudgetState::Under)];
+        assert_eq!(state.app.budget_indicator().as_deref(), Some("budget: ok"));
+    }
+
+    #[test]
+    fn only_not_measured_indicator_says_not_measured() {
+        let mut state = load_state(&[], GroupBy::Source);
+        state.app.budgets = vec![evaluated("claude", crate::budget::BudgetState::NotMeasured)];
+        assert_eq!(
+            state.app.budget_indicator().as_deref(),
+            Some("budget: not measured")
+        );
+    }
+
+    #[test]
+    fn over_budget_source_is_highlighted() {
+        let mut state = load_state(&[], GroupBy::Source);
+        state.app.budgets = vec![
+            evaluated("opencode", crate::budget::BudgetState::Over),
+            evaluated("omp", crate::budget::BudgetState::Under),
+        ];
+        assert!(state.app.source_is_over_budget("opencode"));
+        assert!(!state.app.source_is_over_budget("omp"));
+        assert!(!state.app.source_is_over_budget("kilo"));
+    }
+
+    #[test]
+    fn under_budget_source_is_not_highlighted() {
+        let mut state = load_state(&[], GroupBy::Source);
+        state.app.budgets = vec![evaluated("opencode", crate::budget::BudgetState::Under)];
+        assert!(!state.app.source_is_over_budget("opencode"));
     }
 }
