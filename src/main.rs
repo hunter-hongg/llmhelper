@@ -8,7 +8,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use llmhelper::cli::{
-    Cli, Command, DiffArgs, ReportArgs, RequestArgs, SearchArgs, SessionsArgs, UsageArgs,
+    merge_source_paths, Cli, Command, DiffArgs, FilterArgs, ReportArgs, RequestArgs, SearchArgs,
+    SessionsArgs, UsageArgs,
 };
 use llmhelper::config::Config;
 use llmhelper::diff::compute_diff;
@@ -83,61 +84,21 @@ fn discover_sources(config: &Config) -> Registry {
     reg
 }
 
-fn build_filter(args: &UsageArgs) -> anyhow::Result<Filter> {
-    let last = args.parse_last()?;
+/// Build the record-scoping predicate shared by every read-only command.
+///
+/// One constructor for all callers: the shared predicates come from
+/// [`FilterArgs`], so adding a predicate means implementing an accessor once
+/// rather than editing a copy per command.
+fn build_filter<A: FilterArgs>(args: &A) -> anyhow::Result<Filter> {
     Ok(Filter {
-        since: args.since,
-        last,
+        since: args.since(),
+        last: args.parse_last()?,
         until: None,
-        project: args.project.clone(),
-        model: args.model.clone(),
-        source: args.source.as_ref().map(|s| s.to_string()),
-        fail_open: false,
+        project: args.project().map(str::to_string),
+        model: args.model().map(str::to_string),
+        source: args.source().map(|s| s.to_string()),
+        fail_open: args.fail_open(),
     })
-}
-
-/// Build the Filter for a `report` invocation. Same predicates as `usage`;
-/// a separate constructor because the args types differ.
-fn build_filter_report(args: &ReportArgs) -> anyhow::Result<Filter> {
-    let last = args.parse_last()?;
-    Ok(Filter {
-        since: args.since,
-        last,
-        until: None,
-        project: args.project.clone(),
-        model: args.model.clone(),
-        source: args.source.as_ref().map(|s| s.to_string()),
-        fail_open: false,
-    })
-}
-
-fn build_filter_sessions(args: &SessionsArgs) -> anyhow::Result<Filter> {
-    let last = args.parse_last()?;
-    Ok(Filter {
-        since: args.since,
-        last,
-        until: None,
-        project: args.project.clone(),
-        model: args.model.clone(),
-        source: args.source.as_ref().map(|s| s.to_string()),
-        fail_open: false,
-    })
-}
-
-fn config_from_sessions_args(config: Config, args: &SessionsArgs) -> Config {
-    Config {
-        claude_dir: args.claude_dir.clone().or(config.claude_dir),
-        opencode_dbs: args.opencode_db.clone().or(config.opencode_dbs),
-        omp_dir: args.omp_dir.clone().or(config.omp_dir),
-        kilo_dbs: args.kilo_db.clone().or(config.kilo_dbs),
-        refresh_interval_seconds: config.refresh_interval_seconds,
-        request_base_url: config.request_base_url,
-        request_api_key: config.request_api_key,
-        request_default_model: config.request_default_model,
-        request_timeout_seconds: config.request_timeout_seconds,
-        request_reasoning_fields: config.request_reasoning_fields,
-        request_reasoning: config.request_reasoning,
-    }
 }
 
 fn run_tui(
@@ -434,17 +395,17 @@ fn run_sessions(args: SessionsArgs, config_path: &Option<PathBuf>) -> anyhow::Re
     if args.detail.is_some() || args.json || args.csv {
         run_sessions_non_tui(&args, config_path)
     } else {
-        let config = config_from_sessions_args(Config::load_with(config_path.as_deref()), &args);
+        let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
         let registry = discover_sources(&config);
-        let filter = build_filter_sessions(&args)?;
+        let filter = build_filter(&args)?;
         run_sessions_tui(registry, filter, config.refresh_interval_seconds)
     }
 }
 
 fn run_sessions_non_tui(args: &SessionsArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
-    let config = config_from_sessions_args(Config::load_with(config_path.as_deref()), args);
+    let config = merge_source_paths(Config::load_with(config_path.as_deref()), args);
     let registry = discover_sources(&config);
-    let filter = build_filter_sessions(args)?;
+    let filter = build_filter(args)?;
     let (records, source_statuses) = registry.load_all();
     for status in &source_statuses {
         if let Some(err) = &status.error {
@@ -692,35 +653,6 @@ fn scoped_message_statuses(scoped: &[Message], statuses: &[MessageStatus]) -> Ve
         .collect()
 }
 
-fn config_from_search_args(config: Config, args: &SearchArgs) -> Config {
-    Config {
-        claude_dir: args.claude_dir.clone().or(config.claude_dir),
-        opencode_dbs: args.opencode_db.clone().or(config.opencode_dbs),
-        omp_dir: args.omp_dir.clone().or(config.omp_dir),
-        kilo_dbs: args.kilo_db.clone().or(config.kilo_dbs),
-        refresh_interval_seconds: config.refresh_interval_seconds,
-        request_base_url: config.request_base_url,
-        request_api_key: config.request_api_key,
-        request_default_model: config.request_default_model,
-        request_timeout_seconds: config.request_timeout_seconds,
-        request_reasoning_fields: config.request_reasoning_fields,
-        request_reasoning: config.request_reasoning,
-    }
-}
-
-fn build_filter_search(args: &SearchArgs) -> anyhow::Result<Filter> {
-    let last = args.parse_last()?;
-    Ok(Filter {
-        since: args.since,
-        last,
-        until: None,
-        project: args.project.clone(),
-        model: args.model.clone(),
-        source: args.source.as_ref().map(|s| s.to_string()),
-        fail_open: args.fail_open,
-    })
-}
-
 fn search_options(args: &SearchArgs) -> SearchOptions {
     SearchOptions {
         query: args.query.trim().to_string(),
@@ -784,9 +716,9 @@ fn run_search(args: SearchArgs, config_path: &Option<PathBuf>) -> anyhow::Result
     if args.json || args.csv || args.text {
         return run_search_non_tui(&args, &options, config_path);
     }
-    let config = config_from_search_args(Config::load_with(config_path.as_deref()), &args);
+    let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
     let registry = discover_sources(&config);
-    let filter = build_filter_search(&args)?;
+    let filter = build_filter(&args)?;
     let filter_summary = search_filter_summary(&args);
     run_search_tui(registry, filter, options, filter_summary)
 }
@@ -796,9 +728,9 @@ fn run_search_non_tui(
     options: &SearchOptions,
     config_path: &Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let config = config_from_search_args(Config::load_with(config_path.as_deref()), args);
+    let config = merge_source_paths(Config::load_with(config_path.as_deref()), args);
     let registry = discover_sources(&config);
-    let filter = build_filter_search(args)?;
+    let filter = build_filter(args)?;
     let (hits, statuses) = load_search_data(&registry, &filter, options);
     for status in &statuses {
         if let Some(err) = &status.error {
@@ -929,7 +861,7 @@ fn run_search_tui(
 fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
     let group_by: GroupBy = args.group_by.clone().into();
-    let config = Config::load_with(config_path.as_deref()).merge(&args);
+    let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
     let registry = discover_sources(&config);
     let filter = build_filter(&args)?;
 
@@ -965,7 +897,7 @@ fn run_diff(args: DiffArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()>
     let group_by: GroupBy = args.group_by.clone().into();
 
     // Load sources once (they don't change between windows)
-    let config = Config::load_with(config_path.as_deref()).merge(&diff_args_to_usage_args(&args));
+    let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
     let registry = discover_sources(&config);
 
     let (records, source_statuses) = registry.load_all();
@@ -1002,42 +934,6 @@ fn run_diff(args: DiffArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Clone config overrides from diff args into a UsageArgs for config merging.
-fn diff_args_to_usage_args(args: &DiffArgs) -> UsageArgs {
-    UsageArgs {
-        claude_dir: args.claude_dir.clone(),
-        opencode_db: args.opencode_db.clone(),
-        omp_dir: args.omp_dir.clone(),
-        kilo_db: args.kilo_db.clone(),
-        since: None,
-        last: None,
-        project: args.project.clone(),
-        model: args.model.clone(),
-        source: args.source.clone(),
-        group_by: args.group_by.clone(),
-        json: false,
-        csv: false,
-    }
-}
-
-/// Clone config overrides from report args into a UsageArgs for config merging.
-fn report_args_to_usage_args(args: &ReportArgs) -> UsageArgs {
-    UsageArgs {
-        claude_dir: args.claude_dir.clone(),
-        opencode_db: args.opencode_db.clone(),
-        omp_dir: args.omp_dir.clone(),
-        kilo_db: args.kilo_db.clone(),
-        since: None,
-        last: None,
-        project: args.project.clone(),
-        model: args.model.clone(),
-        source: args.source.clone(),
-        group_by: args.group_by.clone(),
-        json: false,
-        csv: false,
-    }
-}
-
 /// Build the ReportMeta describing the invocation: window text and the
 /// non-temporal filters that were applied.
 fn report_meta(args: &ReportArgs) -> ReportMeta {
@@ -1070,9 +966,9 @@ fn report_meta(args: &ReportArgs) -> ReportMeta {
 fn run_report(args: ReportArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
     let group_by: GroupBy = args.group_by.clone().into();
-    let config = Config::load_with(config_path.as_deref()).merge(&report_args_to_usage_args(&args));
+    let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
     let registry = discover_sources(&config);
-    let filter = build_filter_report(&args)?;
+    let filter = build_filter(&args)?;
 
     let (records, source_statuses) = registry.load_all();
     let agg = AggregateResult::from_records(&records, &filter, group_by);

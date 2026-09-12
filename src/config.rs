@@ -110,23 +110,6 @@ impl Config {
     pub fn load() -> Self {
         Self::load_with(None)
     }
-
-    /// Merge CLI overrides on top of config. CLI flags win.
-    pub fn merge(self, cli: &crate::cli::UsageArgs) -> Self {
-        Self {
-            claude_dir: cli.claude_dir.clone().or(self.claude_dir),
-            opencode_dbs: cli.opencode_db.clone().or(self.opencode_dbs),
-            omp_dir: cli.omp_dir.clone().or(self.omp_dir),
-            kilo_dbs: cli.kilo_db.clone().or(self.kilo_dbs),
-            refresh_interval_seconds: self.refresh_interval_seconds,
-            request_base_url: self.request_base_url,
-            request_api_key: self.request_api_key,
-            request_default_model: self.request_default_model,
-            request_timeout_seconds: self.request_timeout_seconds,
-            request_reasoning_fields: self.request_reasoning_fields,
-            request_reasoning: self.request_reasoning,
-        }
-    }
 }
 
 #[derive(serde::Deserialize, Debug, Default)]

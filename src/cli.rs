@@ -1,7 +1,77 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
+
+/// The time/scope predicates every read-only command shares.
+///
+/// Every subcommand that loads records accepts the same four scoping flags
+/// (`--since`/`--last`, `--project`, `--model`, `--source`), plus an optional
+/// per-Source tolerance flag. Implementing this trait lets `main.rs` build a
+/// [`Filter`] from any of them with one function, so adding a new shared
+/// predicate means implementing one accessor rather than editing five
+/// near-identical builders.
+///
+/// [`Filter`]: crate::filter::Filter
+pub trait FilterArgs {
+    fn since(&self) -> Option<DateTime<Utc>>;
+    fn last(&self) -> Option<&str>;
+    fn project(&self) -> Option<&str>;
+    fn model(&self) -> Option<&str>;
+    fn source(&self) -> Option<&SourceArg>;
+
+    /// Whether a Source that fails to load should contribute zero records
+    /// instead of failing the command. Only `search` exposes this as a flag;
+    /// everything else treats a load error as fatal to the whole run.
+    fn fail_open(&self) -> bool {
+        false
+    }
+
+    /// Parse `--last` into a `Duration`. Errors name the flag on bad input.
+    fn parse_last(&self) -> anyhow::Result<Option<Duration>> {
+        let Some(s) = self.last() else {
+            return Ok(None);
+        };
+        crate::cli::parse_duration(s)
+            .map_err(|e| anyhow::anyhow!("invalid --last {}", e))
+            .map(Some)
+    }
+}
+
+/// The four source-path override flags shared by every command that reads data.
+///
+/// Implementing this trait lets `main.rs` merge CLI overrides onto a loaded
+/// [`Config`] with one function instead of a copy per command.
+///
+/// [`Config`]: crate::config::Config
+pub trait SourcePathArgs {
+    fn claude_dir(&self) -> Option<&PathBuf>;
+    fn opencode_db(&self) -> Option<&Vec<PathBuf>>;
+    fn omp_dir(&self) -> Option<&PathBuf>;
+    fn kilo_db(&self) -> Option<&Vec<PathBuf>>;
+}
+
+/// Apply CLI source-path overrides on top of a loaded config, with the CLI
+/// winning. Every non-overridden key is passed through untouched.
+pub fn merge_source_paths<A: SourcePathArgs>(
+    mut config: crate::config::Config,
+    args: &A,
+) -> crate::config::Config {
+    if let Some(v) = args.claude_dir() {
+        config.claude_dir = Some(v.clone());
+    }
+    if let Some(v) = args.opencode_db() {
+        config.opencode_dbs = Some(v.clone());
+    }
+    if let Some(v) = args.omp_dir() {
+        config.omp_dir = Some(v.clone());
+    }
+    if let Some(v) = args.kilo_db() {
+        config.kilo_dbs = Some(v.clone());
+    }
+    config
+}
 
 /// Main CLI entry point.
 #[derive(Parser, Debug)]
@@ -133,17 +203,6 @@ pub struct UsageArgs {
 }
 
 impl UsageArgs {
-    /// Parse --last duration string into a Duration. Errors on bad input.
-    pub fn parse_last(&self) -> anyhow::Result<Option<Duration>> {
-        let s = match &self.last {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        parse_duration(s)
-            .map_err(|e| anyhow::anyhow!("invalid --last {}", e))
-            .map(Some)
-    }
-
     /// Validate mutually-exclusive flag combinations.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.json && self.csv {
@@ -153,6 +212,39 @@ impl UsageArgs {
             anyhow::bail!("--since and --last are mutually exclusive");
         }
         Ok(())
+    }
+}
+
+impl FilterArgs for UsageArgs {
+    fn since(&self) -> Option<DateTime<Utc>> {
+        self.since
+    }
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+    fn source(&self) -> Option<&SourceArg> {
+        self.source.as_ref()
+    }
+}
+
+impl SourcePathArgs for UsageArgs {
+    fn claude_dir(&self) -> Option<&PathBuf> {
+        self.claude_dir.as_ref()
+    }
+    fn opencode_db(&self) -> Option<&Vec<PathBuf>> {
+        self.opencode_db.as_ref()
+    }
+    fn omp_dir(&self) -> Option<&PathBuf> {
+        self.omp_dir.as_ref()
+    }
+    fn kilo_db(&self) -> Option<&Vec<PathBuf>> {
+        self.kilo_db.as_ref()
     }
 }
 
@@ -262,6 +354,21 @@ impl DiffArgs {
     }
 }
 
+impl SourcePathArgs for DiffArgs {
+    fn claude_dir(&self) -> Option<&PathBuf> {
+        self.claude_dir.as_ref()
+    }
+    fn opencode_db(&self) -> Option<&Vec<PathBuf>> {
+        self.opencode_db.as_ref()
+    }
+    fn omp_dir(&self) -> Option<&PathBuf> {
+        self.omp_dir.as_ref()
+    }
+    fn kilo_db(&self) -> Option<&Vec<PathBuf>> {
+        self.kilo_db.as_ref()
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 pub struct SessionsArgs {
     /// Claude Code projects directory (defaults to ~/.claude/projects).
@@ -323,16 +430,6 @@ pub struct SessionsArgs {
 }
 
 impl SessionsArgs {
-    pub fn parse_last(&self) -> anyhow::Result<Option<Duration>> {
-        let s = match &self.last {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        parse_duration(s)
-            .map_err(|e| anyhow::anyhow!("invalid --last {}", e))
-            .map(Some)
-    }
-
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.json && self.csv {
             anyhow::bail!("--json and --csv are mutually exclusive");
@@ -344,6 +441,39 @@ impl SessionsArgs {
             anyhow::bail!("--detail cannot be combined with --limit/--offset");
         }
         Ok(())
+    }
+}
+
+impl FilterArgs for SessionsArgs {
+    fn since(&self) -> Option<DateTime<Utc>> {
+        self.since
+    }
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+    fn source(&self) -> Option<&SourceArg> {
+        self.source.as_ref()
+    }
+}
+
+impl SourcePathArgs for SessionsArgs {
+    fn claude_dir(&self) -> Option<&PathBuf> {
+        self.claude_dir.as_ref()
+    }
+    fn opencode_db(&self) -> Option<&Vec<PathBuf>> {
+        self.opencode_db.as_ref()
+    }
+    fn omp_dir(&self) -> Option<&PathBuf> {
+        self.omp_dir.as_ref()
+    }
+    fn kilo_db(&self) -> Option<&Vec<PathBuf>> {
+        self.kilo_db.as_ref()
     }
 }
 
@@ -404,16 +534,6 @@ pub struct ReportArgs {
 }
 
 impl ReportArgs {
-    pub fn parse_last(&self) -> anyhow::Result<Option<Duration>> {
-        let s = match &self.last {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        parse_duration(s)
-            .map_err(|e| anyhow::anyhow!("invalid --last {}", e))
-            .map(Some)
-    }
-
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.since.is_some() && self.last.is_some() {
             anyhow::bail!("--since and --last are mutually exclusive");
@@ -424,6 +544,39 @@ impl ReportArgs {
             }
         }
         Ok(())
+    }
+}
+
+impl FilterArgs for ReportArgs {
+    fn since(&self) -> Option<DateTime<Utc>> {
+        self.since
+    }
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+    fn source(&self) -> Option<&SourceArg> {
+        self.source.as_ref()
+    }
+}
+
+impl SourcePathArgs for ReportArgs {
+    fn claude_dir(&self) -> Option<&PathBuf> {
+        self.claude_dir.as_ref()
+    }
+    fn opencode_db(&self) -> Option<&Vec<PathBuf>> {
+        self.opencode_db.as_ref()
+    }
+    fn omp_dir(&self) -> Option<&PathBuf> {
+        self.omp_dir.as_ref()
+    }
+    fn kilo_db(&self) -> Option<&Vec<PathBuf>> {
+        self.kilo_db.as_ref()
     }
 }
 
@@ -584,16 +737,6 @@ pub struct SearchArgs {
 }
 
 impl SearchArgs {
-    pub fn parse_last(&self) -> anyhow::Result<Option<Duration>> {
-        let s = match &self.last {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        parse_duration(s)
-            .map_err(|e| anyhow::anyhow!("invalid --last {}", e))
-            .map(Some)
-    }
-
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.query.trim().is_empty() {
             anyhow::bail!("query must not be empty");
@@ -614,5 +757,41 @@ impl SearchArgs {
             anyhow::bail!("--limit must be at least 1");
         }
         Ok(())
+    }
+}
+
+impl FilterArgs for SearchArgs {
+    fn since(&self) -> Option<DateTime<Utc>> {
+        self.since
+    }
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+    fn source(&self) -> Option<&SourceArg> {
+        self.source.as_ref()
+    }
+    fn fail_open(&self) -> bool {
+        self.fail_open
+    }
+}
+
+impl SourcePathArgs for SearchArgs {
+    fn claude_dir(&self) -> Option<&PathBuf> {
+        self.claude_dir.as_ref()
+    }
+    fn opencode_db(&self) -> Option<&Vec<PathBuf>> {
+        self.opencode_db.as_ref()
+    }
+    fn omp_dir(&self) -> Option<&PathBuf> {
+        self.omp_dir.as_ref()
+    }
+    fn kilo_db(&self) -> Option<&Vec<PathBuf>> {
+        self.kilo_db.as_ref()
     }
 }
