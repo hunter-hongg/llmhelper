@@ -324,3 +324,198 @@ fn json_explain_present_when_requested() {
     let json = json_of(&run(&args));
     assert!(json["diagnostics"].is_object());
 }
+
+// --- Budget annotation (spec 0024) ---
+//
+// Fixture costs: opencode 0.17, kilo 1.5, omp 1.5, claude none. A budget window
+// of 365d matches the `WIDE` window, so the fixtures' fixed 2026-08-27 dates
+// fall inside it.
+
+/// The fixtures' opencode spend (0.17) exceeds 0.10; kilo (1.5) is under 5; and
+/// claude records no cost at all, so it is `not measured` rather than `ok`.
+fn budget_args() -> Vec<&'static str> {
+    vec![
+        "--budget",
+        "opencode:0.10",
+        "--budget",
+        "kilo:5",
+        "--budget",
+        "claude:1",
+        "--budget-window",
+        "365d",
+    ]
+}
+
+#[test]
+fn over_budget_source_is_marked_and_others_are_not() {
+    let mut args: Vec<&str> = WIDE.to_vec();
+    args.extend(["--group-by", "source"]);
+    args.extend(budget_args());
+    let stdout = stdout_of(&run(&args));
+    // The over Source's row carries the glyph; the others do not.
+    let opencode = stdout
+        .lines()
+        .find(|l| l.contains("opencode") && !l.contains("sources:"))
+        .expect("opencode row");
+    assert!(opencode.contains('⚠'), "opencode row was: {opencode}");
+    let kilo = stdout
+        .lines()
+        .find(|l| l.contains("kilo") && !l.contains("sources:"))
+        .expect("kilo row");
+    assert!(!kilo.contains('⚠'), "kilo row was: {kilo}");
+    // The header states the situation, reusing usage's wording.
+    assert!(stdout.contains("budgets: 1 over"), "header was: {stdout}");
+}
+
+#[test]
+fn no_budget_output_is_byte_identical_to_budgetless_run() {
+    // The budget layer must vanish entirely when no budgets are configured: no
+    // glyph, no header count, no JSON field, no CSV column. This is asserted on
+    // `--group-by source`, a dimension that cannot produce a mixed group — see
+    // `mixed_dimensions_change_output_and_that_is_the_fix` for why the other
+    // dimensions are deliberately NOT byte-identical.
+    let table = stdout_of(&run(&["--last", "365d", "--group-by", "source"]));
+    assert!(!table.contains('⚠'));
+    assert!(!table.contains("budgets:"));
+    let csv = stdout_of(&run(&["--last", "365d", "--group-by", "source", "--csv"]));
+    assert!(!csv.contains("budget_state"));
+    let json = json_of(&run(&["--last", "365d", "--group-by", "source", "--json"]));
+    assert!(json.get("budgets").is_none());
+    for row in json["rows"].as_array().unwrap() {
+        assert!(row.get("budget_state").is_none());
+    }
+}
+
+#[test]
+fn mixed_dimensions_change_output_and_that_is_the_fix() {
+    // The aggregator fix is a deliberate, no-budget behavior change: a group
+    // spanning Sources is now `mixed`/cost-less instead of borrowing the first
+    // Source's name and summed cost. That is why the snapshot guard above only
+    // covers `--group-by source`. Assert the honest shape directly, so a future
+    // "let's re-sum project costs" regression trips here rather than passing a
+    // byte-identity check that only ever exercised the safety dimension.
+    let json = json_of(&run(&["--last", "365d", "--group-by", "project", "--json"]));
+    let shared = json["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "/home/hunter/repos/test")
+        .expect("shared project row");
+    // kilo + opencode both record cost; the group must NOT claim either one.
+    assert_eq!(shared["cost"], serde_json::Value::Null);
+    assert!(
+        !shared["cost"].is_number(),
+        "a mixed project must not report a summed cost: {shared}"
+    );
+    // `usage` names the same group `mixed`; both commands read one aggregator.
+    let usage = Command::new(bin())
+        .args(["usage", "--last", "365d", "--group-by", "project", "--json"])
+        .args(fixture_paths())
+        .output()
+        .expect("failed to run llmhelper usage");
+    let usage: serde_json::Value =
+        serde_json::from_slice(&usage.stdout).expect("usage --json is not JSON");
+    let usage_shared = usage["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["key"] == "/home/hunter/repos/test")
+        .expect("shared project group");
+    assert_eq!(
+        usage_shared["source"], "mixed",
+        "compare and usage must agree on the group's source: {usage_shared}"
+    );
+}
+
+#[test]
+fn json_carries_budget_state_only_with_budgets() {
+    let mut args: Vec<&str> = WIDE.to_vec();
+    args.extend(["--group-by", "source", "--json"]);
+    args.extend(budget_args());
+    let json = json_of(&run(&args));
+    // The summary is present, and the over Source's row is `"over"`.
+    assert_eq!(json["budgets"]["over"].as_u64().unwrap(), 1);
+    let rows = json["rows"].as_array().unwrap();
+    let opencode = rows.iter().find(|r| r["key"] == "opencode").unwrap();
+    assert_eq!(opencode["budget_state"], "over");
+    // A row whose Source has no budget omits the field entirely.
+    let omp = rows.iter().find(|r| r["key"] == "omp").unwrap();
+    assert!(omp.get("budget_state").is_none(), "omp was: {omp}");
+    // A not-measured Source is present but rendered `not_measured`.
+    let claude = rows.iter().find(|r| r["key"] == "claude").unwrap();
+    assert_eq!(claude["budget_state"], "not_measured");
+}
+
+#[test]
+fn csv_appends_budget_column_only_with_budgets() {
+    // Without budgets: the original 15-column header, no budget column.
+    let plain = stdout_of(&run(&["--last", "365d", "--group-by", "source", "--csv"]));
+    let header = plain.lines().next().unwrap();
+    assert_eq!(header.matches(',').count(), 14, "header was: {header}");
+    assert!(!header.ends_with("budget_state"));
+
+    // With budgets: a 16th column, `over` on the offending Source and empty on
+    // the rest (never `under`).
+    let mut args: Vec<&str> = WIDE.to_vec();
+    args.extend(["--group-by", "source", "--csv"]);
+    args.extend(budget_args());
+    let with = stdout_of(&run(&args));
+    let mut lines = with.lines();
+    let header = lines.next().unwrap();
+    assert!(header.ends_with("budget_state"), "header was: {header}");
+    let opencode = lines
+        .find(|l| l.starts_with("1,opencode,"))
+        .expect("opencode is rank 1 by tokens");
+    assert!(opencode.ends_with(",over"), "row was: {opencode}");
+}
+
+#[test]
+fn mixed_source_project_group_is_never_marked() {
+    // `/home/hunter/repos/test` receives records from BOTH kilo and opencode,
+    // and both report cost. It must aggregate as `mixed` (cost `—`) and be
+    // excluded from a Source-scoped budget's marking, even though one of its
+    // sources (kilo) is over its ceiling in aggregate. This is the regression
+    // that a `Group.source` claiming the first source once hid.
+    let mut args: Vec<&str> = WIDE.to_vec();
+    args.extend([
+        "--group-by",
+        "project",
+        "--budget",
+        "kilo:1.0",
+        "--budget-window",
+        "365d",
+    ]);
+    let stdout = stdout_of(&run(&args));
+    let shared = stdout
+        .lines()
+        .find(|l| l.contains("/home/hunter/repos/test"))
+        .expect("shared project row");
+    assert!(
+        !shared.contains('⚠'),
+        "a mixed-source project must not be marked: {shared}"
+    );
+    // The header still reports the over budget itself (kilo is over), so the
+    // absence of a glyph is "no single row owns it", not "no budget".
+    assert!(stdout.contains("budgets: 1 over"), "header was: {stdout}");
+}
+
+#[test]
+fn exit_code_is_zero_with_an_over_budget() {
+    // A budget is an annotation, not a gate (spec 0015).
+    let mut args: Vec<&str> = WIDE.to_vec();
+    args.extend(["--group-by", "source"]);
+    args.extend(budget_args());
+    let output = run(&args);
+    assert!(output.status.success(), "over budget must not fail the run");
+}
+
+#[test]
+fn unknown_budget_name_errors_before_loading() {
+    let output = run(&["--last", "365d", "--budget-name", "nope"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown --budget-name 'nope'"),
+        "stderr was: {stderr}"
+    );
+}

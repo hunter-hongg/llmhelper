@@ -44,6 +44,11 @@ _Avoid_: sort, leaderboard, ordering
 A ranked Group's chosen metric as a percentage of the metric's grand total in the same window. The Share follows the Rank's sort metric (cost ranks show cost share); the per-field `token_shares` are always by token count. Cost share is measured only against cost-bearing Groups, so a cost-less Group has no Share rather than a misleading `0%` — the ADR 0001 rule applied to a denominator.
 _Avoid_: percentage, ratio, proportion
 
+**Budget Annotation**:
+The `Over`/`Under`/`NotMeasured` verdict a `Budget` puts on a ranked row in `compare`, matched through the row's group Source. It is an *annotation*, never a predicate: it changes no order, no share, and no exit code, and it is `None` for a `mixed`-source group — a Budget is Source-scoped, so a group spanning Sources has no single spend to be judged against. When no Budget exists for a row's Source the annotation is absent, not `Under`; an unmarked row therefore means "not over", while `NotMeasured` (no Cost recorded) is reported explicitly rather than rendered as `ok`.
+_Avoid_: status, flag, alert
+
+
 
 
 

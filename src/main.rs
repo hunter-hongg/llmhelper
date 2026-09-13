@@ -1371,6 +1371,9 @@ fn run_compare(args: CompareArgs, config_path: &Option<PathBuf>) -> anyhow::Resu
     let group_by: GroupBy = args.group_by.clone().into();
     let sort_by: llmhelper::compare::SortBy = args.sort_by.clone().into();
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
+    // Resolve and validate budgets before loading, so a bad --budget fails with
+    // the same message `usage` gives and never triggers a disk scan (spec 0015).
+    let budgets = args.resolve_budgets(&config.budgets)?;
     let registry = discover_sources(&config);
     let base = base_filter(&args);
     let mode = args.window_mode()?;
@@ -1383,7 +1386,20 @@ fn run_compare(args: CompareArgs, config_path: &Option<PathBuf>) -> anyhow::Resu
     // through so the shares cannot be measured against a different number than
     // the one `usage` would print for the same data.
     let grand_tokens = agg.grand_totals.total();
-    let rows = llmhelper::compare::rank(&agg.groups, grand_tokens, sort_by, args.top);
+    let mut view =
+        llmhelper::compare::rank_with_sources(&agg.groups, grand_tokens, sort_by, args.top);
+    // A row's budget verdict is its group's Source's verdict, measured over the
+    // same window and the same single `now` the ranking used, so a budget and
+    // the ranking cannot disagree about what "this window" is.
+    let command_since = command_since(&args, now)?;
+    let evaluated =
+        llmhelper::budget::evaluate_with_measurement(&budgets, &records, now, command_since);
+    let states = llmhelper::compare::budget_states(&evaluated);
+    llmhelper::compare::attach_budget_states(&mut view.rows, &view.sources, &states);
+    let rows = &view.rows;
+    // The header/JSON budget summary, derived from the same evaluation the rows
+    // were marked with.
+    let budget_summary = llmhelper::compare::BudgetSummary::of(&evaluated);
     // Computed from the same two inputs as the aggregate, so the funnel and the
     // ranking cannot disagree about what the filter did.
     let diag = diagnose(&records, &filter);
@@ -1391,24 +1407,31 @@ fn run_compare(args: CompareArgs, config_path: &Option<PathBuf>) -> anyhow::Resu
     if args.json {
         let mut buf = Vec::new();
         render_compare_json(
-            &rows,
+            rows,
             group_by.label(),
             sort_by.label(),
             grand_tokens,
+            budget_summary.as_ref(),
             want_diag.then_some(&diag),
             &mut buf,
         )?;
         println!("{}", String::from_utf8(buf)?);
     } else if args.csv {
         let mut buf = Vec::new();
-        render_compare_csv(&rows, &mut buf)?;
+        render_compare_csv(rows, budget_summary.is_some(), &mut buf)?;
         println!("{}", String::from_utf8(buf)?);
         // A comment line would corrupt a strict CSV parser, so the reason goes
         // to stderr and the body stays a well-formed table.
         report_diagnostics(&diag, args.explain());
     } else {
         report_diagnostics(&diag, args.explain());
-        render_compare_table(&rows, group_by.label(), sort_by.label(), &source_statuses)?;
+        render_compare_table(
+            rows,
+            group_by.label(),
+            sort_by.label(),
+            budget_summary.as_ref(),
+            &source_statuses,
+        )?;
     }
     Ok(())
 }

@@ -140,7 +140,7 @@ As with `usage`, `--calendar` snaps `--last` to a local-calendar bucket (`1d`/`1
 
 Cost is source-scoped and never summed across sources.
 
-`report` and `usage` also accept the budget flags `--budget`, `--budget-window`, and `--budget-name` (see [Budgets](#budgets)). When budgets are configured, `report` gains a `## Budget` section and `usage` flags over-budget Source rows.
+`report`, `usage`, and `compare` also accept the budget flags `--budget`, `--budget-window`, and `--budget-name` (see [Budgets](#budgets)). When budgets are configured, `report` gains a `## Budget` section, `usage` flags over-budget Source rows, and `compare` marks the ranked row of an over-budget Source.
 
 ### watch
 A live, self-refreshing usage monitor.
@@ -199,6 +199,9 @@ llmhelper compare --last 7d --group-by model --sort-by cost --top 7
 
 # Ranked sources as JSON
 llmhelper compare --last 30d --group-by source --json
+
+# Rank sources and flag the one over its budget
+llmhelper compare --last 30d --group-by source --budget opencode:5.00 --budget-window 1mo
 ```
 
 `--sort-by` picks the ranking metric: `tokens` (default), `cost`, `sessions`, or `messages`. Rows are ordered descending, ties broken by group key, so the same data always produces the same bytes. Each row shows the metric's share of the total; the `share` column follows the sort metric, while the `token_shares` breakdown in JSON is always by token count.
@@ -208,6 +211,8 @@ llmhelper compare --last 30d --group-by source --json
 Cost obeys ADR 0001: a group is priced only when every contributing record shares one source and reports a cost. A cost-less group (Claude Code, or a group mixing sources) shows `—` / `null` / an empty CSV cell — never `0` — and is excluded from the cost-share denominator. When sorting by cost, cost-less groups sort last.
 
 `compare` reuses `usage`'s filter and aggregation verbatim, so a group's totals can never differ between the two commands. `--explain` attaches the same funnel; on `--csv` it goes to stderr so the body stays a bare header plus one row per group. An empty result is a valid, header-only leaderboard and exits 0.
+
+`compare` also accepts the budget flags `--budget`, `--budget-window`, and `--budget-name` (see [Budgets](#budgets)). When budgets are configured, a ranked row whose group belongs to an over-budget Source is marked with `⚠`, and the header reads `budgets: N over` (or `ok` / `not measured`). Because a budget is scoped to one Source (ADR 0001), only a row whose group is a *single* Source can be marked: a project or model group that spans Sources is `mixed` and is never attributed one Source's verdict. A Source that records no cost is left unmarked rather than shown as `ok`. In JSON each row gains a `budget_state` field (`over`/`under`/`not_measured`, absent when no budget applies) and the payload gains a `budgets` object; in CSV a `budget_state` column is appended. With no budgets configured, the output is byte-for-byte identical to a run without this feature, and the exit code never changes on an over budget — a budget is an annotation, not a gate.
 
 ### request
 Send an OpenAI-compatible Chat Completions request with TUI or CLI output.
@@ -437,4 +442,4 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 ## Specs
-See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget, message-export, diff-calendar, usage-report-calendar, watch, empty-diagnostics and per-source-matched specifications. Architecture notes in `docs/adr/`.
+See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget, message-export, diff-calendar, usage-report-calendar, watch, empty-diagnostics, per-source-matched, trend, compare and compare-budget specifications. Architecture notes in `docs/adr/`.

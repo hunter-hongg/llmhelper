@@ -110,6 +110,22 @@ pub enum BudgetState {
     NotMeasured,
 }
 
+impl BudgetState {
+    /// The machine-facing slug used in `compare`'s JSON and CSV output.
+    ///
+    /// Distinct from `report::budget_state_label`'s prose (`over`/`ok`/`not
+    /// measured`): a JSON consumer gets an unambiguous, whitespace-free token,
+    /// while the human table keeps its sentence-like label. `under` is the slug
+    /// for the `Under` variant because "ok" is a rendering choice, not a name.
+    pub fn json_label(&self) -> &'static str {
+        match self {
+            Self::Over => "over",
+            Self::Under => "under",
+            Self::NotMeasured => "not_measured",
+        }
+    }
+}
+
 /// One budget's evaluation against a record set.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BudgetStatus {

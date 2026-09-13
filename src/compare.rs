@@ -9,7 +9,9 @@
 //! [`AggregateResult`]: crate::aggregator::AggregateResult
 
 use crate::aggregator::Group;
+use crate::budget::{BudgetState, EvaluatedBudget};
 use crate::domain::record::TokenBreakdown;
+use std::collections::BTreeMap;
 
 /// The metric a [`rank`] call orders by.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -58,11 +60,26 @@ pub struct RankedGroup {
     pub output_share_pct: Option<f64>,
     pub cache_read_share_pct: Option<f64>,
     pub cache_write_share_pct: Option<f64>,
+    /// The budget verdict bearing on the row's own Source, or `None` when no
+    /// budget applies — including every `(others)` and `mixed`-source row,
+    /// which have no single Source to attribute a spend to. `rank` never sets
+    /// this; it is attached afterwards by [`attach_budget_states`].
+    pub budget_state: Option<BudgetState>,
 }
 
 /// The label the folded tail row carries. A real group can never use it: a
 /// project path, model id, or source name is never the literal `(others)`.
 pub const OTHERS_KEY: &str = "(others)";
+
+/// A ranked view: the rows plus, parallel to them, the `Group::source` each row
+/// came from (`None` for the synthetic `(others)` row). The sources ride
+/// alongside so the budget annotation can map a row to its Source after the
+/// sort, without `RankedGroup` having to carry a field it does not render.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RankedView {
+    pub rows: Vec<RankedGroup>,
+    pub sources: Vec<Option<String>>,
+}
 
 impl TokenBreakdown {
     /// The four-field total: what `SortBy::Tokens` ranks and shares by.
@@ -150,6 +167,23 @@ pub fn rank(
     sort_by: SortBy,
     top: Option<usize>,
 ) -> Vec<RankedGroup> {
+    rank_with_sources(groups, grand_tokens, sort_by, top).rows
+}
+
+/// Rank `groups` and also return, parallel to the rows, the `Group::source`
+/// each row came from (`None` for the synthetic `(others)` row).
+///
+/// The budget annotation (spec 0024) needs the Source of each row *after* the
+/// sort, and `RankedGroup` deliberately does not carry it — a ranked row is a
+/// presentation of a group, not the group. Returning the parallel vector here
+/// keeps [`rank`]'s own signature and contract intact for every existing caller
+/// and test.
+pub fn rank_with_sources(
+    groups: &[Group],
+    grand_tokens: u64,
+    sort_by: SortBy,
+    top: Option<usize>,
+) -> RankedView {
     // Sort descending by the metric; ties broken by key ascending so the order
     // is total and the output is byte-stable across runs.
     let mut ordered: Vec<&Group> = groups.iter().collect();
@@ -180,6 +214,8 @@ pub fn rank(
         output_share_pct: pct(g.tokens.output, grand.output),
         cache_read_share_pct: pct(g.tokens.cache_read, grand.cache_read),
         cache_write_share_pct: pct(g.tokens.cache_write, grand.cache_write),
+        // Attached later: `rank` is budget-free by contract.
+        budget_state: None,
     };
 
     // `top = Some(0)` means "no limit": folding everything into one row would be
@@ -191,11 +227,13 @@ pub fn rank(
     };
 
     let Some(n) = fold_from else {
-        return ordered
+        let rows: Vec<RankedGroup> = ordered
             .iter()
             .enumerate()
             .map(|(i, g)| row_for(g, i + 1, false))
             .collect();
+        let sources = ordered.iter().map(|g| Some(g.source.clone())).collect();
+        return RankedView { rows, sources };
     };
 
     let mut rows: Vec<RankedGroup> = ordered[..n]
@@ -244,9 +282,102 @@ pub fn rank(
         output_share_pct: pct(tokens.output, grand.output),
         cache_read_share_pct: pct(tokens.cache_read, grand.cache_read),
         cache_write_share_pct: pct(tokens.cache_write, grand.cache_write),
+        // The `(others)` row is synthetic: it is not a Source, so no budget
+        // can bear on it.
+        budget_state: None,
     };
     rows.push(others);
-    rows
+    // The folded tail has no single Source, so the `(others)` row's source slot
+    // is `None` — a budget can never mark it.
+    let mut sources: Vec<Option<String>> = ordered[..n]
+        .iter()
+        .map(|g| Some(g.source.clone()))
+        .collect();
+    sources.push(None);
+    RankedView { rows, sources }
+}
+
+/// Attach each row's budget verdict, in place.
+///
+/// `sources` is parallel to `rows`: the `Group::source` value (`"mixed"` for a
+/// cross-source group) that produced each ranked row, or `None` for the
+/// synthetic `(others)` row. `states` maps a Source name to its evaluated
+/// budget state.
+///
+/// A row is marked only when its group has exactly one Source that a budget is
+/// scoped to. This is the load-bearing mapping of spec 0024: a budget is
+/// Source-scoped (ADR 0001), so a `mixed`-source group — which may span several
+/// budgets and whose cost is permanently `None` — is never attributed a single
+/// Source's verdict.
+pub fn attach_budget_states(
+    rows: &mut [RankedGroup],
+    sources: &[Option<String>],
+    states: &BTreeMap<String, BudgetState>,
+) {
+    for (row, source) in rows.iter_mut().zip(sources.iter()) {
+        row.budget_state = source.as_deref().and_then(|s| states.get(s).copied());
+    }
+}
+
+/// The Source→budget-state map consumed by [`attach_budget_states`].
+/// `mixed` can never appear here — no budget is scoped to it — so a
+/// cross-source row resolves to `None` automatically.
+pub fn budget_states(budgets: &[EvaluatedBudget]) -> BTreeMap<String, BudgetState> {
+    budgets
+        .iter()
+        .map(|b| (b.status.budget.source.clone(), b.status.state))
+        .collect()
+}
+
+/// A one-line summary of the evaluated budgets, for the header/JSON.
+///
+/// `None` when no budgets are configured — the marker that a run must stay
+/// byte-identical to a pre-spec-0024 `compare`. Otherwise it carries the counts
+/// the header needs, so the wording lives in one place and is unit-tested,
+/// mirroring `usage`'s `budget_indicator`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetSummary {
+    /// How many budgets are strictly over their ceiling.
+    pub over: usize,
+    /// How many budgets are `Under` (measured and fine).
+    pub under: usize,
+    /// How many budgets are `NotMeasured` (the Source records no cost).
+    pub not_measured: usize,
+}
+
+impl BudgetSummary {
+    /// Summarize evaluated budgets, or `None` when there are none.
+    pub fn of(budgets: &[EvaluatedBudget]) -> Option<Self> {
+        if budgets.is_empty() {
+            return None;
+        }
+        let mut summary = Self {
+            over: 0,
+            under: 0,
+            not_measured: 0,
+        };
+        for b in budgets {
+            match b.status.state {
+                BudgetState::Over => summary.over += 1,
+                BudgetState::Under => summary.under += 1,
+                BudgetState::NotMeasured => summary.not_measured += 1,
+            }
+        }
+        Some(summary)
+    }
+
+    /// The header phrase, reusing the wording `usage`'s indicator fixed:
+    /// `over` wins over `ok` (the count that matters), and an all-unmeasured
+    /// set says so rather than claiming `ok`.
+    pub fn label(&self) -> String {
+        if self.over > 0 {
+            format!("budgets: {} over", self.over)
+        } else if self.under == 0 {
+            "budgets: not measured".to_string()
+        } else {
+            "budgets: ok".to_string()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -426,5 +557,117 @@ mod tests {
         assert_eq!(keys(&by_sessions), vec!["b", "a"]);
         let by_messages = rank(&groups, 200, SortBy::Messages, None);
         assert_eq!(keys(&by_messages), vec!["a", "b"]);
+    }
+
+    // --- Budget annotation (spec 0024) ---
+
+    fn evaluated(source: &str, state: BudgetState) -> EvaluatedBudget {
+        EvaluatedBudget {
+            status: crate::budget::BudgetStatus {
+                budget: crate::budget::Budget {
+                    name: format!("b:{source}"),
+                    source: source.to_string(),
+                    window: crate::budget::BudgetWindow::parse("7d").unwrap(),
+                    max_cost: 5.0,
+                },
+                spend: Some(6.0),
+                state,
+            },
+            measurement: crate::budget::Measurement {
+                lower_bound: None,
+                clipped_by: None,
+            },
+        }
+    }
+
+    #[test]
+    fn budget_states_maps_every_source_to_its_state() {
+        let budgets = vec![
+            evaluated("opencode", BudgetState::Over),
+            evaluated("omp", BudgetState::Under),
+            evaluated("claude", BudgetState::NotMeasured),
+        ];
+        let states = budget_states(&budgets);
+        assert_eq!(states.get("opencode"), Some(&BudgetState::Over));
+        assert_eq!(states.get("omp"), Some(&BudgetState::Under));
+        assert_eq!(states.get("claude"), Some(&BudgetState::NotMeasured));
+        // A Source with no budget is simply absent, so its rows stay unmarked.
+        assert_eq!(states.get("kilo"), None);
+    }
+
+    #[test]
+    fn attach_marks_a_single_source_row_with_its_verdict() {
+        let mut a = group("opencode", 1, 1, [100, 0, 0, 0], Some(6.0));
+        a.source = "opencode".to_string();
+        let mut b = group("omp", 1, 1, [50, 0, 0, 0], Some(1.0));
+        b.source = "omp".to_string();
+        let groups = vec![a, b];
+        let mut view = rank_with_sources(&groups, 150, SortBy::Tokens, None);
+        let states = budget_states(&[
+            evaluated("opencode", BudgetState::Over),
+            evaluated("omp", BudgetState::Under),
+        ]);
+        attach_budget_states(&mut view.rows, &view.sources, &states);
+        assert_eq!(view.rows[0].budget_state, Some(BudgetState::Over));
+        assert_eq!(view.rows[1].budget_state, Some(BudgetState::Under));
+    }
+
+    #[test]
+    fn attach_leaves_a_mixed_source_row_unmarked() {
+        // The `group` helper hardcodes source "opencode" for single-source
+        // rows; build a mixed one explicitly (the aggregator's "mixed" marker).
+        let mut mixed = group("shared-project", 2, 2, [200, 0, 0, 0], None);
+        mixed.source = "mixed".to_string();
+        let groups = vec![mixed];
+        let mut view = rank_with_sources(&groups, 200, SortBy::Tokens, None);
+        let states = budget_states(&[evaluated("opencode", BudgetState::Over)]);
+        attach_budget_states(&mut view.rows, &view.sources, &states);
+        // A Source-scoped budget cannot be attributed to a group spanning
+        // Sources (ADR 0001), even though the budget's Source is present.
+        assert_eq!(view.rows[0].budget_state, None);
+    }
+
+    #[test]
+    fn attach_leaves_the_others_row_unmarked_and_stays_parallel() {
+        let groups = vec![
+            group("a", 1, 1, [1000, 0, 0, 0], Some(9.0)),
+            group("b", 1, 1, [100, 0, 0, 0], Some(1.0)),
+        ];
+        let mut view = rank_with_sources(&groups, 1100, SortBy::Tokens, Some(1));
+        assert_eq!(view.rows.len(), 2);
+        assert_eq!(view.sources.len(), 2);
+        assert_eq!(view.sources[1], None);
+        let states = budget_states(&[evaluated("opencode", BudgetState::Over)]);
+        attach_budget_states(&mut view.rows, &view.sources, &states);
+        assert_eq!(view.rows[0].budget_state, Some(BudgetState::Over));
+        assert!(view.rows[1].is_others);
+        assert_eq!(view.rows[1].budget_state, None);
+    }
+
+    #[test]
+    fn rank_is_budget_free_so_existing_callers_see_no_verdict() {
+        let groups = vec![group("opencode", 1, 1, [100, 0, 0, 0], Some(6.0))];
+        // `rank` returns rows with `budget_state == None` by construction.
+        let rows = rank(&groups, 100, SortBy::Tokens, None);
+        assert_eq!(rows[0].budget_state, None);
+    }
+
+    #[test]
+    fn budget_summary_is_none_without_budgets_and_labels_over_wins() {
+        assert_eq!(BudgetSummary::of(&[]), None);
+
+        let over = BudgetSummary::of(&[
+            evaluated("opencode", BudgetState::Over),
+            evaluated("omp", BudgetState::Under),
+        ])
+        .unwrap();
+        assert_eq!(over.label(), "budgets: 1 over");
+
+        let all_under = BudgetSummary::of(&[evaluated("omp", BudgetState::Under)]).unwrap();
+        assert_eq!(all_under.label(), "budgets: ok");
+
+        let none_measured =
+            BudgetSummary::of(&[evaluated("claude", BudgetState::NotMeasured)]).unwrap();
+        assert_eq!(none_measured.label(), "budgets: not measured");
     }
 }

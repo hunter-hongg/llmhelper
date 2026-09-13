@@ -51,20 +51,28 @@ impl AggregateResult {
             entry.messages += r.message_count as usize;
             entry.tokens.add(&r.tokens);
 
-            // Cost scoping: only sum within a single source.
-            // Once a group has records from multiple sources, cost is permanently None.
+            // Source scoping: a group is single-source only while every record
+            // shares the first record's source. The moment a differing source
+            // appears the group is `mixed` and stays `mixed` — a verdict that
+            // does not depend on whether the two sources report Cost. This is
+            // what makes `Group.source` truthful (a single name, or the literal
+            // `"mixed"`), so a Source-scoped Budget can never be attributed to a
+            // group that actually spans Sources.
             if entry.mixed_source {
+                entry.cost = None;
+            } else if entry.source != r.source {
+                entry.mixed_source = true;
+                // Cost is per-Source and must never be summed across Sources
+                // (ADR 0001), so a mixed group is permanently cost-less.
                 entry.cost = None;
             } else if let (Some(a), Some(b)) = (entry.cost, r.cost) {
                 entry.cost = Some(a + b);
             } else if entry.cost.is_none() && r.cost.is_some() {
-                if entry.source != r.source {
-                    entry.mixed_source = true;
-                    entry.cost = None;
-                } else {
-                    entry.cost = r.cost;
-                }
+                entry.cost = r.cost;
             } else if entry.cost.is_some() && r.cost.is_none() {
+                // The same Source reported Cost for some records and not others:
+                // the group's spend can no longer be represented, so it is
+                // treated as unmeasured rather than a partial sum.
                 entry.mixed_source = true;
                 entry.cost = None;
             }
@@ -163,6 +171,23 @@ mod tests {
         ];
         let agg = AggregateResult::from_records(&records, &Filter::none(), GroupBy::Project);
         let shared = agg.groups.iter().find(|g| g.key == "/shared").unwrap();
+        assert_eq!(shared.cost, None, "mixed group must have cost=None");
+    }
+    #[test]
+    fn aggregate_two_costing_sources_are_still_mixed() {
+        // The regression: when *both* sources report Cost, the group must still
+        // be `mixed` (source = "mixed", cost = None) — not silently summed and
+        // attributed to the first source. A Source-scoped budget relies on this.
+        let records = vec![
+            rec("kilo", "/shared", "m", Some(1.5)),
+            rec("opencode", "/shared", "m", Some(0.17)),
+        ];
+        let agg = AggregateResult::from_records(&records, &Filter::none(), GroupBy::Project);
+        let shared = agg.groups.iter().find(|g| g.key == "/shared").unwrap();
+        assert_eq!(
+            shared.source, "mixed",
+            "a two-source group must report source=mixed"
+        );
         assert_eq!(shared.cost, None, "mixed group must have cost=None");
     }
 

@@ -549,6 +549,19 @@ pub struct CompareArgs {
     /// Output as CSV instead of the terminal table.
     #[arg(long = "csv")]
     pub csv: bool,
+
+    /// One-off spend budget as `<source>:<amount>`, e.g. `opencode:5.00`.
+    /// Repeatable. Over-budget Sources are marked on their ranked rows.
+    #[arg(long = "budget")]
+    pub budget: Vec<String>,
+
+    /// Window applied to --budget one-offs (e.g. 1d, 7d, 30d, 1w, 1mo).
+    #[arg(long = "budget-window")]
+    pub budget_window: Option<String>,
+
+    /// Evaluate only these configured [budget.<name>] entries. Repeatable.
+    #[arg(long = "budget-name")]
+    pub budget_name: Vec<String>,
 }
 
 impl CompareArgs {
@@ -558,6 +571,18 @@ impl CompareArgs {
             anyhow::bail!("--json and --csv are mutually exclusive");
         }
         Ok(())
+    }
+}
+
+impl BudgetArgs for CompareArgs {
+    fn budget(&self) -> &[String] {
+        &self.budget
+    }
+    fn budget_window(&self) -> Option<&str> {
+        self.budget_window.as_deref()
+    }
+    fn budget_name(&self) -> &[String] {
+        &self.budget_name
     }
 }
 

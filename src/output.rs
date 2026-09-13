@@ -575,6 +575,12 @@ struct CompareRowPayload<'a> {
     /// The sort metric's share of the whole, or `null` when undefined.
     share_pct: Option<f64>,
     token_shares: CompareTokenShares,
+    /// The budget verdict for this row's Source, `"over"`/`"under"`/
+    /// `"not_measured"`. Absent (not `null`) when no budget bears on the row —
+    /// including every `(others)` row and any run with no budgets at all (spec
+    /// 0024), so a no-budget payload is byte-identical to before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_state: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -594,10 +600,22 @@ struct ComparePayload<'a> {
     sort_by: &'a str,
     grand_tokens: u64,
     rows: Vec<CompareRowPayload<'a>>,
+    /// The budget summary, present only when budgets were configured (spec
+    /// 0024), so a no-budget payload is byte-identical to before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budgets: Option<CompareBudgets>,
     /// Present only when the result is empty or `--explain` was passed — spec
     /// 0020's rule, applied verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<Diagnostics>,
+}
+
+/// The `budgets` object in `compare`'s JSON, mirroring `BudgetSummary`.
+#[derive(Clone, Copy, Debug, Serialize)]
+struct CompareBudgets {
+    over: usize,
+    under: usize,
+    not_measured: usize,
 }
 
 /// Emit the JSON form of a ranked comparison.
@@ -609,6 +627,7 @@ pub fn render_compare_json<W: Write>(
     group_by: &str,
     sort_by: &str,
     grand_tokens: u64,
+    budgets: Option<&crate::compare::BudgetSummary>,
     diagnostics: Option<&Diagnostics>,
     out: &mut W,
 ) -> anyhow::Result<()> {
@@ -629,6 +648,7 @@ pub fn render_compare_json<W: Write>(
                 cache_read: r.cache_read_share_pct,
                 cache_write: r.cache_write_share_pct,
             },
+            budget_state: r.budget_state.as_ref().map(|s| s.json_label()),
         })
         .collect();
     let payload = ComparePayload {
@@ -636,6 +656,11 @@ pub fn render_compare_json<W: Write>(
         sort_by,
         grand_tokens,
         rows,
+        budgets: budgets.map(|b| CompareBudgets {
+            over: b.over,
+            under: b.under,
+            not_measured: b.not_measured,
+        }),
         diagnostics: diagnostics.cloned(),
     };
     serde_json::to_writer_pretty(out, &payload)?;
@@ -644,12 +669,16 @@ pub fn render_compare_json<W: Write>(
 
 /// Emit the CSV form: a bare header plus one line per ranked group, to
 /// **stdout**. An absent cost or share is an empty cell, not `—`.
+///
+/// A `budget_state` column is appended **only** when `with_budgets` is true, so
+/// a run with no budgets keeps the original 15-column header byte-for-byte.
 pub fn render_compare_csv<W: Write>(
     rows: &[crate::compare::RankedGroup],
+    with_budgets: bool,
     out: &mut W,
 ) -> anyhow::Result<()> {
     let mut w = csv::Writer::from_writer(out);
-    w.write_record([
+    let mut header = vec![
         "rank",
         "key",
         "is_others",
@@ -665,26 +694,40 @@ pub fn render_compare_csv<W: Write>(
         "output_share_pct",
         "cache_read_share_pct",
         "cache_write_share_pct",
-    ])?;
+    ];
+    if with_budgets {
+        header.push("budget_state");
+    }
+    w.write_record(&header)?;
     let num = |v: Option<f64>| v.map(|x| format!("{x}")).unwrap_or_default();
     for r in rows {
-        w.write_record([
-            &r.rank.to_string(),
-            &r.key,
-            &r.is_others.to_string(),
-            &r.sessions.to_string(),
-            &r.messages.to_string(),
-            &r.tokens.input.to_string(),
-            &r.tokens.output.to_string(),
-            &r.tokens.cache_read.to_string(),
-            &r.tokens.cache_write.to_string(),
-            &r.cost.map(|c| format!("{:.6}", c)).unwrap_or_default(),
-            &num(r.share_pct),
-            &num(r.input_share_pct),
-            &num(r.output_share_pct),
-            &num(r.cache_read_share_pct),
-            &num(r.cache_write_share_pct),
-        ])?;
+        let mut record = vec![
+            r.rank.to_string(),
+            r.key.clone(),
+            r.is_others.to_string(),
+            r.sessions.to_string(),
+            r.messages.to_string(),
+            r.tokens.input.to_string(),
+            r.tokens.output.to_string(),
+            r.tokens.cache_read.to_string(),
+            r.tokens.cache_write.to_string(),
+            r.cost.map(|c| format!("{:.6}", c)).unwrap_or_default(),
+            num(r.share_pct),
+            num(r.input_share_pct),
+            num(r.output_share_pct),
+            num(r.cache_read_share_pct),
+            num(r.cache_write_share_pct),
+        ];
+        if with_budgets {
+            // An absent state is an empty cell, never `under` or `0`.
+            record.push(
+                r.budget_state
+                    .as_ref()
+                    .map(|s| s.json_label().to_string())
+                    .unwrap_or_default(),
+            );
+        }
+        w.write_record(&record)?;
     }
     w.flush()?;
     Ok(())
@@ -700,6 +743,7 @@ pub fn render_compare_table(
     rows: &[crate::compare::RankedGroup],
     group_by: &str,
     sort_by: &str,
+    budgets: Option<&crate::compare::BudgetSummary>,
     source_statuses: &[SourceStatus],
 ) -> anyhow::Result<()> {
     let mut out = std::io::stdout().lock();
@@ -715,13 +759,24 @@ pub fn render_compare_table(
         })
         .collect();
     writeln!(out, "sources: {}", sources_line.join("  "))?;
-    writeln!(
-        out,
-        "compare  |  group: {}   sort: {}   rows: {}",
-        group_by,
-        sort_by,
-        rows.len()
-    )?;
+    if let Some(b) = budgets {
+        writeln!(
+            out,
+            "compare  |  group: {}   sort: {}   rows: {}   {}",
+            group_by,
+            sort_by,
+            rows.len(),
+            b.label()
+        )?;
+    } else {
+        writeln!(
+            out,
+            "compare  |  group: {}   sort: {}   rows: {}",
+            group_by,
+            sort_by,
+            rows.len()
+        )?;
+    }
     writeln!(out)?;
 
     let key_width = rows
@@ -735,9 +790,14 @@ pub fn render_compare_table(
     let tok_width = 8usize;
     let share_width = 7usize;
 
+    // The status gutter is a fixed two-cell prefix, present only when budgets
+    // were configured, so a no-budget table is byte-identical to before and
+    // existing column-width assumptions hold (spec 0024).
+    let gutter = if budgets.is_some() { "⚠ " } else { "" };
     writeln!(
         out,
-        "{:>rank$}  {:<key$}  {:>num$}  {:>num$}  {:>tok$}  {:>share$}  {:>tok$}",
+        "{}{:>rank$}  {:<key$}  {:>num$}  {:>num$}  {:>tok$}  {:>share$}  {:>tok$}",
+        if budgets.is_some() { "  " } else { "" },
         "rank",
         "group",
         "sessions",
@@ -762,9 +822,20 @@ pub fn render_compare_table(
             .share_pct
             .map(|p| format!("{p:.1}%"))
             .unwrap_or_else(|| "—".to_string());
+        // Only an `over` verdict earns the glyph: `under` and `not_measured`
+        // render an empty gutter, because absence of `⚠` means "not over",
+        // not "no budget" (the header states the budget situation).
+        let flag = if r.budget_state == Some(crate::budget::BudgetState::Over) {
+            gutter
+        } else if budgets.is_some() {
+            "  "
+        } else {
+            ""
+        };
         writeln!(
             out,
-            "{:>rank$}  {:<key$}  {:>num$}  {:>num$}  {:>tok$}  {:>share$}  {:>tok$}",
+            "{}{:>rank$}  {:<key$}  {:>num$}  {:>num$}  {:>tok$}  {:>share$}  {:>tok$}",
+            flag,
             r.rank,
             r.key,
             r.sessions,
