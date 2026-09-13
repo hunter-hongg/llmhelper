@@ -173,6 +173,8 @@ pub enum Command {
     Watch(WatchArgs),
     /// Show usage bucketed over time (one row per day/week/month).
     Trend(TrendArgs),
+    /// Rank groups against each other within one window.
+    Compare(CompareArgs),
 }
 
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
@@ -199,6 +201,38 @@ impl From<GroupByArg> for crate::domain::group::GroupBy {
             GroupByArg::Source => Self::Source,
             GroupByArg::Project => Self::Project,
             GroupByArg::Model => Self::Model,
+        }
+    }
+}
+
+/// The metric `compare` ranks groups by.
+#[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
+pub enum SortByArg {
+    #[default]
+    Tokens,
+    Cost,
+    Sessions,
+    Messages,
+}
+
+impl std::fmt::Display for SortByArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tokens => write!(f, "tokens"),
+            Self::Cost => write!(f, "cost"),
+            Self::Sessions => write!(f, "sessions"),
+            Self::Messages => write!(f, "messages"),
+        }
+    }
+}
+
+impl From<SortByArg> for crate::compare::SortBy {
+    fn from(v: SortByArg) -> Self {
+        match v {
+            SortByArg::Tokens => Self::Tokens,
+            SortByArg::Cost => Self::Cost,
+            SortByArg::Sessions => Self::Sessions,
+            SortByArg::Messages => Self::Messages,
         }
     }
 }
@@ -456,7 +490,128 @@ impl SourcePathArgs for UsageArgs {
     }
 }
 
-/// Parse a duration string in `Nd`, `Nh`, `Nm`, or `Ns` form (e.g. `7d`, `24h`, `30m`, `86400s`).
+/// `compare`: rank the groups of one window against each other.
+///
+/// Where `usage --group-by` prints a grouped table in map order and `diff`
+/// contrasts the same group across two windows, `compare` orders the groups of
+/// a **single** window by one metric and reports each one's share of the whole.
+/// The window flags are the shared ones; `--last` is the common entry point.
+#[derive(Parser, Debug, Clone)]
+pub struct CompareArgs {
+    /// Claude Code projects directory (defaults to ~/.claude/projects).
+    #[arg(long = "claude-dir")]
+    pub claude_dir: Option<std::path::PathBuf>,
+    /// OpenCode database path(s). Can be specified multiple times.
+    #[arg(long = "opencode-db")]
+    pub opencode_db: Option<Vec<std::path::PathBuf>>,
+    /// OMP sessions directory (defaults to ~/.omp/agent/sessions).
+    #[arg(long = "omp-dir")]
+    pub omp_dir: Option<std::path::PathBuf>,
+    /// Kilo Code database path(s). Can be specified multiple times.
+    #[arg(long = "kilo-db")]
+    pub kilo_db: Option<Vec<std::path::PathBuf>>,
+    /// Only include sessions started at or after this RFC 3339 timestamp.
+    #[arg(long = "since")]
+    pub since: Option<DateTime<Utc>>,
+    /// Only include sessions from the last N days/hours (e.g. "7d", "4h").
+    #[arg(long = "last")]
+    pub last: Option<String>,
+    /// Align the window to a local calendar bucket instead of a rolling
+    /// duration (same contract as `usage --calendar`).
+    #[arg(long = "calendar")]
+    pub calendar: bool,
+    /// Filter by project path substring.
+    #[arg(long = "project")]
+    pub project: Option<String>,
+    /// Filter by model substring (case-insensitive).
+    #[arg(long = "model")]
+    pub model: Option<String>,
+    /// Filter by source name.
+    #[arg(long = "source")]
+    pub source: Option<SourceArg>,
+    /// Explain the filter pipeline: report how many records each predicate
+    /// excluded, and name the one that removed the last records.
+    #[arg(long = "explain")]
+    pub explain: bool,
+    /// Group output by this dimension: source, project, or model.
+    #[arg(long = "group-by", default_value_t)]
+    pub group_by: GroupByArg,
+    /// Rank the groups by this metric, descending (default: tokens).
+    #[arg(long = "sort-by", default_value_t)]
+    pub sort_by: SortByArg,
+    /// Show only the top N groups; the rest fold into a single `(others)` row.
+    /// `0` means no limit.
+    #[arg(long = "top")]
+    pub top: Option<usize>,
+    /// Output as JSON instead of the terminal table.
+    #[arg(long = "json")]
+    pub json: bool,
+    /// Output as CSV instead of the terminal table.
+    #[arg(long = "csv")]
+    pub csv: bool,
+}
+
+impl CompareArgs {
+    /// Validate the flag combination before any source is read.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.json && self.csv {
+            anyhow::bail!("--json and --csv are mutually exclusive");
+        }
+        Ok(())
+    }
+}
+
+impl FilterArgs for CompareArgs {
+    fn since(&self) -> Option<DateTime<Utc>> {
+        self.since
+    }
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+    fn source(&self) -> Option<&SourceArg> {
+        self.source.as_ref()
+    }
+}
+
+impl WindowArgs for CompareArgs {
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn since(&self) -> Option<DateTime<Utc>> {
+        self.since
+    }
+    fn calendar(&self) -> bool {
+        self.calendar
+    }
+}
+
+impl ExplainArgs for CompareArgs {
+    fn explain(&self) -> bool {
+        self.explain
+    }
+}
+
+impl SourcePathArgs for CompareArgs {
+    fn claude_dir(&self) -> Option<&PathBuf> {
+        self.claude_dir.as_ref()
+    }
+    fn opencode_db(&self) -> Option<&Vec<PathBuf>> {
+        self.opencode_db.as_ref()
+    }
+    fn omp_dir(&self) -> Option<&PathBuf> {
+        self.omp_dir.as_ref()
+    }
+    fn kilo_db(&self) -> Option<&Vec<PathBuf>> {
+        self.kilo_db.as_ref()
+    }
+}
+
 fn parse_numeric_prefix(s: &str, suffix: char) -> anyhow::Result<u64> {
     let Some(rest) = s.strip_suffix(suffix) else {
         anyhow::bail!("invalid duration '{}': missing suffix {}", s, suffix);

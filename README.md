@@ -188,6 +188,27 @@ A bucket's `cost` is `—` when no source in it recorded a cost, and `0.000000` 
 
 `--explain` attaches the same filter funnel every other read command uses; on `--csv` the funnel goes to stderr so the body stays a bare header plus one row per bucket.
 
+### compare
+Rank the groups of one window against each other — the "who is eating my budget" view. `usage` prints a grouped table in map order with no share; `diff` contrasts the *same* group across two windows; `compare` orders the groups of a *single* window by one metric and shows each one's share of the whole.
+```bash
+# The biggest projects of the last 30 days, largest first
+llmhelper compare --last 30d --group-by project
+
+# Ranked by spend, top 7 with the tail folded into (others)
+llmhelper compare --last 7d --group-by model --sort-by cost --top 7
+
+# Ranked sources as JSON
+llmhelper compare --last 30d --group-by source --json
+```
+
+`--sort-by` picks the ranking metric: `tokens` (default), `cost`, `sessions`, or `messages`. Rows are ordered descending, ties broken by group key, so the same data always produces the same bytes. Each row shows the metric's share of the total; the `share` column follows the sort metric, while the `token_shares` breakdown in JSON is always by token count.
+
+`--top N` keeps the N largest groups and folds the rest into a single `(others)` row that still carries their summed share, so the visible percentages add up to 100. `--top 0` means no limit, and a limit at or above the group count folds nothing.
+
+Cost obeys ADR 0001: a group is priced only when every contributing record shares one source and reports a cost. A cost-less group (Claude Code, or a group mixing sources) shows `—` / `null` / an empty CSV cell — never `0` — and is excluded from the cost-share denominator. When sorting by cost, cost-less groups sort last.
+
+`compare` reuses `usage`'s filter and aggregation verbatim, so a group's totals can never differ between the two commands. `--explain` attaches the same funnel; on `--csv` it goes to stderr so the body stays a bare header plus one row per group. An empty result is a valid, header-only leaderboard and exits 0.
+
 ### request
 Send an OpenAI-compatible Chat Completions request with TUI or CLI output.
 ```bash

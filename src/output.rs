@@ -559,6 +559,229 @@ pub fn render_trend_table(
     Ok(())
 }
 
+// --- Compare rendering ---
+
+/// A ranked row's JSON shape. Shares are nested under `token_shares` so the
+/// per-field breakdown reads as a unit, mirroring `tokens`.
+#[derive(Clone, Debug, Serialize)]
+struct CompareRowPayload<'a> {
+    rank: usize,
+    key: &'a str,
+    is_others: bool,
+    sessions: usize,
+    messages: usize,
+    tokens: &'a crate::domain::record::TokenBreakdown,
+    cost: Option<f64>,
+    /// The sort metric's share of the whole, or `null` when undefined.
+    share_pct: Option<f64>,
+    token_shares: CompareTokenShares,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CompareTokenShares {
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+}
+
+/// The JSON payload for `compare`.
+///
+/// An **object**, not a bare array, so the ranking and the funnel can coexist.
+#[derive(Clone, Debug, Serialize)]
+struct ComparePayload<'a> {
+    group_by: &'a str,
+    sort_by: &'a str,
+    grand_tokens: u64,
+    rows: Vec<CompareRowPayload<'a>>,
+    /// Present only when the result is empty or `--explain` was passed — spec
+    /// 0020's rule, applied verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<Diagnostics>,
+}
+
+/// Emit the JSON form of a ranked comparison.
+///
+/// `grand_tokens` is the aggregate's own four-field total, threaded through so
+/// the payload's denominator matches the one the shares were computed against.
+pub fn render_compare_json<W: Write>(
+    rows: &[crate::compare::RankedGroup],
+    group_by: &str,
+    sort_by: &str,
+    grand_tokens: u64,
+    diagnostics: Option<&Diagnostics>,
+    out: &mut W,
+) -> anyhow::Result<()> {
+    let rows = rows
+        .iter()
+        .map(|r| CompareRowPayload {
+            rank: r.rank,
+            key: &r.key,
+            is_others: r.is_others,
+            sessions: r.sessions,
+            messages: r.messages,
+            tokens: &r.tokens,
+            cost: r.cost,
+            share_pct: r.share_pct,
+            token_shares: CompareTokenShares {
+                input: r.input_share_pct,
+                output: r.output_share_pct,
+                cache_read: r.cache_read_share_pct,
+                cache_write: r.cache_write_share_pct,
+            },
+        })
+        .collect();
+    let payload = ComparePayload {
+        group_by,
+        sort_by,
+        grand_tokens,
+        rows,
+        diagnostics: diagnostics.cloned(),
+    };
+    serde_json::to_writer_pretty(out, &payload)?;
+    Ok(())
+}
+
+/// Emit the CSV form: a bare header plus one line per ranked group, to
+/// **stdout**. An absent cost or share is an empty cell, not `—`.
+pub fn render_compare_csv<W: Write>(
+    rows: &[crate::compare::RankedGroup],
+    out: &mut W,
+) -> anyhow::Result<()> {
+    let mut w = csv::Writer::from_writer(out);
+    w.write_record([
+        "rank",
+        "key",
+        "is_others",
+        "sessions",
+        "messages",
+        "input",
+        "output",
+        "cache_read",
+        "cache_write",
+        "cost",
+        "share_pct",
+        "input_share_pct",
+        "output_share_pct",
+        "cache_read_share_pct",
+        "cache_write_share_pct",
+    ])?;
+    let num = |v: Option<f64>| v.map(|x| format!("{x}")).unwrap_or_default();
+    for r in rows {
+        w.write_record([
+            &r.rank.to_string(),
+            &r.key,
+            &r.is_others.to_string(),
+            &r.sessions.to_string(),
+            &r.messages.to_string(),
+            &r.tokens.input.to_string(),
+            &r.tokens.output.to_string(),
+            &r.tokens.cache_read.to_string(),
+            &r.tokens.cache_write.to_string(),
+            &r.cost.map(|c| format!("{:.6}", c)).unwrap_or_default(),
+            &num(r.share_pct),
+            &num(r.input_share_pct),
+            &num(r.output_share_pct),
+            &num(r.cache_read_share_pct),
+            &num(r.cache_write_share_pct),
+        ])?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// Emit the terminal table for a ranked comparison: one row per group, largest
+/// first, with each group's share of the whole.
+///
+/// The `(others)` fold, when present, is printed last and its key makes it
+/// unmistakable for a real group. An empty result prints the header and no rows
+/// — a valid empty leaderboard — with `--explain` explaining why.
+pub fn render_compare_table(
+    rows: &[crate::compare::RankedGroup],
+    group_by: &str,
+    sort_by: &str,
+    source_statuses: &[SourceStatus],
+) -> anyhow::Result<()> {
+    let mut out = std::io::stdout().lock();
+
+    let sources_line: Vec<String> = source_statuses
+        .iter()
+        .map(|s| {
+            if s.error.is_some() {
+                format!("{} ✗", s.name)
+            } else {
+                format!("{} ●", s.name)
+            }
+        })
+        .collect();
+    writeln!(out, "sources: {}", sources_line.join("  "))?;
+    writeln!(
+        out,
+        "compare  |  group: {}   sort: {}   rows: {}",
+        group_by,
+        sort_by,
+        rows.len()
+    )?;
+    writeln!(out)?;
+
+    let key_width = rows
+        .iter()
+        .map(|r| r.key.chars().count())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    let rank_width = 4usize;
+    let num_width = 8usize;
+    let tok_width = 8usize;
+    let share_width = 7usize;
+
+    writeln!(
+        out,
+        "{:>rank$}  {:<key$}  {:>num$}  {:>num$}  {:>tok$}  {:>share$}  {:>tok$}",
+        "rank",
+        "group",
+        "sessions",
+        "messages",
+        "tokens",
+        "share",
+        "cost",
+        rank = rank_width,
+        key = key_width,
+        num = num_width,
+        tok = tok_width,
+        share = share_width
+    )?;
+    for r in rows {
+        // An absent cost or share is `—`, never `0`, so "no data" and "zero" do
+        // not render alike.
+        let cost = r
+            .cost
+            .map(|c| format!("{:.6}", c))
+            .unwrap_or_else(|| "—".to_string());
+        let share = r
+            .share_pct
+            .map(|p| format!("{p:.1}%"))
+            .unwrap_or_else(|| "—".to_string());
+        writeln!(
+            out,
+            "{:>rank$}  {:<key$}  {:>num$}  {:>num$}  {:>tok$}  {:>share$}  {:>tok$}",
+            r.rank,
+            r.key,
+            r.sessions,
+            r.messages,
+            format_tokens(r.tokens.total()),
+            share,
+            cost,
+            rank = rank_width,
+            key = key_width,
+            num = num_width,
+            tok = tok_width,
+            share = share_width
+        )?;
+    }
+    Ok(())
+}
+
 /// Format a token count with magnitude-appropriate unit (K, M, B).
 pub fn format_tokens(n: u64) -> String {
     if n < 1_000 {

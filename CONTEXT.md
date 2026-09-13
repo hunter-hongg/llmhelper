@@ -36,5 +36,14 @@ _Avoid_: filter-stage, condition, clause
 The sequence of record counts observed by applying the Predicate Layers one at a time to the loaded set, each stage built on the previous stage's survivors: `loaded → after window → after project → after model → after source → matched`. The stages are nested by construction, never independent counts against the raw set — cumulative application is what makes "which layer removed the last records" answerable. The **blame layer** is the first stage whose output is zero while its input was non-zero; it is `None` when records matched or when nothing was loaded at all, because "there was no data" is not the filters' fault.
 _Avoid_: pipeline, breakdown, trace
 
+**Rank**:
+The ordering `compare` puts a window's Groups in, by exactly one explicit metric (`tokens`, `cost`, `sessions`, or `messages`), descending, ties broken by group key so the order is total and the output byte-stable. A Rank is derived from an existing aggregate — it never re-sums — so a group's totals cannot differ between `compare` and `usage`. The fold of the tail past `--top N` is a synthetic `(others)` row, not a Group and never a real key.
+_Avoid_: sort, leaderboard, ordering
+
+**Share**:
+A ranked Group's chosen metric as a percentage of the metric's grand total in the same window. The Share follows the Rank's sort metric (cost ranks show cost share); the per-field `token_shares` are always by token count. Cost share is measured only against cost-bearing Groups, so a cost-less Group has no Share rather than a misleading `0%` — the ADR 0001 rule applied to a denominator.
+_Avoid_: percentage, ratio, proportion
+
+
 
 

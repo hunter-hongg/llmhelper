@@ -9,9 +9,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use llmhelper::cli::{
-    merge_source_paths, parse_duration, BudgetArgs, Cli, Command, DiffArgs, ExplainArgs,
-    ExportArgs, FilterArgs, ReportArgs, RequestArgs, SearchArgs, SessionsArgs, TrendArgs,
-    UsageArgs, WatchArgs, WindowArgs,
+    merge_source_paths, parse_duration, BudgetArgs, Cli, Command, CompareArgs, DiffArgs,
+    ExplainArgs, ExportArgs, FilterArgs, ReportArgs, RequestArgs, SearchArgs, SessionsArgs,
+    TrendArgs, UsageArgs, WatchArgs, WindowArgs,
 };
 use llmhelper::config::Config;
 use llmhelper::diagnostics::{diagnose, funnel_line, matched_by_source, reason_line, Diagnostics};
@@ -22,8 +22,8 @@ use llmhelper::domain::record::Record;
 use llmhelper::export::ExportOptions;
 use llmhelper::filter::{window_filter, Filter};
 use llmhelper::output::{
-    format_tokens, render_diff_csv, render_diff_json, render_trend_csv, render_trend_json,
-    OutputRenderer,
+    format_tokens, render_compare_csv, render_compare_json, render_compare_table, render_diff_csv,
+    render_diff_json, render_trend_csv, render_trend_json, OutputRenderer,
 };
 use llmhelper::report::{render_report, ReportMeta};
 use llmhelper::search::{search, SearchHit, SearchOptions};
@@ -1358,6 +1358,61 @@ fn run_trend(args: TrendArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
     Ok(())
 }
 
+/// `compare`: rank the groups of a single window against each other.
+///
+/// The aggregation is `usage`'s verbatim — `AggregateResult::from_filtered_refs`
+/// with the same `GroupBy` — so a group's totals cannot differ between the two
+/// commands. What `compare` adds is only the ordering and the share, both
+/// computed by the pure `compare::rank`.
+fn run_compare(args: CompareArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
+    // Validate before any disk scan, like every other read command.
+    args.validate()?;
+    args.validate_window()?;
+    let group_by: GroupBy = args.group_by.clone().into();
+    let sort_by: llmhelper::compare::SortBy = args.sort_by.clone().into();
+    let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
+    let registry = discover_sources(&config);
+    let base = base_filter(&args);
+    let mode = args.window_mode()?;
+    let now = Utc::now();
+    let filter = window_filter(&base, mode, now)
+        .ok_or_else(|| anyhow::anyhow!("could not anchor the calendar window to local midnight"))?;
+    let (records, source_statuses) = registry.load_all();
+    let agg = AggregateResult::from_records(&records, &filter, group_by);
+    // The aggregate's own four-field total is the share denominator, threaded
+    // through so the shares cannot be measured against a different number than
+    // the one `usage` would print for the same data.
+    let grand_tokens = agg.grand_totals.total();
+    let rows = llmhelper::compare::rank(&agg.groups, grand_tokens, sort_by, args.top);
+    // Computed from the same two inputs as the aggregate, so the funnel and the
+    // ranking cannot disagree about what the filter did.
+    let diag = diagnose(&records, &filter);
+    let want_diag = diag_explains(&diag, args.explain());
+    if args.json {
+        let mut buf = Vec::new();
+        render_compare_json(
+            &rows,
+            group_by.label(),
+            sort_by.label(),
+            grand_tokens,
+            want_diag.then_some(&diag),
+            &mut buf,
+        )?;
+        println!("{}", String::from_utf8(buf)?);
+    } else if args.csv {
+        let mut buf = Vec::new();
+        render_compare_csv(&rows, &mut buf)?;
+        println!("{}", String::from_utf8(buf)?);
+        // A comment line would corrupt a strict CSV parser, so the reason goes
+        // to stderr and the body stays a well-formed table.
+        report_diagnostics(&diag, args.explain());
+    } else {
+        report_diagnostics(&diag, args.explain());
+        render_compare_table(&rows, group_by.label(), sort_by.label(), &source_statuses)?;
+    }
+    Ok(())
+}
+
 /// The monitor loop. Unlike `run_tui` there is no shared grouping dimension to
 /// mutate (no `Tab`) and no reload trigger to debounce: one timer task reloads
 /// on schedule, the channel keeps only the latest frame, and `r` runs the same
@@ -2380,5 +2435,6 @@ fn main() -> anyhow::Result<()> {
         Command::Export(args) => run_export(args, &config_path),
         Command::Watch(args) => run_watch(args, &config_path),
         Command::Trend(args) => run_trend(args, &config_path),
+        Command::Compare(args) => run_compare(args, &config_path),
     }
 }
