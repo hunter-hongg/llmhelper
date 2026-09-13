@@ -9,8 +9,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use llmhelper::cli::{
-    merge_source_paths, BudgetArgs, Cli, Command, DiffArgs, ExplainArgs, ExportArgs, FilterArgs,
-    ReportArgs, RequestArgs, SearchArgs, SessionsArgs, UsageArgs, WatchArgs, WindowArgs,
+    merge_source_paths, parse_duration, BudgetArgs, Cli, Command, DiffArgs, ExplainArgs,
+    ExportArgs, FilterArgs, ReportArgs, RequestArgs, SearchArgs, SessionsArgs, TrendArgs,
+    UsageArgs, WatchArgs, WindowArgs,
 };
 use llmhelper::config::Config;
 use llmhelper::diagnostics::{diagnose, funnel_line, matched_by_source, reason_line, Diagnostics};
@@ -20,7 +21,10 @@ use llmhelper::domain::message::Message;
 use llmhelper::domain::record::Record;
 use llmhelper::export::ExportOptions;
 use llmhelper::filter::{window_filter, Filter};
-use llmhelper::output::{format_tokens, render_diff_csv, render_diff_json, OutputRenderer};
+use llmhelper::output::{
+    format_tokens, render_diff_csv, render_diff_json, render_trend_csv, render_trend_json,
+    OutputRenderer,
+};
 use llmhelper::report::{render_report, ReportMeta};
 use llmhelper::search::{search, SearchHit, SearchOptions};
 use llmhelper::source::{
@@ -1277,6 +1281,83 @@ fn run_watch(args: WatchArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
     run_watch_tui(registry, base, mode, group_by, budgets, args.interval)
 }
 
+/// `trend`: usage split into aligned, whole time buckets.
+///
+/// The window is a rolling `--last` (there is no `--since` and no `--calendar`:
+/// `--bucket` is where the calendar vocabulary enters, and the series is built
+/// from whole bucket starts). Records are filtered once by the same `Filter`
+/// every other read command uses — so `--explain` and the funnel are identical
+/// — and then placed into buckets, which is the only step `trend` adds.
+fn run_trend(args: TrendArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
+    // Validate before any disk scan: missing/ malformed flags must not cost a
+    // source read to discover.
+    args.validate()?;
+    let last_str = args.require_last()?;
+    let last = parse_duration(last_str).map_err(|e| anyhow::anyhow!("invalid --last {}", e))?;
+    let bucket_days = args.bucket_days()?;
+    // Round **up**: a span of 25h needs two local days to cover it, and flooring
+    // would silently shorten the series by a day. The bucket count is what the
+    // flag ultimately controls, since the series' own bounds are the filter.
+    let last_days = (last.as_secs().div_ceil(86_400)).max(1) as u32;
+
+    let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
+    let registry = discover_sources(&config);
+
+    let now = Utc::now();
+    // The bucket sequence is derived **first**, because its own bounds — not a
+    // rolling `now - last` — are what the records are filtered against.
+    //
+    // This matters: the buckets are whole local days, while `now - last` is an
+    // arbitrary instant. Using the latter would leave up to a day's worth of
+    // records inside the filter's window but outside every bucket (so silently
+    // dropped by `bucketize`), and `--explain`'s `matched` would then not equal
+    // the sum of the rows. Filtering on the series' real bounds keeps the funnel
+    // and the table in agreement, which is the invariant spec 0020/0021 exist to
+    // protect.
+    let buckets = llmhelper::trend::bucket_bounds(now, last_days, bucket_days)
+        .ok_or_else(|| anyhow::anyhow!("could not anchor the trend buckets to local midnight"))?;
+    let series_start = buckets
+        .first()
+        .map(|b| b.since)
+        .ok_or_else(|| anyhow::anyhow!("the trend window produced no buckets"))?;
+
+    // The same four predicate layers as `usage`, with the window pinned to the
+    // bucket series and the open end at `now`.
+    let filter = Filter {
+        since: Some(series_start),
+        until: Some(now),
+        ..base_filter(&args)
+    };
+
+    let (records, source_statuses) = registry.load_all();
+    let filtered = filter.apply(&records);
+    let rows = llmhelper::trend::bucketize(&filtered, &buckets);
+
+    // Computed from the same filter the rows were bucketed under, so the funnel
+    // and the table cannot disagree about what the window admitted.
+    let diag = diagnose(&records, &filter);
+    let want_diag = diag_explains(&diag, args.explain());
+
+    if args.json {
+        let mut buf = Vec::new();
+        render_trend_json(&rows, want_diag.then_some(&diag), &mut buf)?;
+        println!("{}", String::from_utf8(buf)?);
+    } else if args.csv {
+        let mut buf = Vec::new();
+        render_trend_csv(&rows, &mut buf)?;
+        println!("{}", String::from_utf8(buf)?);
+        // Same asymmetry as `usage`: a comment would corrupt the CSV body, so
+        // the reason goes to stderr and stdout stays parseable.
+        report_diagnostics(&diag, args.explain());
+    } else {
+        // The table is the one case where an empty result must still be fully
+        // explained *and* fully printed: the zero rows are the answer.
+        report_diagnostics(&diag, args.explain());
+        llmhelper::output::render_trend_table(&rows, bucket_days, &source_statuses)?;
+    }
+    Ok(())
+}
+
 /// The monitor loop. Unlike `run_tui` there is no shared grouping dimension to
 /// mutate (no `Tab`) and no reload trigger to debounce: one timer task reloads
 /// on schedule, the channel keeps only the latest frame, and `r` runs the same
@@ -2298,5 +2379,6 @@ fn main() -> anyhow::Result<()> {
         Command::Search(args) => run_search(args, &config_path),
         Command::Export(args) => run_export(args, &config_path),
         Command::Watch(args) => run_watch(args, &config_path),
+        Command::Trend(args) => run_trend(args, &config_path),
     }
 }

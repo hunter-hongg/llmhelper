@@ -165,6 +165,29 @@ Keys: `r` reload immediately, `q` or `Esc` quit. That is deliberately the whole 
 
 `--interval <seconds>` sets the reload period (default `5`; `0` is rejected). `--json` writes exactly one frame — byte-for-byte the same output as `usage --json` for the same flags — and exits, so a sampling script needs no second code path. There is no `--csv` for `watch`: a CSV has nowhere to record when the frame was read, when the next read is due, or what the deltas are measured against.
 
+### trend
+Usage split into aligned, whole time buckets — the "how has this changed over time" view that `usage` (a single window) cannot give.
+```bash
+# The last 30 days, one row per day
+llmhelper trend --last 30d --bucket 1d
+
+# The last 12 weeks, one row per week
+llmhelper trend --last 12w --bucket 1w
+
+# Weekly buckets, narrowed to one project, as JSON
+llmhelper trend --last 90d --bucket 1w --project myproj --json
+```
+
+`trend` reads the same data and applies the same filters as `usage`, then places each surviving record into the bucket whose local-calendar range contains it. Every bucket is emitted, oldest first, including empty ones, so a gap in activity is a visible row of zeros rather than a missing line.
+
+Both flags are required. `--bucket` takes only the calendar keywords `1d`, `1w` and `1mo`: a duration like `4h` has no local-day alignment and is rejected rather than silently producing a misaligned grid. `--last` is rounded up to whole buckets, so `--last 30d --bucket 1w` emits five weekly rows — the series may over-cover the window, never under-cover it. The header names the resolved span (first bucket's start → last bucket's end), not the flags you passed.
+
+Each row is one bucket's totals; there is no per-group breakdown, so `trend` has no `--group-by`. To trend a single project, model or source, narrow the input instead — `--project`, `--model` and `--source` all filter *before* bucketing.
+
+A bucket's `cost` is `—` when no source in it recorded a cost, and `0.000000` only when a source genuinely reported zero — a blank would be read as "spent nothing". Cost is never summed across sources: a bucket is priced only when all its records share one source and report a cost (ADR 0001). In JSON the same distinction is `null` versus `0.0`. The final bucket is open: it starts on a local midnight and ends at the current time, so it is the only row whose width can be a partial day.
+
+`--explain` attaches the same filter funnel every other read command uses; on `--csv` the funnel goes to stderr so the body stays a bare header plus one row per bucket.
+
 ### request
 Send an OpenAI-compatible Chat Completions request with TUI or CLI output.
 ```bash

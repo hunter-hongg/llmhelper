@@ -378,6 +378,187 @@ fn i64_disp(v: i64) -> String {
     }
 }
 
+// --- Trend rendering ---
+
+/// The JSON payload for `trend`.
+///
+/// An **object**, not a bare array, so the bucket list and the funnel can
+/// coexist. `buckets` is always dense: an empty trend still emits one entry per
+/// bucket, because the number and identity of the rows is itself the answer.
+#[derive(Clone, Debug, Serialize)]
+struct TrendPayload {
+    buckets: Vec<crate::trend::BucketRow>,
+    /// Present only when the result is empty or `--explain` was passed — spec
+    /// 0020's rule, applied verbatim. An ordinary non-empty trend carries no
+    /// key, exactly as `usage --json` does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<Diagnostics>,
+}
+
+/// Emit the JSON form of a trend.
+pub fn render_trend_json<W: Write>(
+    rows: &[crate::trend::BucketRow],
+    diagnostics: Option<&Diagnostics>,
+    out: &mut W,
+) -> anyhow::Result<()> {
+    let payload = TrendPayload {
+        buckets: rows.to_vec(),
+        diagnostics: diagnostics.cloned(),
+    };
+    serde_json::to_writer_pretty(out, &payload)?;
+    Ok(())
+}
+
+/// Emit the CSV form: a bare header plus one line per bucket, to **stdout**.
+///
+/// The diagnostics funnel does not belong here — a comment line would corrupt a
+/// strict CSV parser — so a caller that has one writes it to stderr (spec
+/// 0020's asymmetry). An absent cost is an empty cell rather than `—`, because
+/// CSV has no such convention and a blank reads as "no data" to a spreadsheet.
+pub fn render_trend_csv<W: Write>(
+    rows: &[crate::trend::BucketRow],
+    out: &mut W,
+) -> anyhow::Result<()> {
+    let mut w = csv::Writer::from_writer(out);
+    w.write_record([
+        "bucket_since",
+        "bucket_until",
+        "sessions",
+        "messages",
+        "input",
+        "output",
+        "cache_read",
+        "cache_write",
+        "cost",
+    ])?;
+    for r in rows {
+        w.write_record([
+            &r.since.to_rfc3339(),
+            &r.until.to_rfc3339(),
+            &r.sessions.to_string(),
+            &r.messages.to_string(),
+            &r.tokens.input.to_string(),
+            &r.tokens.output.to_string(),
+            &r.tokens.cache_read.to_string(),
+            &r.tokens.cache_write.to_string(),
+            &r.cost.map(|c| format!("{:.6}", c)).unwrap_or_default(),
+        ])?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// Emit the terminal table for a trend: one row per bucket, oldest first.
+///
+/// Every bucket is printed, including one with no records, as a row of zeros —
+/// "no activity in that bucket" and "no bucket at all" must not render alike.
+/// The header names the **resolved span** (first bucket's start → last bucket's
+/// end) rather than echoing the flags, so a clamped tail is visible.
+pub fn render_trend_table(
+    rows: &[crate::trend::BucketRow],
+    bucket_days: u32,
+    source_statuses: &[SourceStatus],
+) -> anyhow::Result<()> {
+    let mut out = std::io::stdout().lock();
+
+    let sources_line: Vec<String> = source_statuses
+        .iter()
+        .map(|s| {
+            if s.error.is_some() {
+                format!("{} ✗", s.name)
+            } else {
+                format!("{} ●", s.name)
+            }
+        })
+        .collect();
+    writeln!(out, "sources: {}", sources_line.join("  "))?;
+
+    match (rows.first(), rows.last()) {
+        (Some(first), Some(last)) => writeln!(
+            out,
+            "trend  |  {} → {}",
+            first.since.with_timezone(&chrono::Local).format("%Y-%m-%d"),
+            last.until.with_timezone(&chrono::Local).format("%Y-%m-%d"),
+        )?,
+        _ => writeln!(out, "trend  |  (no buckets)")?,
+    }
+    writeln!(out)?;
+
+    if rows.is_empty() {
+        writeln!(out, "(no buckets)")?;
+        return Ok(());
+    }
+
+    // The label column widens for multi-day buckets, whose labels are spans
+    // (`2026-08-23 → 08-30`, 18 chars) rather than single dates.
+    let label_width = if bucket_days <= 1 { 10usize } else { 18usize };
+    let num_width = 8usize;
+    let tok_width = 8usize;
+
+    writeln!(
+        out,
+        "{:<label$}  {:>num$}  {:>num$}  {:>tok$}  {:>tok$}  {:>tok$}  {:>tok$}  {:>tok$}",
+        "bucket",
+        "sessions",
+        "messages",
+        "input",
+        "output",
+        "cache_read",
+        "cache_write",
+        "cost",
+        label = label_width,
+        num = num_width,
+        tok = tok_width
+    )?;
+    let dashes = |n: usize| "-".repeat(n);
+    writeln!(
+        out,
+        "{:<label$}  {:>num$}  {:>num$}  {:>tok$}  {:>tok$}  {:>tok$}  {:>tok$}  {:>tok$}",
+        dashes(label_width),
+        dashes(num_width),
+        dashes(num_width),
+        dashes(tok_width),
+        dashes(tok_width),
+        dashes(tok_width),
+        dashes(tok_width),
+        dashes(tok_width),
+        label = label_width,
+        num = num_width,
+        tok = tok_width
+    )?;
+
+    for r in rows {
+        // Cost is `—` when no source in the bucket recorded one, never `0.000000`
+        // — a blank would be read as "spent nothing".
+        let cost = r
+            .cost
+            .map(|c| format!("{:.6}", c))
+            .unwrap_or_else(|| "—".to_string());
+        writeln!(
+            out,
+            "{:<label$}  {:>num$}  {:>num$}  {:>tok$}  {:>tok$}  {:>tok$}  {:>tok$}  {:>tok$}",
+            crate::trend::bucket_label(
+                &crate::trend::Bucket {
+                    since: r.since,
+                    until: r.until
+                },
+                bucket_days,
+            ),
+            r.sessions,
+            r.messages,
+            format_tokens(r.tokens.input),
+            format_tokens(r.tokens.output),
+            format_tokens(r.tokens.cache_read),
+            format_tokens(r.tokens.cache_write),
+            cost,
+            label = label_width,
+            num = num_width,
+            tok = tok_width
+        )?;
+    }
+    Ok(())
+}
+
 /// Format a token count with magnitude-appropriate unit (K, M, B).
 pub fn format_tokens(n: u64) -> String {
     if n < 1_000 {

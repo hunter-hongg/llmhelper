@@ -234,4 +234,44 @@ mod tests {
             local(2026, 9, 12, 0, 0)
         );
     }
+
+    #[test]
+    fn bucket_before_never_returns_the_anchor_itself() {
+        // The contract is the *previous* bucket, so even a 0-day request steps
+        // back a full day. `diff` and the TUI's bucket cycling chain this call,
+        // and assuming `before(anchor, 0) == anchor` would collapse two adjacent
+        // buckets onto one instant.
+        let anchor = local(2026, 9, 13, 0, 0);
+        assert_eq!(
+            calendar_bucket_before(anchor, 0).unwrap(),
+            local(2026, 9, 12, 0, 0)
+        );
+        assert_eq!(
+            calendar_bucket_before(anchor, 0).unwrap(),
+            calendar_bucket_before(anchor, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn chained_bucket_before_walks_back_one_whole_bucket_at_a_time() {
+        // Chaining yields consecutive, non-overlapping buckets with no duplicate
+        // and no gap — the property callers that walk backwards rely on.
+        let anchor = local(2026, 9, 13, 0, 0);
+        let mut cursor = anchor;
+        let mut days = vec![cursor];
+        for _ in 0..4 {
+            cursor = calendar_bucket_before(cursor, 1).unwrap();
+            days.push(cursor);
+        }
+        assert_eq!(
+            days,
+            vec![
+                local(2026, 9, 13, 0, 0),
+                local(2026, 9, 12, 0, 0),
+                local(2026, 9, 11, 0, 0),
+                local(2026, 9, 10, 0, 0),
+                local(2026, 9, 9, 0, 0),
+            ]
+        );
+    }
 }

@@ -12,4 +12,5 @@ pub mod report;
 pub mod request;
 pub mod search;
 pub mod source;
+pub mod trend;
 pub mod tui;

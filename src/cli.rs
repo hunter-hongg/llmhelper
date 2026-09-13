@@ -171,6 +171,8 @@ pub enum Command {
     Export(ExportArgs),
     /// Continuously monitor usage, cost and budget status.
     Watch(WatchArgs),
+    /// Show usage bucketed over time (one row per day/week/month).
+    Trend(TrendArgs),
 }
 
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
@@ -607,6 +609,134 @@ impl ExplainArgs for DiffArgs {
 }
 
 impl SourcePathArgs for DiffArgs {
+    fn claude_dir(&self) -> Option<&PathBuf> {
+        self.claude_dir.as_ref()
+    }
+    fn opencode_db(&self) -> Option<&Vec<PathBuf>> {
+        self.opencode_db.as_ref()
+    }
+    fn omp_dir(&self) -> Option<&PathBuf> {
+        self.omp_dir.as_ref()
+    }
+    fn kilo_db(&self) -> Option<&Vec<PathBuf>> {
+        self.kilo_db.as_ref()
+    }
+}
+
+/// `trend`: usage split into aligned, whole time buckets.
+///
+/// Unlike `usage`/`report`, `trend` takes **no** `--since`: a trend is a
+/// sequence of bucket-aligned rows, and an arbitrary start instant would leave
+/// a ragged first bucket and make the rows incomparable. `--last` is the only
+/// entry point and is required.
+#[derive(Parser, Debug, Clone)]
+pub struct TrendArgs {
+    /// Window length to cover, e.g. "30d" or "12w". Required.
+    #[arg(long = "last")]
+    pub last: Option<String>,
+    /// Bucket width: one of the calendar keywords `1d`, `1w`, or `1mo`.
+    /// Required. Only whole-local-day buckets are accepted, so a duration like
+    /// `4h` is a loud error rather than a silently misaligned grid.
+    #[arg(long = "bucket")]
+    pub bucket: Option<String>,
+    /// Claude Code projects directory (defaults to ~/.claude/projects).
+    #[arg(long = "claude-dir")]
+    pub claude_dir: Option<std::path::PathBuf>,
+    /// OpenCode database path(s). Can be specified multiple times.
+    #[arg(long = "opencode-db")]
+    pub opencode_db: Option<Vec<std::path::PathBuf>>,
+    /// OMP sessions directory (defaults to ~/.omp/agent/sessions).
+    #[arg(long = "omp-dir")]
+    pub omp_dir: Option<std::path::PathBuf>,
+    /// Kilo Code database path(s). Can be specified multiple times.
+    #[arg(long = "kilo-db")]
+    pub kilo_db: Option<Vec<std::path::PathBuf>>,
+    /// Filter by project path substring.
+    #[arg(long = "project")]
+    pub project: Option<String>,
+    /// Filter by model substring (case-insensitive).
+    #[arg(long = "model")]
+    pub model: Option<String>,
+    /// Filter by source name.
+    #[arg(long = "source")]
+    pub source: Option<SourceArg>,
+    /// Explain the filter pipeline: report how many records each predicate
+    /// excluded, and name the one that removed the last records.
+    #[arg(long = "explain")]
+    pub explain: bool,
+    /// Output as JSON instead of the terminal table.
+    #[arg(long = "json")]
+    pub json: bool,
+    /// Output as CSV instead of the terminal table.
+    #[arg(long = "csv")]
+    pub csv: bool,
+}
+
+impl TrendArgs {
+    /// Validate the flag combination before any source is read.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.json && self.csv {
+            anyhow::bail!("--json and --csv are mutually exclusive");
+        }
+        Ok(())
+    }
+
+    /// `--last` is mandatory: a trend of an undefined span is not a trend.
+    pub fn require_last(&self) -> anyhow::Result<&str> {
+        self.last
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--last is required"))
+    }
+
+    /// `--bucket` is mandatory, for the same reason.
+    pub fn require_bucket(&self) -> anyhow::Result<&str> {
+        self.bucket
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--bucket is required"))
+    }
+
+    /// The bucket width in local days, via the shared calendar vocabulary.
+    ///
+    /// Only `1d`/`1w`/`1mo` are accepted. A duration has no local-day alignment
+    /// — a `4h` bucket cannot start on a midnight — so accepting one would put
+    /// `trend` in conflict with `--calendar` about what a boundary is.
+    pub fn bucket_days(&self) -> anyhow::Result<u32> {
+        let bucket = self.require_bucket()?;
+        crate::domain::window::calendar_days(bucket).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid --bucket '{}' (expected a calendar bucket: 1d, 1w, 1mo)",
+                bucket
+            )
+        })
+    }
+}
+
+impl FilterArgs for TrendArgs {
+    fn since(&self) -> Option<DateTime<Utc>> {
+        // Deliberately absent: see `TrendArgs`' doc comment.
+        None
+    }
+    fn last(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+    fn source(&self) -> Option<&SourceArg> {
+        self.source.as_ref()
+    }
+}
+
+impl ExplainArgs for TrendArgs {
+    fn explain(&self) -> bool {
+        self.explain
+    }
+}
+
+impl SourcePathArgs for TrendArgs {
     fn claude_dir(&self) -> Option<&PathBuf> {
         self.claude_dir.as_ref()
     }
