@@ -18,7 +18,8 @@ The failure is worse than "unhelpful", it is **actively misleading**:
 - `usage --json` still emits a populated `sources[]` array. Those numbers are
   the *loaded* counts, not the matched counts, so the output appears to contain
   data even though nothing matched. A downstream tool reading `sources[].records`
-  sees `22` and concludes there was usage.
+  sees `22` and concludes there was usage. (Addressed by spec 0021, which adds
+  a `matched` count per source alongside the loaded one.)
 - The three output modes disagree. The table path prints `(no groups)`
   (`output.rs`); CSV prints a bare header; JSON prints an empty `groups: []`
   beside the loaded `sources[]`. The same empty result looks like three

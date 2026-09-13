@@ -133,6 +133,37 @@ fn watch_json_matches_usage_for_every_diagnostics_case() {
     assert_watch_matches_usage(&fixture_paths(), &["--source", "claude"]);
 }
 
+/// The per-source `matched` count travels inside the diagnostics-bearing frame,
+/// so the equality must hold there too. Asserting the field is actually present
+/// on both sides keeps the equality test from passing vacuously.
+#[test]
+fn watch_json_and_usage_json_carry_the_same_per_source_matched() {
+    let cases: Vec<(&str, &[&str])> = vec![
+        ("watch", &["--project", "/nonexistent-xyz"]),
+        ("usage", &["--project", "/nonexistent-xyz"]),
+        ("watch", &["--source", "claude", "--explain"]),
+        ("usage", &["--source", "claude", "--explain"]),
+    ];
+    for (subcommand, extra_args) in cases {
+        let json = json_ok(subcommand, &fixture_paths(), extra_args);
+        let sources = json["sources"].as_array().unwrap();
+        assert!(
+            !sources.is_empty(),
+            "{subcommand} should list the sources that loaded"
+        );
+        let with_matched: Vec<&str> = sources
+            .iter()
+            .filter(|s| s.get("matched").is_some())
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            with_matched.len(),
+            sources.len(),
+            "{subcommand} did not put matched on every source: {json}"
+        );
+    }
+}
+
 #[test]
 fn watch_json_matches_usage_for_a_calendar_window() {
     assert_watch_matches_usage(&fixture_paths(), &["--calendar", "--last", "1d"]);

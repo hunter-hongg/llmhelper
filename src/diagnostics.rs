@@ -16,6 +16,8 @@
 //! already-resolved absolute bounds; re-resolving it could disagree with the
 //! filter that actually ran (the clock moved).
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use crate::domain::record::Record;
@@ -121,6 +123,21 @@ pub fn diagnose(records: &[Record], filter: &Filter) -> Diagnostics {
         matched: survivors.len(),
         blamed,
     }
+}
+
+/// How many records each Source contributed to the *matched* set.
+///
+/// `SourceStatus::record_count` is a *loaded* count, so on an empty result the
+/// JSON sources panel looks populated while `groups` is empty — the exact
+/// confusion the funnel exists to dispel. This is the per-source breakdown of
+/// the same filter, counted by the same [`Filter::apply`] the aggregate uses,
+/// never a parallel reimplementation of its predicates.
+pub fn matched_by_source(records: &[Record], filter: &Filter) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for r in filter.apply(records) {
+        *counts.entry(r.source.clone()).or_insert(0) += 1;
+    }
+    counts
 }
 
 /// Apply exactly one layer's predicate to a record.
@@ -293,6 +310,40 @@ mod tests {
 
     fn stage<'a>(d: &'a Diagnostics, layer: &str) -> &'a Stage {
         d.stages.iter().find(|s| s.layer == layer).unwrap()
+    }
+
+    #[test]
+    fn per_source_matched_uses_the_same_filter_as_the_aggregate() {
+        // A source with no surviving record must not appear as a 0 entry: it
+        // is deliberately absent, so the renderer can report an explicit 0 to
+        // keep the loaded count and the matched count on the same row.
+        let records = vec![
+            rec("claude", "proj", "auto", 1),
+            rec("claude", "proj", "auto", 2),
+            rec("omp", "proj", "auto", 3),
+        ];
+        let f = Filter {
+            source: Some("claude".to_string()),
+            ..Filter::none()
+        };
+        let counts = matched_by_source(&records, &f);
+        assert_eq!(counts.get("claude"), Some(&2));
+        assert_eq!(counts.get("omp"), None);
+        assert_eq!(
+            counts.values().sum::<usize>(),
+            diagnose(&records, &f).matched
+        );
+
+        // Nothing matching at all yields an empty map, which is what makes an
+        // over-narrow filter render every source as matched 0 rather than absent.
+        let empty = matched_by_source(
+            &records,
+            &Filter {
+                project: Some("/nope".to_string()),
+                ..Filter::none()
+            },
+        );
+        assert!(empty.is_empty());
     }
 
     #[test]

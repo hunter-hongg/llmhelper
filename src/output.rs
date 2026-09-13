@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Write;
 
 use serde::Serialize;
@@ -11,6 +12,8 @@ use crate::source::SourceStatus;
 struct SourceInfo {
     name: String,
     records: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched: Option<usize>,
     status: String,
 }
 
@@ -27,25 +30,49 @@ struct JsonPayload {
 
 pub struct OutputRenderer;
 
+/// Build the JSON panel entry for one Source.
+///
+/// `matched` is the loaded count's honest counterpart: how many of that
+/// Source's records actually survived the filter. It is only emitted when the
+/// funnel is carried (`matched_map` is `Some`), which is exactly the set of
+/// runs where the distinction matters — an empty result, or `--explain`.
+/// Everywhere else the key is omitted, so the frame stays byte-identical for
+/// the ordinary non-empty run that downstream tools parse.
+fn source_info(s: &SourceStatus, matched_map: Option<&BTreeMap<String, usize>>) -> SourceInfo {
+    SourceInfo {
+        name: s.name.clone(),
+        records: s.record_count,
+        matched: matched_map.map(|m| m.get(&s.name).copied().unwrap_or(0)),
+        status: match &s.error {
+            None => "ok".to_string(),
+            Some(e) => format!("{}", e),
+        },
+    }
+}
+
 impl OutputRenderer {
+    /// Render the `usage` / `watch` frame.
+    ///
+    /// `matched_by_source` is the per-Source breakdown of the *matched* set. It
+    /// is only consulted when the funnel is carried, so an ordinary non-empty
+    /// run serialises exactly as it always has — see [`source_info`].
     pub fn json<W: Write>(
         &self,
         groups: &[Group],
         source_statuses: &[SourceStatus],
         group_by: &str,
         diagnostics: Option<&Diagnostics>,
+        matched_by_source: Option<&BTreeMap<String, usize>>,
         out: &mut W,
     ) -> anyhow::Result<()> {
+        // The panel keeps reporting *loaded* counts, but once the funnel is
+        // carried the ambiguity it was blamed for is visible right beside it:
+        // `records` (loaded) and `matched` (survived the filter) sit on the same
+        // row, so a populated panel next to empty `groups` can no longer pose as
+        // "there was usage".
         let sources: Vec<SourceInfo> = source_statuses
             .iter()
-            .map(|s| SourceInfo {
-                name: s.name.clone(),
-                records: s.record_count,
-                status: match &s.error {
-                    None => "ok".to_string(),
-                    Some(e) => format!("{}", e),
-                },
-            })
+            .map(|s| source_info(s, diagnostics.and(matched_by_source)))
             .collect();
         let payload = JsonPayload {
             sources,
@@ -149,14 +176,7 @@ pub fn render_diff_json(
         },
         sources: source_statuses
             .iter()
-            .map(|s| SourceInfo {
-                name: s.name.clone(),
-                records: s.record_count,
-                status: match &s.error {
-                    None => "ok".to_string(),
-                    Some(e) => format!("{}", e),
-                },
-            })
+            .map(|s| source_info(s, None))
             .collect(),
         group_by: group_by.to_string(),
         rows: rows.to_vec(),
@@ -456,7 +476,7 @@ mod tests {
         let mut buf = Vec::new();
         let renderer = OutputRenderer;
         renderer
-            .json(&agg.groups, &statuses, "source", None, &mut buf)
+            .json(&agg.groups, &statuses, "source", None, None, &mut buf)
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(parsed.get("sources").is_some());

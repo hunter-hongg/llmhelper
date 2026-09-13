@@ -13,7 +13,7 @@ use llmhelper::cli::{
     ReportArgs, RequestArgs, SearchArgs, SessionsArgs, UsageArgs, WatchArgs, WindowArgs,
 };
 use llmhelper::config::Config;
-use llmhelper::diagnostics::{diagnose, funnel_line, reason_line, Diagnostics};
+use llmhelper::diagnostics::{diagnose, funnel_line, matched_by_source, reason_line, Diagnostics};
 use llmhelper::diff::{compute_diff, fmt_window_len, window_pair, DiffMode};
 use llmhelper::domain::group::GroupBy;
 use llmhelper::domain::message::Message;
@@ -1174,12 +1174,14 @@ fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
 
     let renderer = OutputRenderer;
     if args.json {
+        let matched = matched_by_source(&records, &filter);
         let mut buf = Vec::new();
         renderer.json(
             &agg.groups,
             &source_statuses,
             group_by.label(),
             want_diag.then_some(&diag),
+            want_diag.then_some(&matched),
             &mut buf,
         )?;
         println!("{}", String::from_utf8(buf)?);
@@ -1258,12 +1260,14 @@ fn run_watch(args: WatchArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
         // funnel is attached by the same rule and nothing prints to stderr.
         let diag = diagnose(&records, &filter);
         let want_diag = diag_explains(&diag, args.explain());
+        let matched = matched_by_source(&records, &filter);
         let mut buf = Vec::new();
         OutputRenderer.json(
             &agg.groups,
             &source_statuses,
             group_by.label(),
             want_diag.then_some(&diag),
+            want_diag.then_some(&matched),
             &mut buf,
         )?;
         println!("{}", String::from_utf8(buf)?);

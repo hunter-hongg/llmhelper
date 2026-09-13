@@ -383,6 +383,93 @@ fn a_non_empty_json_result_is_byte_identical_to_the_pre_feature_shape() {
     );
 }
 
+/// `matched` is gated on `diagnostics`: an ordinary non-empty run gains neither
+/// key, so the frame a downstream tool already parses is unchanged.
+#[test]
+fn an_ordinary_json_result_carries_no_matched_field() {
+    let json: serde_json::Value =
+        serde_json::from_slice(&run("usage", &["--json"]).stdout).unwrap();
+    let sources = json["sources"].as_array().unwrap();
+    assert!(
+        !sources.is_empty(),
+        "the fixture tree should load at least one source"
+    );
+    for source in sources {
+        assert!(
+            source.get("matched").is_none(),
+            "a non-empty run without --explain grew a matched key: {json}"
+        );
+    }
+    // `diff --json` shares the SourceInfo shape but has no funnel, so it must
+    // not pick the field up either.
+    let diff: serde_json::Value =
+        serde_json::from_slice(&run("diff", &["--last", "1d", "--prev", "1d", "--json"]).stdout)
+            .unwrap();
+    for source in diff["sources"].as_array().unwrap() {
+        assert!(
+            source.get("matched").is_none(),
+            "diff --json must not carry matched: {diff}"
+        );
+    }
+}
+
+#[test]
+fn every_source_reports_matched_zero_on_an_empty_result() {
+    // The defect that motivated spec 0021: `groups` empty, `diagnostics.matched`
+    // zero, and a `sources` panel whose bare loaded counts looked like usage.
+    let json: serde_json::Value =
+        serde_json::from_slice(&run("usage", &["--json", "--project", NO_SUCH_PROJECT]).stdout)
+            .unwrap();
+    assert!(json["groups"].as_array().unwrap().is_empty());
+    let sources = json["sources"].as_array().unwrap();
+    assert!(
+        !sources.is_empty(),
+        "sources that loaded should still be listed"
+    );
+    for source in sources {
+        let records = source["records"].as_u64().unwrap();
+        let matched = source["matched"].as_u64();
+        assert_eq!(
+            matched,
+            Some(0),
+            "a source whose records all fell outside the filter must say matched 0: {json}"
+        );
+        assert!(
+            records > 0,
+            "records is the loaded count and the fixtures load: {json}"
+        );
+    }
+}
+
+/// `sum(sources[].matched) == diagnostics.matched`: the two views of "how much
+/// survived" must agree, on a partial match as well as on an empty one.
+#[test]
+fn per_source_matched_sums_to_the_funnel_matched() {
+    let cases: Vec<(&[&str], u64)> = vec![
+        (&["--json", "--project", NO_SUCH_PROJECT], 0),
+        (&["--json", "--source", "claude", "--explain"], 2),
+        (&["--json", "--explain"], 7),
+    ];
+    for (args, expected) in cases {
+        let json: serde_json::Value = serde_json::from_slice(&run("usage", args).stdout).unwrap();
+        let per_source: u64 = json["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["matched"].as_u64().unwrap_or(0))
+            .sum();
+        let matched = json["diagnostics"]["matched"].as_u64().unwrap();
+        assert_eq!(
+            per_source, matched,
+            "per-source matched must sum to the funnel total for {args:?}"
+        );
+        assert_eq!(
+            matched, expected,
+            "the fixture tree's matched total changed for {args:?}"
+        );
+    }
+}
+
 #[test]
 fn a_zero_loaded_run_stays_exit_zero() {
     // An empty corpus is not an error, and the diagnostic must not turn it

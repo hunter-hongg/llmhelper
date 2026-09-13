@@ -61,6 +61,15 @@ Where it goes depends on the output mode:
 }
 ```
 
+`sources[].records` is a **loaded** count, not a matched one, so an empty result
+would otherwise show a populated `sources` panel beside `groups: []`. When
+`diagnostics` is present, each source gains a `matched` count on the same row
+— how many of its records survived the filter — so a consumer reading only
+`sources` can no longer mistake a filtered-out corpus for usage. The field is
+emitted only alongside `diagnostics`: an ordinary non-empty run is
+byte-identical to before, and `sum(sources[].matched) == diagnostics.matched`.
+`diff --json` carries no `matched`, since it has no funnel.
+
 `report --output` embeds the funnel in the generated Markdown (there is no
 terminal to print it to), under a `## Filters` section that appears only when
 there is something to explain or `--explain` was passed. `search` counts
@@ -384,4 +393,4 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 ## Specs
-See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget, message-export, diff-calendar, usage-report-calendar, watch and empty-diagnostics specifications. Architecture notes in `docs/adr/`.
+See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget, message-export, diff-calendar, usage-report-calendar, watch, empty-diagnostics and per-source-matched specifications. Architecture notes in `docs/adr/`.
