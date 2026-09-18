@@ -1,5 +1,6 @@
 pub mod aggregator;
 pub mod budget;
+pub mod cache;
 pub mod cli;
 pub mod compare;
 pub mod config;

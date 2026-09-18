@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -16,6 +16,68 @@ pub struct Config {
     /// Source-scoped spend budgets declared under `[budget.<name>]`, in the
     /// file's declaration order. Empty when the table is absent.
     pub budgets: Vec<crate::budget::Budget>,
+    /// `[cache]` — the message-extraction cache's declared settings. Resolution
+    /// (CLI flag > config > default) happens in [`Config::resolve_cache`],
+    /// because only the CLI layer knows about the flags.
+    pub cache: CacheConfig,
+}
+
+/// The `[cache]` table.
+#[derive(Clone, Debug, Default)]
+pub struct CacheConfig {
+    /// `cache.enabled = false` turns the cache off entirely. `None` means "not
+    /// declared", so a CLI `--no-cache` and an absent key are distinguishable
+    /// before resolution.
+    pub enabled: Option<bool>,
+    /// `cache.dir` — where to keep the indices. `None` uses the platform cache
+    /// directory.
+    pub dir: Option<PathBuf>,
+}
+
+/// What the cache should actually do for this run, after CLI > config > default
+/// resolution. Carried from `main` down to Source discovery.
+#[derive(Clone, Debug)]
+pub struct ResolvedCache {
+    /// `false` means "extract everything, write nothing" (the `--no-cache` path,
+    /// or `cache.enabled = false`).
+    pub enabled: bool,
+    /// The directory the per-Source indices live in. Unused when disabled.
+    pub dir: PathBuf,
+    /// Set when `--refresh-cache` was passed: every Source's index is ignored on
+    /// read and rewritten, and the previously stored file is removed first.
+    pub refresh: bool,
+}
+
+impl ResolvedCache {
+    /// A disabled cache, as if `--no-cache` were always passed.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            dir: crate::cache::default_dir(),
+            refresh: false,
+        }
+    }
+
+    /// Open one Source's cache handle, or `None` when disabled.
+    ///
+    /// `--refresh-cache` deletes the Source's existing index before the handle
+    /// opens, so no entry can be served from the file being replaced. Deletion
+    /// is best-effort — a read-only cache directory cannot be cleaned — but the
+    /// handle is opened with its stored entries ignored either way, so the run
+    /// re-extracts everything and rewrites the index from scratch.
+    pub fn handle_for(&self, name: &str) -> Option<crate::source::SharedMessageCache> {
+        if !self.enabled {
+            return None;
+        }
+        if self.refresh {
+            let index = self
+                .dir
+                .join(format!("{}.ndjson", crate::cache::sanitize_name(name)));
+            let _ = std::fs::remove_file(index);
+            return Some(crate::source::cache_handle_fresh(&self.dir, name));
+        }
+        Some(crate::source::cache_handle(&self.dir, name))
+    }
 }
 
 impl Default for Config {
@@ -33,6 +95,7 @@ impl Default for Config {
             request_reasoning_fields: None,
             request_reasoning: None,
             budgets: Vec::new(),
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -121,6 +184,39 @@ impl Config {
                     }
                 })
                 .collect(),
+            cache: CacheConfig {
+                enabled: parsed.cache.as_ref().and_then(|c| c.enabled),
+                dir: parsed.cache.as_ref().and_then(|c| c.dir.clone()),
+            },
+        }
+    }
+
+    /// Resolve the effective cache settings: CLI flag beats config beats default.
+    ///
+    /// `no_cache` comes from `--no-cache`, `refresh` from `--refresh-cache`, and
+    /// `dir` from `--cache-dir`. Clap rejects `--no-cache --refresh-cache` at
+    /// the parser (`conflicts_with`), so the precedence below only arbitrates
+    /// between flags and config; `refresh && enabled` additionally makes
+    /// `--refresh-cache` a no-op when `cache.enabled = false`.
+    pub fn resolve_cache(
+        &self,
+        no_cache: bool,
+        refresh: bool,
+        dir: Option<&Path>,
+    ) -> ResolvedCache {
+        let enabled = if no_cache {
+            false
+        } else {
+            self.cache.enabled.unwrap_or(true)
+        };
+        let dir = dir
+            .map(Path::to_path_buf)
+            .or_else(|| self.cache.dir.clone())
+            .unwrap_or_else(crate::cache::default_dir);
+        ResolvedCache {
+            enabled,
+            dir,
+            refresh: refresh && enabled,
         }
     }
 
@@ -137,6 +233,14 @@ struct ConfigTable {
     request: Option<RequestConfig>,
     /// `[budget.<name>]` tables, in declaration order.
     budget: Option<std::collections::BTreeMap<String, BudgetConfig>>,
+    /// `[cache]`
+    cache: Option<CacheTable>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct CacheTable {
+    enabled: Option<bool>,
+    dir: Option<PathBuf>,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]

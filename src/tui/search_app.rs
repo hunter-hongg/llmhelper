@@ -1,3 +1,4 @@
+use crate::cache::CacheStats;
 use crate::search::SearchHit;
 use crate::source::MessageStatus;
 use crate::tui::list_detail::{ListDetail, ViewSwitcher};
@@ -27,6 +28,11 @@ impl ViewSwitcher for SearchView {
 pub struct SearchData {
     pub hits: Vec<SearchHit>,
     pub message_statuses: Vec<MessageStatus>,
+    /// Aggregate cache statistics for the load that produced `hits`, or `None`
+    /// when the run had no cache. Carried into the header so a user watching
+    /// the `r`-refresh sees the reuse count climb instead of the load looking
+    /// opaque.
+    pub cache_stats: Option<CacheStats>,
 }
 
 pub struct SearchTuiState {
@@ -38,6 +44,8 @@ pub struct SearchTuiState {
     /// as one line, so a scoped search never looks unscoped on screen.
     pub filters: String,
     pub message_statuses: Vec<MessageStatus>,
+    /// The load's cache statistics, shown beside the filters line.
+    pub cache_stats: Option<CacheStats>,
     /// Scroll offset and line count for the detail body.
     pub scroll: usize,
     pub viewport_height: usize,
@@ -53,6 +61,9 @@ impl SearchTuiState {
         filters: String,
         data: SearchData,
     ) -> Self {
+        // Read the cache stats off the data before it is moved into the state,
+        // so the header can show them without the caller re-querying.
+        let cache_stats = data.cache_stats;
         let mut this = Self {
             list: ListDetail::new(),
             query,
@@ -60,6 +71,7 @@ impl SearchTuiState {
             role,
             filters,
             message_statuses: data.message_statuses,
+            cache_stats,
             scroll: 0,
             viewport_height: 0,
             detail_lines: Vec::new(),
@@ -81,6 +93,9 @@ impl SearchTuiState {
     /// the `sessions` refresh behaviour.
     pub fn apply_data(&mut self, data: SearchData) {
         self.message_statuses = data.message_statuses;
+        // The header's reuse count is recomputed on every refresh, so it never
+        // displays the first load's numbers while showing a later load's hits.
+        self.cache_stats = data.cache_stats;
         let survived = self.list.apply_items(data.hits, |a, b| a.same_message(b));
         if survived.is_some() {
             self.set_scroll(0);
@@ -219,6 +234,7 @@ mod tests {
             SearchData {
                 hits,
                 message_statuses: Vec::new(),
+                cache_stats: None,
             },
         );
         state.list.running = true;
@@ -314,6 +330,7 @@ mod tests {
                 message_count: 2,
                 error: None,
             }],
+            cache_stats: None,
         });
 
         assert_eq!(state.list.view, SearchView::Detail);
@@ -331,6 +348,7 @@ mod tests {
         state.apply_data(SearchData {
             hits: vec![hit(1, "one", 1)],
             message_statuses: Vec::new(),
+            cache_stats: None,
         });
 
         assert_eq!(state.list.view, SearchView::List);
@@ -346,6 +364,7 @@ mod tests {
         state.apply_data(SearchData {
             hits: vec![hit(1, "one", 1), hit(2, "rewritten", 1)],
             message_statuses: Vec::new(),
+            cache_stats: None,
         });
 
         assert_eq!(state.list.view, SearchView::List);
@@ -360,6 +379,7 @@ mod tests {
         state.apply_data(SearchData {
             hits: vec![hit(1, "one", 1)],
             message_statuses: Vec::new(),
+            cache_stats: None,
         });
 
         assert_eq!(state.list.table_state.selected(), Some(0));
@@ -379,6 +399,7 @@ mod tests {
         state.apply_data(SearchData {
             hits: vec![hit(1, "line\nline\nline\nline", 3)],
             message_statuses: Vec::new(),
+            cache_stats: None,
         });
 
         assert_eq!(state.list.view, SearchView::Detail);

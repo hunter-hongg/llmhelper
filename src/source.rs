@@ -1,12 +1,38 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::Connection;
 
+use crate::cache::{CacheStats, FileFingerprint, MessageCache};
 use crate::domain::message::Message;
 use crate::domain::record::{Record, TokenBreakdown};
 use chrono::{DateTime, TimeZone, Utc};
+
+/// The handle a Source holds to the shared message cache.
+///
+/// One cache per Source (each writes its own index file), behind an `Arc<Mutex>`
+/// because the same corpus is read from both the shell paths and the TUI's
+/// refresh loop, and a run-scoped statistics total must reflect every read.
+pub type SharedMessageCache = Arc<Mutex<MessageCache>>;
+
+/// Open a fresh cache handle for one Source under `dir`.
+///
+/// Every Source gets its own index file — one Source's cached rows can never be
+/// served to another, because the two extract different fields even from a
+/// shared schema (OpenCode records a cost, Kilo a message count).
+pub fn cache_handle(dir: &Path, name: &str) -> SharedMessageCache {
+    Arc::new(Mutex::new(MessageCache::open(dir, name, true)))
+}
+
+/// As [`cache_handle`], but the stored index is ignored: for `--refresh-cache`,
+/// whose run must re-extract everything regardless of whether deleting the old
+/// index file succeeded (spec 0025's "rewrites the index from scratch").
+pub fn cache_handle_fresh(dir: &Path, name: &str) -> SharedMessageCache {
+    Arc::new(Mutex::new(MessageCache::open(dir, name, false)))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceError {
@@ -52,6 +78,17 @@ pub trait Source: Send + Sync {
     /// result instead of requiring a special case at every call site.
     fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
         Ok(Vec::new())
+    }
+
+    /// Persist this Source's message cache index, if it has one. Default is a
+    /// no-op, so a Source that never reads messages needs no cache code at all.
+    fn flush_cache(&self) {}
+
+    /// This Source's cache statistics, if it has a cache. Default is `None`, so
+    /// an uncached Source is absent from the aggregate rather than contributing
+    /// a line of zeroes.
+    fn cache_stats(&self) -> Option<CacheStats> {
+        None
     }
 }
 
@@ -99,11 +136,49 @@ impl Registry {
         }
         (records, statuses)
     }
+    /// Load every Source's messages concurrently, in parallel across Sources.
+    ///
+    /// The Sources are independent — separate files, separate databases, and (in
+    /// cached runs) separate cache indices — so their reads cannot interfere.
+    /// Each runs on its own thread, which matters because a large corpus is
+    /// dominated by I/O wait and SQLite scans that a single thread serialises.
+    ///
+    /// The **results** are ordered deterministically: Sources are sorted by name
+    /// before the threads spawn and the outputs are reassembled in that order,
+    /// so the concatenated corpus — and therefore `search`'s hit ranking — is
+    /// identical to the sequential version regardless of which thread finishes
+    /// first. (Asserted in `tests/cache_integration.rs`.)
     pub fn load_messages_all(&self) -> (Vec<Message>, MessageStatuses) {
+        let mut named: Vec<(&String, &Box<dyn Source>)> = self.sources.iter().collect();
+        named.sort_by_key(|(name, _)| name.as_str());
+
+        // One scoped thread per Source; a Source that panics yields an error
+        // status rather than aborting the run, matching the tolerance the
+        // sequential version has for a single Source's failure.
+        let results: Vec<(&String, Result<Vec<Message>, SourceError>)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = named
+                    .iter()
+                    .map(|(name, src)| (name, scope.spawn(move || src.load_messages())))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(name, handle)| {
+                        let result = handle.join().unwrap_or_else(|_| {
+                            Err(SourceError::Unreadable(format!(
+                                "source {} panicked while loading messages",
+                                name
+                            )))
+                        });
+                        (*name, result)
+                    })
+                    .collect()
+            });
+
         let mut messages = Vec::new();
         let mut statuses = Vec::new();
-        for (name, src) in &self.sources {
-            match src.load_messages() {
+        for (name, result) in results {
+            match result {
                 Ok(batch) => {
                     let count = batch.len();
                     messages.extend(batch);
@@ -126,6 +201,44 @@ impl Registry {
     }
     pub fn source_names(&self) -> Vec<&str> {
         self.sources.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Persist every Source's message cache index.
+    ///
+    /// Called once at the end of a run that read messages. Sources built without
+    /// a cache (or handed a disabled one) have nothing to flush, so their own
+    /// `flush` is skipped by the Sources themselves — this walks the registry
+    /// and asks each one, rather than `main` tracking which Sources were cached.
+    pub fn flush_caches(&self) {
+        for src in self.sources.values() {
+            src.flush_cache();
+        }
+    }
+
+    /// Aggregate cache statistics across Sources, or `None` when no Source had
+    /// a cache (the `--no-cache` path, or `--messages` absent).
+    ///
+    /// Summed over Sources because the figure a user acts on is "how much of
+    /// this run was served from the cache", which is a whole-corpus question,
+    /// not a per-Source one. The per-Source breakdown, if ever needed, is a
+    /// separate method rather than a wider return type here.
+    pub fn cache_stats(&self) -> Option<CacheStats> {
+        let mut total = CacheStats::default();
+        let mut any = false;
+        for src in self.sources.values() {
+            if let Some(s) = src.cache_stats() {
+                any = true;
+                // The per-Source counts are summed, but `sources` is counted
+                // here: only the registry knows how many Sources contributed.
+                total.sources += 1;
+                total.files_seen += s.files_seen;
+                total.files_reused += s.files_reused;
+                total.files_extracted += s.files_extracted;
+                total.messages_reused += s.messages_reused;
+                total.messages_extracted += s.messages_extracted;
+            }
+        }
+        any.then_some(total)
     }
 }
 
@@ -225,7 +338,11 @@ fn merge_message_batches(
 
 /// Read searchable messages from every database of a SQLite Source, skipping
 /// absent paths and deduping sessions across databases.
-fn load_sqlite_messages_all(dbs: &[PathBuf], source: &str) -> Vec<Message> {
+fn load_sqlite_messages_all(
+    dbs: &[PathBuf],
+    source: &str,
+    cache: Option<&SharedMessageCache>,
+) -> Vec<Message> {
     if dbs.is_empty() {
         return Vec::new();
     }
@@ -237,7 +354,37 @@ fn load_sqlite_messages_all(dbs: &[PathBuf], source: &str) -> Vec<Message> {
         if !db_path.exists() {
             continue;
         }
-        let batch = match load_sqlite_messages(db_path, source) {
+        // WAL commits need not touch the main DB fingerprint. Only a known
+        // absent WAL permits reuse: errors also fail open to a fresh SQLite
+        // read. Resolve symlinks because SQLite puts its WAL beside the real DB.
+        let wal_absent = std::fs::canonicalize(db_path).ok().is_some_and(|path| {
+            let mut wal = path.into_os_string();
+            wal.push("-wal");
+            matches!(Path::new(&wal).try_exists(), Ok(false))
+        });
+        let result = if wal_absent {
+            cached_file_messages(cache, db_path, || {
+                load_sqlite_messages(db_path, source)
+            })
+        } else if let Some(handle) = cache {
+            // No fingerprint means neither old entries nor WAL-derived results
+            // are reused/stored, but extraction is still counted. Once SQLite
+            // removes the WAL, checkpoint writes invalidate any old main-file
+            // fingerprint; an empty WAL needs no such invalidation.
+            // The DB file itself was still reached (its WAL merely disallows
+            // reuse), so record it: pruning must not drop an entry for a file
+            // this load did visit.
+            let seen = std::fs::canonicalize(db_path)
+                .unwrap_or_else(|_| db_path.to_path_buf());
+            handle.lock().mark_seen(&seen);
+            handle
+                .lock()
+                .reuse_or_extract(None, || load_sqlite_messages(db_path, source))
+        } else {
+            load_sqlite_messages(db_path, source)
+        };
+        // Cross-DB session dedup depends on every DB and is never cached.
+        let batch = match result {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("warn: cannot read messages from {:?}: {}", db_path, e);
@@ -359,6 +506,30 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Read one file's messages, consulting the cache first.
+///
+/// A `None` cache (caching off, or a Source constructed without one) and an
+/// uncapturable fingerprint both degrade to running `extract`, so a run without
+/// a cache behaves exactly as it did before — only slower.
+fn cached_file_messages<F>(
+    cache: Option<&SharedMessageCache>,
+    path: &Path,
+    extract: F,
+) -> Result<Vec<Message>, SourceError>
+where
+    F: FnOnce() -> Result<Vec<Message>, SourceError>,
+{
+    match cache {
+        Some(handle) => {
+            let fingerprint = FileFingerprint::capture(path);
+            handle
+                .lock()
+                .reuse_or_extract(fingerprint.as_ref(), extract)
+        }
+        None => extract(),
+    }
+}
+
 /// One OMP message collected before the session envelope is resolved:
 /// `(timestamp, model, role, text)`.
 type MessageEvent = (Option<DateTime<Utc>>, Option<String>, String, String);
@@ -452,11 +623,23 @@ mod claude {
 
     pub struct ClaudeSource {
         project_dir: PathBuf,
+        cache: Option<SharedMessageCache>,
     }
 
     impl ClaudeSource {
         pub fn new(project_dir: PathBuf) -> Self {
-            Self { project_dir }
+            Self {
+                project_dir,
+                cache: None,
+            }
+        }
+
+        /// As [`Self::new`], with a message cache attached for `load_messages`.
+        pub fn with_cache(project_dir: PathBuf, cache: SharedMessageCache) -> Self {
+            Self {
+                project_dir,
+                cache: Some(cache),
+            }
         }
 
         /// Decode a hyphen-encoded project directory name into a path.
@@ -584,6 +767,13 @@ mod claude {
         }
 
         fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
+            // The handle (and its stats) survive the TUI's `r` refresh; the
+            // load must describe this walk only — zeroed counters, and a
+            // corpus walk announced so stale index entries are pruned at flush
+            // (spec 0025).
+            if let Some(c) = self.cache.as_ref() {
+                c.lock().begin_load();
+            }
             if !self.project_dir.exists() {
                 return Err(SourceError::Absent(
                     self.project_dir.to_string_lossy().to_string(),
@@ -605,47 +795,74 @@ mod claude {
                 let mut files = Vec::new();
                 collect_jsonl(&dir, &mut files);
                 for p in files {
-                    let content = match std::fs::read_to_string(&p) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("warn: cannot read {:?}: {}", p, e);
-                            continue;
-                        }
-                    };
-                    let session_id = p
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    for line in content.lines().filter(|l| !l.trim().is_empty()) {
-                        let line: Line = match serde_json::from_str(line) {
-                            Ok(l) => l,
-                            Err(_) => continue,
-                        };
-                        let Some(m) = line.message.as_ref() else {
-                            continue;
-                        };
-                        // `user` and `assistant` are the conversation turns.
-                        // Every other line type is harness bookkeeping.
-                        let role = match line.line_type.as_deref() {
-                            Some("user") => "user",
-                            Some("assistant") => "assistant",
-                            _ => continue,
-                        };
-                        let ts = line.timestamp.as_deref().and_then(parse_timestamp);
-                        let model = m.model.clone();
-                        for (msg_role, text) in content_texts(m.content.as_ref(), role) {
-                            messages.push(Message {
-                                source: "claude".to_string(),
-                                session_id: session_id.clone(),
-                                project: project.clone(),
-                                model: model.clone(),
-                                role: msg_role,
-                                timestamp: ts,
-                                text,
-                            });
-                        }
-                    }
+                    let batch = cached_file_messages(self.cache.as_ref(), &p, || {
+                        Self::extract_file_messages(&p, &project)
+                    })?;
+                    messages.extend(batch);
+                }
+            }
+            Ok(messages)
+        }
+
+        fn flush_cache(&self) {
+            if let Some(c) = self.cache.as_ref() {
+                c.lock().flush();
+            }
+        }
+
+        fn cache_stats(&self) -> Option<CacheStats> {
+            self.cache.as_ref().map(|c| c.lock().stats())
+        }
+    }
+
+    impl ClaudeSource {
+        /// Extract every message in one transcript file.
+        ///
+        /// The unit the cache memoizes: a Claude transcript file is one session,
+        /// and its `session_id` is the file name and its `project` the enclosing
+        /// directory, so the extraction is fully determined by the file's
+        /// content — exactly what makes it safe to reuse a cached result.
+        fn extract_file_messages(p: &Path, project: &str) -> Result<Vec<Message>, SourceError> {
+            let content = match std::fs::read_to_string(p) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("warn: cannot read {:?}: {}", p, e);
+                    return Ok(Vec::new());
+                }
+            };
+            let session_id = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let mut messages = Vec::new();
+            for line in content.lines().filter(|l| !l.trim().is_empty()) {
+                let line: Line = match serde_json::from_str(line) {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let Some(m) = line.message.as_ref() else {
+                    continue;
+                };
+                // `user` and `assistant` are the conversation turns.
+                // Every other line type is harness bookkeeping.
+                let role = match line.line_type.as_deref() {
+                    Some("user") => "user",
+                    Some("assistant") => "assistant",
+                    _ => continue,
+                };
+                let ts = line.timestamp.as_deref().and_then(parse_timestamp);
+                let model = m.model.clone();
+                for (msg_role, text) in content_texts(m.content.as_ref(), role) {
+                    messages.push(Message {
+                        source: "claude".to_string(),
+                        session_id: session_id.clone(),
+                        project: project.to_string(),
+                        model: model.clone(),
+                        role: msg_role,
+                        timestamp: ts,
+                        text,
+                    });
                 }
             }
             Ok(messages)
@@ -664,11 +881,20 @@ mod opencode {
 
     pub struct OpenCodeSource {
         dbs: Vec<PathBuf>,
+        cache: Option<SharedMessageCache>,
     }
 
     impl OpenCodeSource {
         pub fn new(dbs: Vec<PathBuf>) -> Self {
-            Self { dbs }
+            Self { dbs, cache: None }
+        }
+
+        /// As [`Self::new`], with a message cache attached for `load_messages`.
+        pub fn with_cache(dbs: Vec<PathBuf>, cache: SharedMessageCache) -> Self {
+            Self {
+                dbs,
+                cache: Some(cache),
+            }
         }
     }
 
@@ -788,7 +1014,27 @@ mod opencode {
         }
 
         fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
-            Ok(load_sqlite_messages_all(&self.dbs, "opencode"))
+            // The handle outlives the run (the TUI's `r` refresh reuses it),
+            // so re-open the load state: zeroed counters and a fresh corpus
+            // walk, so stale index entries are pruned at flush (spec 0025).
+            if let Some(c) = self.cache.as_ref() {
+                c.lock().begin_load();
+            }
+            Ok(load_sqlite_messages_all(
+                &self.dbs,
+                "opencode",
+                self.cache.as_ref(),
+            ))
+        }
+
+        fn flush_cache(&self) {
+            if let Some(c) = self.cache.as_ref() {
+                c.lock().flush();
+            }
+        }
+
+        fn cache_stats(&self) -> Option<CacheStats> {
+            self.cache.as_ref().map(|c| c.lock().stats())
         }
     }
 }
@@ -849,148 +1095,217 @@ mod omp {
 
     pub struct OmpSource {
         sessions_dir: PathBuf,
+        cache: Option<SharedMessageCache>,
+    }
+
+    /// One OMP file's two halves: its aggregate record (when it has timestamped
+    /// assistant turns) and its message corpus.
+    struct OmpFileExtract {
+        record: Option<Record>,
+        messages: Vec<Message>,
     }
 
     impl OmpSource {
         pub fn new(sessions_dir: PathBuf) -> Self {
-            Self { sessions_dir }
+            Self {
+                sessions_dir,
+                cache: None,
+            }
+        }
+
+        /// As [`Self::new`], with a message cache attached. Only the message
+        /// half of a warmed file is reused; the record half is always computed
+        /// from disk, so record-reading commands see no behavioural change.
+        pub fn with_cache(sessions_dir: PathBuf, cache: SharedMessageCache) -> Self {
+            Self {
+                sessions_dir,
+                cache: Some(cache),
+            }
         }
 
         /// Walk every session JSONL once, producing both the aggregated
         /// records and the raw message corpus. Without this the two reads each
         /// walked the whole directory, which matters on a machine where the
         /// transcripts run to hundreds of megabytes.
+        ///
+        /// The caller decides which half to use, so one warm-cache extract can
+        /// legitimately return no records (see [`Self::extract_file`]).
         fn load_all(&self) -> Result<(Vec<Record>, Vec<Message>), SourceError> {
             if !self.sessions_dir.exists() {
                 return Err(SourceError::Absent(
                     self.sessions_dir.to_string_lossy().to_string(),
                 ));
             }
-            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
             let mut records = Vec::new();
             let mut messages = Vec::new();
             let mut files = Vec::new();
             collect_jsonl(&self.sessions_dir, &mut files);
             for p in files {
-                let content = match std::fs::read_to_string(&p) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("warn: cannot read {:?}: {}", p, e);
-                        continue;
-                    }
-                };
-                let decoded_project = p
-                    .parent()
-                    .and_then(|d| d.file_name())
-                    .and_then(|n| n.to_str())
-                    .map(|n| Self::decode_dir_name(n, &home));
-                let mut session_id: Option<String> = None;
-                let mut session_cwd: Option<String> = None;
-                let mut session_started_at: Option<DateTime<Utc>> = None;
-                let mut events: Vec<(DateTime<Utc>, String, TokenBreakdown)> = Vec::new();
-                let mut cost: f64 = 0.0;
-                // (timestamp, model, role, text) — resolved against the session
-                // envelope after the loop, matching how `load` builds a record.
-                let mut message_events: Vec<MessageEvent> = Vec::new();
-                for line in content.lines().filter(|l| !l.trim().is_empty()) {
-                    let line: Line = match serde_json::from_str(line) {
-                        Ok(l) => l,
-                        Err(_) => continue,
-                    };
-                    let ts = line.timestamp.as_deref().and_then(parse_timestamp);
-                    match line.line_type.as_deref() {
-                        Some("session") => {
-                            session_id = session_id.or(line.id);
-                            session_cwd = session_cwd.or(line.cwd);
-                            session_started_at = session_started_at.or(ts);
-                        }
-                        Some("message") => {
-                            let Some(m) = line.message else {
-                                continue;
-                            };
-                            // Record side: only assistant turns with a timestamp
-                            // contribute usage.
-                            if m.role.as_deref() == Some("assistant") {
-                                if let Some(ts) = ts {
-                                    let model = m.model.clone().unwrap_or_default();
-                                    let u = m.usage.unwrap_or_default();
-                                    cost += u.cost.as_ref().and_then(|c| c.total).unwrap_or(0.0);
-                                    events.push((
-                                        ts,
-                                        model,
-                                        TokenBreakdown {
-                                            input: u.input.unwrap_or(0),
-                                            output: u.output.unwrap_or(0)
-                                                + u.reasoning_tokens.unwrap_or(0),
-                                            cache_read: u.cache_read.unwrap_or(0),
-                                            cache_write: u.cache_write.unwrap_or(0),
-                                        },
-                                    ));
-                                }
-                            }
-                            // Corpus side: tool and shell output are machine
-                            // dumps, not conversation, and dominate the corpus
-                            // by volume.
-                            match m.role.as_deref() {
-                                Some("toolResult") | Some("bashExecution") => continue,
-                                _ => {}
-                            }
-                            let Some(role) = m.role.clone() else {
-                                continue;
-                            };
-                            let model = m.model.clone();
-                            for (msg_role, text) in content_texts(m.content.as_ref(), &role) {
-                                message_events.push((ts, model.clone(), msg_role, text));
-                            }
-                        }
-                        Some("custom_message") => {
-                            let Some(v) = line.content.as_ref() else {
-                                continue;
-                            };
-                            let role = line
-                                .custom_type
-                                .clone()
-                                .unwrap_or_else(|| "custom".to_string());
-                            for (msg_role, text) in content_texts(Some(v), &role) {
-                                message_events.push((ts, None, msg_role, text));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                let project = session_cwd
-                    .or_else(|| decoded_project.clone())
-                    .unwrap_or_else(|| "/unknown".to_string());
-                let sid = session_id.unwrap_or_else(|| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string()
-                });
-                let cost = if cost == 0.0 { None } else { Some(cost) };
-                if let Some(rec) = build_session_record(
-                    "omp",
-                    sid.clone(),
-                    project.clone(),
-                    session_started_at,
-                    &mut events,
-                    cost,
-                ) {
+                // A cache hit serves the message half only; the record half
+                // still comes from the file. Letting the record half be skipped
+                // too would couple `usage`'s speed to the cache for no gain.
+                let extracted = self.extract_file(&p)?;
+                if let Some(rec) = extracted.record {
                     records.push(rec);
                 }
-                for (ts, model, role, text) in message_events {
-                    messages.push(Message {
-                        source: "omp".to_string(),
-                        session_id: sid.clone(),
-                        project: project.clone(),
-                        model,
-                        role,
-                        timestamp: ts,
-                        text,
+                messages.extend(extracted.messages);
+            }
+            Ok((records, messages))
+        }
+
+        /// Extract one file, consulting the cache for the message half.
+        ///
+        /// Split deliberately in two: the cache is consulted only for a file's
+        /// messages, and on a miss the **same** parse pass that produces the
+        /// messages also produces the record, so a cold cache costs no extra
+        /// read. The record is never reused — `usage` sees unchanged numbers —
+        /// so a caller that needs records must not go through this path with a
+        /// warm cache (see [`Self::load_all`], and `Source::load`'s fresh
+        /// un-cached walk for message-cached Sources).
+        fn extract_file(&self, p: &Path) -> Result<OmpFileExtract, SourceError> {
+            let fingerprint = FileFingerprint::capture(p);
+            if let (Some(handle), Some(fp)) = (self.cache.as_ref(), fingerprint.as_ref()) {
+                handle.lock().mark_seen(&fp.path);
+                if let Some(messages) = handle.lock().lookup(fp) {
+                    return Ok(OmpFileExtract {
+                        record: None,
+                        messages,
                     });
                 }
             }
-            Ok((records, messages))
+            let extracted = Self::extract_file_uncached(p)?;
+            if let (Some(handle), Some(fp)) = (self.cache.as_ref(), fingerprint.as_ref()) {
+                handle.lock().record(fp, extracted.messages.clone());
+            }
+            Ok(extracted)
+        }
+
+        /// Parse one OMP session file into its record and messages. The unit the
+        /// cache memoizes is this whole extraction: a session envelope is spread
+        /// across lines that precede the messages referencing it, so a per-line
+        /// cache would lose the `cwd`/`id` that only appear at the top.
+        fn extract_file_uncached(p: &Path) -> Result<OmpFileExtract, SourceError> {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+            let content = match std::fs::read_to_string(p) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("warn: cannot read {:?}: {}", p, e);
+                    return Ok(OmpFileExtract {
+                        record: None,
+                        messages: Vec::new(),
+                    });
+                }
+            };
+            let decoded_project = p
+                .parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .map(|n| Self::decode_dir_name(n, &home));
+            let mut session_id: Option<String> = None;
+            let mut session_cwd: Option<String> = None;
+            let mut session_started_at: Option<DateTime<Utc>> = None;
+            let mut events: Vec<(DateTime<Utc>, String, TokenBreakdown)> = Vec::new();
+            let mut cost: f64 = 0.0;
+            // (timestamp, model, role, text) — resolved against the session
+            // envelope after the loop, matching how `load` builds a record.
+            let mut message_events: Vec<MessageEvent> = Vec::new();
+            for line in content.lines().filter(|l| !l.trim().is_empty()) {
+                let line: Line = match serde_json::from_str(line) {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let ts = line.timestamp.as_deref().and_then(parse_timestamp);
+                match line.line_type.as_deref() {
+                    Some("session") => {
+                        session_id = session_id.or(line.id);
+                        session_cwd = session_cwd.or(line.cwd);
+                        session_started_at = session_started_at.or(ts);
+                    }
+                    Some("message") => {
+                        let Some(m) = line.message else {
+                            continue;
+                        };
+                        // Record side: only assistant turns with a timestamp
+                        // contribute usage.
+                        if m.role.as_deref() == Some("assistant") {
+                            if let Some(ts) = ts {
+                                let model = m.model.clone().unwrap_or_default();
+                                let u = m.usage.unwrap_or_default();
+                                cost += u.cost.as_ref().and_then(|c| c.total).unwrap_or(0.0);
+                                events.push((
+                                    ts,
+                                    model,
+                                    TokenBreakdown {
+                                        input: u.input.unwrap_or(0),
+                                        output: u.output.unwrap_or(0)
+                                            + u.reasoning_tokens.unwrap_or(0),
+                                        cache_read: u.cache_read.unwrap_or(0),
+                                        cache_write: u.cache_write.unwrap_or(0),
+                                    },
+                                ));
+                            }
+                        }
+                        // Corpus side: tool and shell output are machine
+                        // dumps, not conversation, and dominate the corpus
+                        // by volume.
+                        match m.role.as_deref() {
+                            Some("toolResult") | Some("bashExecution") => continue,
+                            _ => {}
+                        }
+                        let Some(role) = m.role.clone() else {
+                            continue;
+                        };
+                        let model = m.model.clone();
+                        for (msg_role, text) in content_texts(m.content.as_ref(), &role) {
+                            message_events.push((ts, model.clone(), msg_role, text));
+                        }
+                    }
+                    Some("custom_message") => {
+                        let Some(v) = line.content.as_ref() else {
+                            continue;
+                        };
+                        let role = line
+                            .custom_type
+                            .clone()
+                            .unwrap_or_else(|| "custom".to_string());
+                        for (msg_role, text) in content_texts(Some(v), &role) {
+                            message_events.push((ts, None, msg_role, text));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let project = session_cwd
+                .or_else(|| decoded_project.clone())
+                .unwrap_or_else(|| "/unknown".to_string());
+            let sid = session_id.unwrap_or_else(|| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            });
+            let cost = if cost == 0.0 { None } else { Some(cost) };
+            let record = build_session_record(
+                "omp",
+                sid.clone(),
+                project.clone(),
+                session_started_at,
+                &mut events,
+                cost,
+            );
+            let messages = message_events
+                .into_iter()
+                .map(|(ts, model, role, text)| Message {
+                    source: "omp".to_string(),
+                    session_id: sid.clone(),
+                    project: project.clone(),
+                    model,
+                    role,
+                    timestamp: ts,
+                    text,
+                })
+                .collect();
+            Ok(OmpFileExtract { record, messages })
         }
 
         /// Decode a hyphen-encoded project directory name.
@@ -1012,13 +1327,31 @@ mod omp {
         }
 
         fn load(&self) -> Result<Vec<Record>, SourceError> {
-            let (records, _) = self.load_all()?;
+            // Message-cache hits contain no record; record reads must always
+            // parse the source, even when this Source has a warmed cache.
+            let (records, _) = Self::new(self.sessions_dir.clone()).load_all()?;
             Ok(records)
         }
 
         fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
+            // The handle outlives the run (the TUI's `r` refresh reuses it),
+            // so re-open the load state: zeroed counters and a fresh corpus
+            // walk, so stale index entries are pruned at flush (spec 0025).
+            if let Some(c) = self.cache.as_ref() {
+                c.lock().begin_load();
+            }
             let (_, messages) = self.load_all()?;
             Ok(messages)
+        }
+
+        fn flush_cache(&self) {
+            if let Some(c) = self.cache.as_ref() {
+                c.lock().flush();
+            }
+        }
+
+        fn cache_stats(&self) -> Option<CacheStats> {
+            self.cache.as_ref().map(|c| c.lock().stats())
         }
     }
 }
@@ -1033,11 +1366,20 @@ mod kilo {
 
     pub struct KiloSource {
         dbs: Vec<PathBuf>,
+        cache: Option<SharedMessageCache>,
     }
 
     impl KiloSource {
         pub fn new(dbs: Vec<PathBuf>) -> Self {
-            Self { dbs }
+            Self { dbs, cache: None }
+        }
+
+        /// As [`Self::new`], with a message cache attached for `load_messages`.
+        pub fn with_cache(dbs: Vec<PathBuf>, cache: SharedMessageCache) -> Self {
+            Self {
+                dbs,
+                cache: Some(cache),
+            }
         }
         /// Count `message` rows per session. Message counts are a separate
         /// lookup because the `message` table may be absent from older schemas;
@@ -1175,7 +1517,27 @@ mod kilo {
         }
 
         fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
-            Ok(load_sqlite_messages_all(&self.dbs, "kilo"))
+            // The handle outlives the run (the TUI's `r` refresh reuses it),
+            // so re-open the load state: zeroed counters and a fresh corpus
+            // walk, so stale index entries are pruned at flush (spec 0025).
+            if let Some(c) = self.cache.as_ref() {
+                c.lock().begin_load();
+            }
+            Ok(load_sqlite_messages_all(
+                &self.dbs,
+                "kilo",
+                self.cache.as_ref(),
+            ))
+        }
+
+        fn flush_cache(&self) {
+            if let Some(c) = self.cache.as_ref() {
+                c.lock().flush();
+            }
+        }
+
+        fn cache_stats(&self) -> Option<CacheStats> {
+            self.cache.as_ref().map(|c| c.lock().stats())
         }
     }
 }
@@ -1189,6 +1551,84 @@ pub use opencode::OpenCodeSource;
 mod tests {
     use super::*;
     use crate::domain::record::{Record, TokenBreakdown};
+
+    #[test]
+    fn load_messages_all_is_ordered_by_source_name() {
+        // Two Sources whose load is deliberately slow-then-fast in *reverse*
+        // name order: "aaa" sleeps and "zzz" returns immediately. If the
+        // registry concatenated results in completion order, "zzz" would come
+        // first; ordering by name must keep "aaa" first.
+        struct SlowSource {
+            name: &'static str,
+            sleep_ms: u64,
+        }
+        impl Source for SlowSource {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn load(&self) -> Result<Vec<Record>, SourceError> {
+                Ok(Vec::new())
+            }
+            fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
+                std::thread::sleep(std::time::Duration::from_millis(self.sleep_ms));
+                Ok(vec![Message {
+                    source: self.name.to_string(),
+                    session_id: "s".to_string(),
+                    project: String::new(),
+                    model: None,
+                    role: "user".to_string(),
+                    timestamp: None,
+                    text: self.name.to_string(),
+                }])
+            }
+        }
+        let mut reg = Registry::new();
+        reg.register(Box::new(SlowSource {
+            name: "aaa",
+            sleep_ms: 50,
+        }));
+        reg.register(Box::new(SlowSource {
+            name: "zzz",
+            sleep_ms: 0,
+        }));
+
+        let (messages, statuses) = reg.load_messages_all();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aaa", "zzz"],
+            "sources must be concatenated in name order, not completion order"
+        );
+        assert_eq!(statuses[0].name, "aaa");
+        assert_eq!(statuses[1].name, "zzz");
+    }
+
+    #[test]
+    fn a_panicking_source_is_reported_not_aborted() {
+        struct PanicSource;
+        impl Source for PanicSource {
+            fn name(&self) -> &str {
+                "boom"
+            }
+            fn load(&self) -> Result<Vec<Record>, SourceError> {
+                Ok(Vec::new())
+            }
+            fn load_messages(&self) -> Result<Vec<Message>, SourceError> {
+                panic!("synthetic source failure");
+            }
+        }
+        let mut reg = Registry::new();
+        reg.register(Box::new(PanicSource));
+        let (messages, statuses) = reg.load_messages_all();
+        assert!(messages.is_empty());
+        assert_eq!(statuses.len(), 1);
+        assert!(
+            statuses[0].error.is_some(),
+            "a panicking source must surface as an error status"
+        );
+    }
 
     #[test]
     fn registry_absent_source_returns_ok_empty() {
@@ -1251,6 +1691,41 @@ mod tests {
         );
         assert_eq!(ClaudeSource::decode_project_name("-single"), "/single");
         assert_eq!(ClaudeSource::decode_project_name("no-prefix"), "no/prefix");
+    }
+
+    #[test]
+    fn claude_cache_reuses_messages_on_second_load() {
+        use super::cache_handle;
+        use super::claude::ClaudeSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("-home-hunter-projects-cache");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("session-a.jsonl"),
+            r#"{"type":"user","timestamp":"2026-08-28T12:00:00.000Z","message":{"role":"user","content":"cached message"}}"#,
+        )
+        .unwrap();
+
+        let cache_dir = tmp.path().join("cache");
+        let cache = cache_handle(&cache_dir, "claude");
+        let src = ClaudeSource::with_cache(tmp.path().to_path_buf(), cache);
+        let first = src.load_messages().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].text, "cached message");
+        src.flush_cache();
+
+        // A second run is a fresh handle over the persisted index.
+        let warm = cache_handle(&cache_dir, "claude");
+        let src2 = ClaudeSource::with_cache(tmp.path().to_path_buf(), warm.clone());
+        assert_eq!(src2.load_messages().unwrap(), first);
+
+        let stats = warm.lock().stats();
+        assert!(stats.is_observed());
+        assert_eq!(stats.files_seen, 1);
+        assert_eq!(stats.files_reused, 1);
+        assert_eq!(stats.files_extracted, 0);
+        assert_eq!(stats.messages_reused, 1);
+        assert_eq!(stats.messages_extracted, 0);
     }
 
     #[test]
@@ -1649,6 +2124,44 @@ mod tests {
         assert_eq!(messages[3].model, None);
     }
 
+    #[test]
+    fn omp_cache_reuses_messages_on_second_load() {
+        use super::cache_handle;
+        use super::omp::OmpSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let proj = root.join("-projects-omp-cache");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("2026-08-28T12-00-00-000Z_01aaa.jsonl"),
+            r#"{"type":"session","id":"01aaa","timestamp":"2026-08-28T12:00:00.000Z","cwd":"/home/hunter/projects/omp-cache"}
+{"type":"message","id":"m0","timestamp":"2026-08-28T12:00:10.000Z","message":{"role":"user","model":"auto","content":[{"type":"text","text":"cached question"}]}}
+{"type":"message","id":"m1","timestamp":"2026-08-28T12:00:20.000Z","message":{"role":"assistant","model":"auto","content":[{"type":"text","text":"cached answer"}]}}
+"#,
+        )
+        .unwrap();
+
+        let cache_dir = tmp.path().join("cache");
+        let cache = cache_handle(&cache_dir, "omp");
+        let src = OmpSource::with_cache(root.clone(), cache);
+        let first = src.load_messages().unwrap();
+        assert_eq!(first.len(), 2);
+        src.flush_cache();
+
+        // A second run is a fresh handle over the persisted index.
+        let warm = cache_handle(&cache_dir, "omp");
+        let src2 = OmpSource::with_cache(root, warm.clone());
+        assert_eq!(src2.load_messages().unwrap(), first);
+
+        let stats = warm.lock().stats();
+        assert!(stats.is_observed());
+        assert_eq!(stats.files_seen, 1);
+        assert_eq!(stats.files_reused, 1);
+        assert_eq!(stats.files_extracted, 0);
+        assert_eq!(stats.messages_reused, 2);
+        assert_eq!(stats.messages_extracted, 0);
+    }
+
     /// Open a temp SQLite file with the shared OpenCode/Kilo Code schema.
     fn open_sqlite_text_db(path: &Path) -> rusqlite::Connection {
         let conn = rusqlite::Connection::open(path).unwrap();
@@ -1740,6 +2253,89 @@ mod tests {
         assert!(messages.iter().all(|m| m.model.as_deref() == Some("auto")));
         assert!(messages.iter().all(|m| m.timestamp.is_some()));
         assert!(!messages.iter().any(|m| m.text.contains("HIDDEN")));
+    }
+
+    fn insert_sqlite_session_and_parts(conn: &rusqlite::Connection) {
+        conn.execute(
+            "INSERT INTO session (id, project_id, directory, model, time_created, time_updated)
+             VALUES ('ses_x', 'p', '/home/hunter/repos/cache', ?1, 1700000000000, 1700000000100)",
+            rusqlite::params![r#"{"id":"auto","providerID":"freellm"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES ('m1', 'ses_x', 1700000000010, 1700000000010, '{\"role\":\"user\"}'),
+                    ('m2', 'ses_x', 1700000000020, 1700000000020, '{\"role\":\"assistant\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO part VALUES ('p1','m1','ses_x',1700000000011,1700000000011,'{\"type\":\"text\",\"text\":\"cached question\"}');
+             INSERT INTO part VALUES ('p2','m2','ses_x',1700000000021,1700000000021,'{\"type\":\"text\",\"text\":\"cached reply\"}')",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn kilo_cache_reuses_messages_on_second_load() {
+        use super::cache_handle;
+        use super::kilo::KiloSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("kilo.db");
+        let conn = open_sqlite_text_db(&db);
+        insert_sqlite_session_and_parts(&conn);
+        drop(conn);
+
+        let cache_dir = tmp.path().join("cache");
+        let cache = cache_handle(&cache_dir, "kilo");
+        let src = KiloSource::with_cache(vec![db.clone()], cache);
+        let first = src.load_messages().unwrap();
+        assert_eq!(first.len(), 2);
+        src.flush_cache();
+
+        // A second run is a fresh handle over the persisted index.
+        let warm = cache_handle(&cache_dir, "kilo");
+        let src2 = KiloSource::with_cache(vec![db], warm.clone());
+        assert_eq!(src2.load_messages().unwrap(), first);
+
+        let stats = warm.lock().stats();
+        assert!(stats.is_observed());
+        assert_eq!(stats.files_seen, 1);
+        assert_eq!(stats.files_reused, 1);
+        assert_eq!(stats.files_extracted, 0);
+        assert_eq!(stats.messages_reused, 2);
+        assert_eq!(stats.messages_extracted, 0);
+    }
+
+    #[test]
+    fn opencode_cache_reuses_messages_on_second_load() {
+        use super::cache_handle;
+        use super::opencode::OpenCodeSource;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        let conn = open_sqlite_text_db(&db);
+        insert_sqlite_session_and_parts(&conn);
+        drop(conn);
+
+        let cache_dir = tmp.path().join("cache");
+        let cache = cache_handle(&cache_dir, "opencode");
+        let src = OpenCodeSource::with_cache(vec![db.clone()], cache);
+        let first = src.load_messages().unwrap();
+        assert_eq!(first.len(), 2);
+        src.flush_cache();
+
+        // A second run is a fresh handle over the persisted index.
+        let warm = cache_handle(&cache_dir, "opencode");
+        let src2 = OpenCodeSource::with_cache(vec![db], warm.clone());
+        assert_eq!(src2.load_messages().unwrap(), first);
+
+        let stats = warm.lock().stats();
+        assert!(stats.is_observed());
+        assert_eq!(stats.files_seen, 1);
+        assert_eq!(stats.files_reused, 1);
+        assert_eq!(stats.files_extracted, 0);
+        assert_eq!(stats.messages_reused, 2);
+        assert_eq!(stats.messages_extracted, 0);
     }
 
     #[test]

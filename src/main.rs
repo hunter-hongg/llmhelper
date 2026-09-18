@@ -9,7 +9,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use llmhelper::cli::{
-    merge_source_paths, parse_duration, BudgetArgs, Cli, Command, CompareArgs, DiffArgs,
+    merge_source_paths, parse_duration, BudgetArgs, CacheArgs, Cli, Command, CompareArgs, DiffArgs,
     ExplainArgs, ExportArgs, FilterArgs, ReportArgs, RequestArgs, SearchArgs, SessionsArgs,
     TrendArgs, UsageArgs, WatchArgs, WindowArgs,
 };
@@ -84,14 +84,51 @@ fn load_usage_data(
     }
 }
 
-fn discover_sources(config: &Config) -> Registry {
+/// How (and whether) to attach a message cache when discovering Sources.
+///
+/// Record-reading commands pass [`CacheSetup::Off`] so `usage`/`trend`/`compare`
+/// keep loading from disk exactly as before — the cache is a *message*-reading
+/// accelerator and nothing else. The message-reading commands pass their
+/// resolved [`CacheConfig`].
+#[derive(Clone, Debug)]
+enum CacheSetup {
+    Off,
+    On(llmhelper::config::ResolvedCache),
+}
+
+impl CacheSetup {
+    /// Open a Source's cache handle, or `None` when caching is off/disabled.
+    fn handle(&self, name: &str) -> Option<llmhelper::source::SharedMessageCache> {
+        match self {
+            CacheSetup::Off => None,
+            CacheSetup::On(resolved) => resolved.handle_for(name),
+        }
+    }
+}
+
+/// Resolve a message-reading command's cache settings from its own flags.
+///
+/// One helper so `search`'s two paths and `export --messages` cannot resolve
+/// `--no-cache`/`--refresh-cache`/`--cache-dir` differently.
+fn message_cache(config: &Config, args: &impl CacheArgs) -> CacheSetup {
+    CacheSetup::On(config.resolve_cache(
+        args.no_cache(),
+        args.refresh_cache(),
+        args.cache_dir().map(|dir| dir.as_path()),
+    ))
+}
+
+fn discover_sources(config: &Config, cache: &CacheSetup) -> Registry {
     let mut reg = Registry::new();
     let claude_dir = config.claude_dir.clone().unwrap_or_else(|| {
         dirs::home_dir()
             .map(|h| h.join(".claude").join("projects"))
             .unwrap_or_default()
     });
-    reg.register(Box::new(ClaudeSource::new(claude_dir)));
+    reg.register(Box::new(match cache.handle("claude") {
+        Some(c) => ClaudeSource::with_cache(claude_dir, c),
+        None => ClaudeSource::new(claude_dir),
+    }));
     let opencode_dbs: Vec<PathBuf> = if let Some(ref overrides) = config.opencode_dbs {
         overrides.clone()
     } else {
@@ -103,20 +140,29 @@ fn discover_sources(config: &Config) -> Registry {
             .map(|n| base.join(n))
             .collect()
     };
-    reg.register(Box::new(OpenCodeSource::new(opencode_dbs)));
+    reg.register(Box::new(match cache.handle("opencode") {
+        Some(c) => OpenCodeSource::with_cache(opencode_dbs, c),
+        None => OpenCodeSource::new(opencode_dbs),
+    }));
     let omp_dir = config.omp_dir.clone().unwrap_or_else(|| {
         dirs::home_dir()
             .map(|h| h.join(".omp").join("agent").join("sessions"))
             .unwrap_or_default()
     });
-    reg.register(Box::new(OmpSource::new(omp_dir)));
+    reg.register(Box::new(match cache.handle("omp") {
+        Some(c) => OmpSource::with_cache(omp_dir, c),
+        None => OmpSource::new(omp_dir),
+    }));
     let kilo_db = config.kilo_dbs.clone().unwrap_or_else(|| {
         vec![dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("kilo")
             .join("kilo.db")]
     });
-    reg.register(Box::new(KiloSource::new(kilo_db)));
+    reg.register(Box::new(match cache.handle("kilo") {
+        Some(c) => KiloSource::with_cache(kilo_db, c),
+        None => KiloSource::new(kilo_db),
+    }));
     reg
 }
 
@@ -551,7 +597,7 @@ fn run_sessions(args: SessionsArgs, config_path: &Option<PathBuf>) -> anyhow::Re
         run_sessions_non_tui(&args, config_path)
     } else {
         let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
-        let registry = discover_sources(&config);
+        let registry = discover_sources(&config, &CacheSetup::Off);
         let filter = build_filter(&args)?;
         run_sessions_tui(registry, filter, config.refresh_interval_seconds)
     }
@@ -559,7 +605,7 @@ fn run_sessions(args: SessionsArgs, config_path: &Option<PathBuf>) -> anyhow::Re
 
 fn run_sessions_non_tui(args: &SessionsArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), args);
-    let registry = discover_sources(&config);
+    let registry = discover_sources(&config, &CacheSetup::Off);
     let filter = build_filter(args)?;
     let (records, source_statuses) = registry.load_all();
     for status in &source_statuses {
@@ -726,7 +772,14 @@ fn run_sessions_non_tui(args: &SessionsArgs, config_path: &Option<PathBuf>) -> a
 fn run_export(args: ExportArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
-    let registry = discover_sources(&config);
+    // The cache is a message-reading accelerator, so the record path must not
+    // pay for it: `--messages` is the only branch that reads the corpus.
+    let cache = if args.messages {
+        message_cache(&config, &args)
+    } else {
+        CacheSetup::Off
+    };
+    let registry = discover_sources(&config, &cache);
     let filter = build_filter(&args)?;
 
     if args.messages {
@@ -775,6 +828,7 @@ fn run_export_messages(
         fields,
     };
     let (messages, statuses) = registry.load_messages_all();
+    registry.flush_caches();
     for status in &statuses {
         if let Some(err) = &status.error {
             eprintln!("warn: source {} error: {}", status.name, err);
@@ -863,9 +917,14 @@ fn load_search_data(
     registry: &Registry,
     filter: &Filter,
     options: &SearchOptions,
-) -> (Vec<SearchHit>, Vec<MessageStatus>) {
+) -> (
+    Vec<SearchHit>,
+    Vec<MessageStatus>,
+    Option<llmhelper::cache::CacheStats>,
+) {
     let (hits, statuses, _) = load_search_data_counted(registry, filter, options);
-    (hits, statuses)
+    let stats = registry.cache_stats().filter(|s| s.is_observed());
+    (hits, statuses, stats)
 }
 
 /// As [`load_search_data`], but also reports the pre-filter message count so the
@@ -881,6 +940,11 @@ fn load_search_data_counted(
     options: &SearchOptions,
 ) -> (Vec<SearchHit>, Vec<MessageStatus>, SearchCounts) {
     let (messages, statuses) = registry.load_messages_all();
+    // Flush here rather than at each call site: this is the single choke point
+    // both `search` modes (and every TUI refresh) pass through, so the index is
+    // written exactly when the messages were read and skipped when nothing new
+    // was extracted.
+    registry.flush_caches();
     let loaded = messages.len();
     let scoped: Vec<Message> = messages
         .iter()
@@ -992,7 +1056,8 @@ fn run_search(args: SearchArgs, config_path: &Option<PathBuf>) -> anyhow::Result
         return run_search_non_tui(&args, &options, config_path);
     }
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
-    let registry = discover_sources(&config);
+    let cache = message_cache(&config, &args);
+    let registry = discover_sources(&config, &cache);
     let filter = build_filter(&args)?;
     let filter_summary = search_filter_summary(&args);
     run_search_tui(registry, filter, options, filter_summary)
@@ -1004,7 +1069,8 @@ fn run_search_non_tui(
     config_path: &Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), args);
-    let registry = discover_sources(&config);
+    let cache = message_cache(&config, args);
+    let registry = discover_sources(&config, &cache);
     let filter = build_filter(args)?;
     let (hits, statuses, counts) = load_search_data_counted(&registry, &filter, options);
     for status in &statuses {
@@ -1028,8 +1094,19 @@ fn run_search_non_tui(
             );
         }
     }
+    // The cache line is `--explain`'s, and `--explain`'s alone. The 0020
+    // asymmetry puts structured figures in the JSON payload and prose on stderr,
+    // so in JSON mode the payload below is the whole story — printing here too
+    // would say it twice. An empty result auto-explains its filters, but cache
+    // provenance is not what that is answering, so it stays opt-in.
+    let cache_stats = registry.cache_stats().filter(|s| s.is_observed());
+    if args.explain() && !args.json {
+        if let Some(stats) = &cache_stats {
+            eprintln!("{}", stats.explain_line());
+        }
+    }
     if args.json {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "query": options.query,
             "case_sensitive": options.case_sensitive,
             "role": options.role,
@@ -1038,6 +1115,22 @@ fn run_search_non_tui(
             "hits": hits,
             "sources": message_sources_json(&statuses),
         });
+        // Gated on `--explain` like the diagnostics funnel (0020): the key is
+        // *added*, not set to null, because a `"cache": null` in normal `--json`
+        // would break the byte-identity between cached and uncached runs — the
+        // contract this whole change rests on.
+        if args.explain() {
+            if let Some(s) = &cache_stats {
+                payload["cache"] = serde_json::json!({
+                    "sources": s.sources,
+                    "files_seen": s.files_seen,
+                    "files_reused": s.files_reused,
+                    "files_extracted": s.files_extracted,
+                    "messages_reused": s.messages_reused,
+                    "messages_extracted": s.messages_extracted,
+                });
+            }
+        }
         let mut buf = Vec::new();
         serde_json::to_writer_pretty(&mut buf, &payload)?;
         println!("{}", String::from_utf8(buf)?);
@@ -1092,10 +1185,11 @@ fn run_search_tui(
     filter_summary: String,
 ) -> anyhow::Result<()> {
     let load = |registry: &Registry| -> llmhelper::tui::search_app::SearchData {
-        let (hits, message_statuses) = load_search_data(registry, &filter, &options);
+        let (hits, message_statuses, cache_stats) = load_search_data(registry, &filter, &options);
         llmhelper::tui::search_app::SearchData {
             hits,
             message_statuses,
+            cache_stats,
         }
     };
     let mut tui = llmhelper::tui::search_app::SearchTuiApp::new(
@@ -1153,7 +1247,7 @@ fn run_usage(args: UsageArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
     args.validate()?;
     let group_by: GroupBy = args.group_by.clone().into();
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
-    let registry = discover_sources(&config);
+    let registry = discover_sources(&config, &CacheSetup::Off);
 
     // The window is derived, not baked into the filter: `--calendar` re-anchors
     // the bucket to local midnight on every load (the TUI path), and the
@@ -1246,7 +1340,7 @@ fn run_watch(args: WatchArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
 
     let group_by: GroupBy = args.group_by.clone().into();
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
-    let registry = discover_sources(&config);
+    let registry = discover_sources(&config, &CacheSetup::Off);
     let base = base_filter(&args);
     let mode = args.window_mode()?;
     let budgets = args.resolve_budgets(&config.budgets)?;
@@ -1301,7 +1395,7 @@ fn run_trend(args: TrendArgs, config_path: &Option<PathBuf>) -> anyhow::Result<(
     let last_days = (last.as_secs().div_ceil(86_400)).max(1) as u32;
 
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
-    let registry = discover_sources(&config);
+    let registry = discover_sources(&config, &CacheSetup::Off);
 
     let now = Utc::now();
     // The bucket sequence is derived **first**, because its own bounds — not a
@@ -1374,7 +1468,7 @@ fn run_compare(args: CompareArgs, config_path: &Option<PathBuf>) -> anyhow::Resu
     // Resolve and validate budgets before loading, so a bad --budget fails with
     // the same message `usage` gives and never triggers a disk scan (spec 0015).
     let budgets = args.resolve_budgets(&config.budgets)?;
-    let registry = discover_sources(&config);
+    let registry = discover_sources(&config, &CacheSetup::Off);
     let base = base_filter(&args);
     let mode = args.window_mode()?;
     let now = Utc::now();
@@ -1545,7 +1639,7 @@ fn run_diff(args: DiffArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()>
 
     // Load sources once (they don't change between windows)
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
-    let registry = discover_sources(&config);
+    let registry = discover_sources(&config, &CacheSetup::Off);
 
     let (records, source_statuses) = registry.load_all();
 
@@ -1641,7 +1735,7 @@ fn run_report(args: ReportArgs, config_path: &Option<PathBuf>) -> anyhow::Result
     args.validate()?;
     let group_by: GroupBy = args.group_by.clone().into();
     let config = merge_source_paths(Config::load_with(config_path.as_deref()), &args);
-    let registry = discover_sources(&config);
+    let registry = discover_sources(&config, &CacheSetup::Off);
     let base = base_filter(&args);
     let mode = args.window_mode()?;
 

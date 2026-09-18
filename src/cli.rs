@@ -48,6 +48,26 @@ pub trait ExplainArgs {
     fn explain(&self) -> bool;
 }
 
+/// The cache-control flags shared by every command that reads *messages*.
+///
+/// Record-reading commands do not implement this: the cache accelerates message
+/// extraction only, so `usage`/`trend`/`compare`/`diff`/`watch`/`report` never
+/// offer a flag that would do nothing. The trait exists so the two readers that
+/// do implement it — `search` and `export` (which reads messages only under
+/// `--messages`) — resolve the same three flags through the same [`Config`]
+/// method.
+///
+/// [`Config`]: crate::config::Config
+pub trait CacheArgs {
+    /// `--no-cache`: extract every message from disk and write nothing.
+    fn no_cache(&self) -> bool;
+    /// `--refresh-cache`: ignore each Source's stored index and rebuild it.
+    fn refresh_cache(&self) -> bool;
+    /// `--cache-dir`: where to keep the message-extraction indices, overriding
+    /// the config key and the platform default.
+    fn cache_dir(&self) -> Option<&std::path::PathBuf>;
+}
+
 /// The four source-path override flags shared by every command that reads data.
 ///
 /// Implementing this trait lets `main.rs` merge CLI overrides onto a loaded
@@ -1366,6 +1386,19 @@ pub struct SearchArgs {
     /// Output a plain hit list instead of the interactive TUI.
     #[arg(long = "text")]
     pub text: bool,
+
+    /// Do not read or write the message cache: extract every message from disk.
+    #[arg(long = "no-cache", conflicts_with = "refresh_cache")]
+    pub no_cache: bool,
+
+    /// Ignore each Source's stored cache index and rebuild it.
+    #[arg(long = "refresh-cache")]
+    pub refresh_cache: bool,
+
+    /// Keep the message-cache indices here, overriding `cache.dir` and the
+    /// platform default.
+    #[arg(long = "cache-dir", value_name = "DIR")]
+    pub cache_dir: Option<std::path::PathBuf>,
 }
 
 impl SearchArgs {
@@ -1416,6 +1449,18 @@ impl FilterArgs for SearchArgs {
 impl ExplainArgs for SearchArgs {
     fn explain(&self) -> bool {
         self.explain
+    }
+}
+
+impl CacheArgs for SearchArgs {
+    fn no_cache(&self) -> bool {
+        self.no_cache
+    }
+    fn refresh_cache(&self) -> bool {
+        self.refresh_cache
+    }
+    fn cache_dir(&self) -> Option<&std::path::PathBuf> {
+        self.cache_dir.as_ref()
     }
 }
 
@@ -1527,6 +1572,32 @@ pub struct ExportArgs {
     /// Requires --messages.
     #[arg(long = "role")]
     pub role: Option<String>,
+
+    /// Do not read or write the message cache: extract every message from disk.
+    /// Only meaningful with `--messages`; accepted (and inert) without it.
+    #[arg(long = "no-cache", conflicts_with = "refresh_cache")]
+    pub no_cache: bool,
+
+    /// Ignore each Source's stored cache index and rebuild it.
+    #[arg(long = "refresh-cache")]
+    pub refresh_cache: bool,
+
+    /// Keep the message-cache indices here, overriding `cache.dir` and the
+    /// platform default.
+    #[arg(long = "cache-dir", value_name = "DIR")]
+    pub cache_dir: Option<std::path::PathBuf>,
+}
+
+impl CacheArgs for ExportArgs {
+    fn no_cache(&self) -> bool {
+        self.no_cache
+    }
+    fn refresh_cache(&self) -> bool {
+        self.refresh_cache
+    }
+    fn cache_dir(&self) -> Option<&std::path::PathBuf> {
+        self.cache_dir.as_ref()
+    }
 }
 
 impl ExportArgs {

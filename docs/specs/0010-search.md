@@ -67,7 +67,7 @@ Search is implemented as a pure, independently testable function over an in-memo
 - **Semantic or embedding-based search.** No vector store, no model calls.
 - **Tool output and code diff search.** `toolResult`, `tool_use`, `patch`, and `image` parts are excluded from the corpus.
 - **Cross-session ranking or relevance scoring** beyond match count and recency.
-- **Incremental indexing.** The corpus is scanned on each run; caching is a future concern.
+- **Incremental indexing.** The corpus is scanned on each run; caching is a future concern. (Now built: see spec 0025.)
 - **Editing, deleting, or annotating messages.** This command is read-only, like the other four.
 
 ## Further Notes

@@ -48,6 +48,10 @@ _Avoid_: percentage, ratio, proportion
 The `Over`/`Under`/`NotMeasured` verdict a `Budget` puts on a ranked row in `compare`, matched through the row's group Source. It is an *annotation*, never a predicate: it changes no order, no share, and no exit code, and it is `None` for a `mixed`-source group — a Budget is Source-scoped, so a group spanning Sources has no single spend to be judged against. When no Budget exists for a row's Source the annotation is absent, not `Under`; an unmarked row therefore means "not over", while `NotMeasured` (no Cost recorded) is reported explicitly rather than rendered as `ok`.
 _Avoid_: status, flag, alert
 
+**Message Cache**:
+The per-file memoization of Message extraction behind `load_messages` (`search` and `export --messages`), keyed by a file's (canonical path, size, mtime-ns, inode). It is a pure accelerator: a cached run and an uncached run produce **byte-identical non-interactive output**; search cache statistics surface under `--explain` (a `cache` object in JSON, one line on stderr otherwise) and in the interactive search header, never in normal `--json`. It is fail-open (any anomaly re-extracts that file), Source-scoped (one NDJSON index per source), and covers only the message corpus — record-level commands never consult it.
+_Avoid_: index, store, snapshot, memo
+
 
 
 

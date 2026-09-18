@@ -298,6 +298,31 @@ Without `--json`/`--csv`/`--text`, `search` opens an interactive TUI: select a h
 
 Flags: `--source`, `--project`, `--model`, `--role`, `--since`/`--last`, `--context` (snippet context, default 80), `--limit` (default 100), `--case-sensitive`, `--json`/`--csv`/`--text`, `--explain`. Messages without a timestamp never match a time filter. Tool output and image/patch blocks are excluded from the searchable corpus.
 
+#### Message cache
+
+`search` (and `export --messages` — they share the corpus) memoizes message
+extraction **per source file**: unchanged files are served from an index under
+the platform cache directory instead of being re-parsed on every run. This is a
+pure accelerator — a cached run and a `--no-cache` run produce byte-identical
+non-interactive output. Search cache statistics appear under `--explain`: a
+`cache` object in JSON, one line on stderr otherwise. The interactive search
+TUI additionally shows reuse counts in its header without `--explain`.
+
+```bash
+llmhelper search --explain "query"        # show how much was reused
+llmhelper search --json --explain "query" # …as a `cache` object in the payload
+llmhelper search --no-cache "query"       # force a full re-extraction
+llmhelper search --refresh-cache "query"  # discard the index, rebuild it
+```
+
+- The index lives at `~/.cache/llmhelper/` by default; `[cache] dir` in
+  `config.toml` relocates it, `[cache] enabled = false` disables it.
+- A file is re-extracted when its size, mtime, or inode changes; an appending
+  transcript is therefore picked up on the next run. A corrupted index
+  self-heals by re-extracting the affected files.
+- `--refresh-cache` forces a rebuild; the two flags are mutually exclusive.
+  `export --no-cache`/`--refresh-cache` only apply to `--messages`.
+
 ### export
 Flat, machine-oriented dump of the filtered Session records — one row per
 Session, no aggregation. The program-facing counterpart to `report`.
@@ -354,7 +379,7 @@ As with session export, a zero-match filter exits 0 (`[]` for JSON, a header
 row for CSV/TSV, nothing for JSONL), and Source errors warn on stderr without
 aborting.
 
-Flags: `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db`, `--since`/`--last`, `--project`, `--model`, `--source`, `--format jsonl|json|csv|tsv`, `--fields`, `--messages`, `--role`.
+Flags: `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db`, `--since`/`--last`, `--project`, `--model`, `--source`, `--format jsonl|json|csv|tsv`, `--fields`, `--messages`, `--role`, `--no-cache`, `--refresh-cache` (the latter two for `--messages`).
 
 ## Sources
 

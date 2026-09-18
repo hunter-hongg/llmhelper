@@ -1,5 +1,9 @@
 # Agent Changelog
 
+## 2026-09-15
+
+- 消息缓存 (`spec 0025`)：`search` 与 `export --messages` 现以文件级指纹（规范路径、大小、纳秒 mtime、inode）增量复用消息抽取。冷/热两次运行产生**逐字节相同**的非交互输出；search 统计在 `--explain` 显示（JSON 为 `cache` 对象，其余模式一行 stderr），交互式 search 头部恒显复用计数（0025 授权的例外），普通 `--json` 永不含 `cache` 键。缓存自愈、不可写静默降级、配置项 `[cache] dir`/`enabled`、`--no-cache`/`--refresh-cache`/`--cache-dir` 全备。并行加载四个 Source（scoped thread + join in registry order）。新增 ADR 0005 记录指纹契约、fail-open、并行例外。文档统一：CONTEXT.md、README.md、spec 0025 与 0010 的措辞均改为透明性契约。补齐四个 adapter 的 cache 测试（冷/热双 handle 验证跨进程复用）。
+
 ## 2026-08-30
 
 

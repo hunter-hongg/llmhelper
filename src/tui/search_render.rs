@@ -47,7 +47,13 @@ pub fn render(frame: &mut Frame, state: &mut SearchTuiState) {
     frame.render_widget(render_footer(state), chunks[3]);
 }
 
-fn render_header(state: &SearchTuiState) -> Paragraph<'_> {
+fn render_header(state: &SearchTuiState) -> Paragraph<'static> {
+    Paragraph::new(header_lines(state)).block(panel("llmhelper"))
+}
+
+/// The header's rows as plain lines — the pure part of [`render_header`], so
+/// the cache segment's placement can be unit-tested without a terminal.
+fn header_lines(state: &SearchTuiState) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![
         Span::styled(
             "llmhelper",
@@ -77,6 +83,16 @@ fn render_header(state: &SearchTuiState) -> Paragraph<'_> {
     if !state.filters.is_empty() {
         query_spans.push(Span::styled(
             format!("  {}", state.filters),
+            Style::default().fg(MUTED),
+        ));
+    }
+    // The cache segment rides the filter line rather than taking one of its own:
+    // it describes how the corpus was *loaded*, and a human glances at it rather
+    // than reading it, so it is not worth a hit-row of screen space. Absent when
+    // the run had no cache at all (`--no-cache`, or a non-message command).
+    if let Some(stats) = state.cache_stats.as_ref().filter(|s| s.is_observed()) {
+        query_spans.push(Span::styled(
+            format!("  · {}", stats.header_line()),
             Style::default().fg(MUTED),
         ));
     }
@@ -110,7 +126,7 @@ fn render_header(state: &SearchTuiState) -> Paragraph<'_> {
             ]));
         }
     }
-    Paragraph::new(lines).block(panel("llmhelper"))
+    lines
 }
 
 fn render_sources(statuses: &[MessageStatus]) -> Paragraph<'_> {
@@ -300,4 +316,66 @@ fn render_table(state: &mut SearchTuiState) -> Table<'static> {
         .header(header_row)
         .block(block)
         .style(Style::default().bg(BG))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::CacheStats;
+    use crate::tui::search_app::SearchData;
+
+    fn state_with(cache_stats: Option<CacheStats>) -> SearchTuiState {
+        SearchTuiState::new(
+            "hello".to_string(),
+            false,
+            None,
+            "project:foo".to_string(),
+            SearchData {
+                hits: Vec::new(),
+                message_statuses: Vec::new(),
+                cache_stats,
+            },
+        )
+    }
+
+    fn header_text(state: &SearchTuiState) -> String {
+        header_lines(state)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The cache segment rides the existing filter line — one line, not two —
+    /// so the header does not cost a hit-row of screen space.
+    #[test]
+    fn cache_segment_shares_the_filter_line() {
+        let state = state_with(Some(CacheStats {
+            sources: 4,
+            files_seen: 20,
+            files_reused: 19,
+            files_extracted: 1,
+            messages_reused: 15113,
+            messages_extracted: 0,
+        }));
+        let line = header_text(&state);
+        assert!(line.contains("project:foo"), "filters still shown: {line}");
+        assert!(
+            line.contains("cache: 15113 reused, 0 re-read"),
+            "the cache segment must be on the same line as the filters: {line}"
+        );
+    }
+
+    /// With no cache at all (`--no-cache`, or an unobserved empty load) the
+    /// segment is absent rather than printed as zeroes.
+    #[test]
+    fn no_cache_segment_when_there_is_no_cache() {
+        assert!(!header_text(&state_with(None)).contains("cache:"));
+        assert!(!header_text(&state_with(Some(CacheStats::default()))).contains("cache:"));
+    }
 }
