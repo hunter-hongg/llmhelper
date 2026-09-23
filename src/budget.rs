@@ -16,7 +16,7 @@ use crate::domain::record::Record;
 
 /// The known Source names a budget may target. Kept in sync with the Source
 /// registry; an unknown name is a configuration error, not a silent no-op.
-pub const KNOWN_SOURCES: [&str; 4] = ["claude", "opencode", "omp", "kilo"];
+pub const KNOWN_SOURCES: [&str; 5] = ["claude", "opencode", "omp", "kilo", "llmhelper"];
 
 /// The time span a budget is measured over.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,6 +258,26 @@ pub fn measurement(
         lower_bound: effective_lower(w, command_since),
         clipped_by,
     }
+}
+
+/// Evaluate `budgets` against `records` and return only the budgets whose
+/// state is [`BudgetState::Over`], in the order the budgets were given.
+///
+/// This is the pre-flight gate for `request`: it decides whether a spend is
+/// already over a ceiling, and unlike [`evaluate`] it throws away the
+/// non-offenders so a caller can name the exact budgets that blocked a
+/// request. Pure in its inputs, including `now` and `command_since` — it reads
+/// no clock and touches no Source.
+pub fn over_budget(
+    budgets: &[Budget],
+    records: &[Record],
+    now: DateTime<Utc>,
+    command_since: Option<DateTime<Utc>>,
+) -> Vec<BudgetStatus> {
+    evaluate(budgets, records, now, command_since)
+        .into_iter()
+        .filter(|s| s.state == BudgetState::Over)
+        .collect()
 }
 
 /// Validate a budget's fields. Called after config load and after CLI parsing
@@ -543,5 +563,49 @@ mod tests {
         for s in KNOWN_SOURCES {
             assert!(validate(&budget(s, "1d", 1.0)).is_ok(), "{}", s);
         }
+    }
+
+    #[test]
+    fn over_budget_returns_only_the_overs_in_input_order() {
+        let now = at("2026-09-13T12:00:00Z");
+        let records = vec![
+            rec("opencode", at("2026-09-13T01:00:00Z"), Some(6.0)),
+            rec("omp", at("2026-09-13T01:00:00Z"), Some(1.0)),
+            rec("kilo", at("2026-09-13T01:00:00Z"), Some(7.0)),
+        ];
+        let budgets = vec![
+            budget("opencode", "1d", 5.0), // over
+            budget("omp", "1d", 5.0),      // under
+            budget("kilo", "1d", 5.0),     // over
+        ];
+        let out = over_budget(&budgets, &records, now, None);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].budget.source, "opencode");
+        assert_eq!(out[1].budget.source, "kilo");
+        assert!(out.iter().all(|s| s.state == BudgetState::Over));
+    }
+
+    #[test]
+    fn over_budget_is_empty_when_nothing_is_over() {
+        let now = at("2026-09-13T12:00:00Z");
+        let records = vec![
+            rec("opencode", at("2026-09-13T01:00:00Z"), Some(1.0)),
+            rec("claude", at("2026-09-13T01:00:00Z"), None), // not measured
+        ];
+        let budgets = vec![
+            budget("opencode", "1d", 5.0), // under
+            budget("claude", "1d", 5.0),   // not measured
+        ];
+        assert!(over_budget(&budgets, &records, now, None).is_empty());
+    }
+
+    #[test]
+    fn over_budget_respects_the_command_window_clip() {
+        let now = at("2026-09-13T12:00:00Z");
+        // 30d ago: inside a 30d budget, but outside a --last 7d command.
+        let records = vec![rec("opencode", at("2026-08-20T01:00:00Z"), Some(100.0))];
+        let command_since = Some(now - Duration::days(7));
+        let budgets = vec![budget("opencode", "30d", 5.0)];
+        assert!(over_budget(&budgets, &records, now, command_since).is_empty());
     }
 }

@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
@@ -16,6 +17,9 @@ pub enum RequestError {
     Client(String),
     /// Request-level failure: non-2xx HTTP status, response JSON parse error.
     Request(String),
+    /// Pre-flight budget gate refusal: a named budget is already over its
+    /// ceiling, so no request is sent at all.
+    Budget(String),
 }
 
 impl std::fmt::Display for RequestError {
@@ -23,6 +27,7 @@ impl std::fmt::Display for RequestError {
         match self {
             Self::Client(msg) => write!(f, "client error: {msg}"),
             Self::Request(msg) => write!(f, "request error: {msg}"),
+            Self::Budget(msg) => write!(f, "budget gate: {msg}"),
         }
     }
 }
@@ -33,6 +38,7 @@ pub fn request_exit_code(err: &RequestError) -> i32 {
     match err {
         RequestError::Client(_) => 2,
         RequestError::Request(_) => 1,
+        RequestError::Budget(_) => 3,
     }
 }
 
@@ -145,6 +151,11 @@ pub struct RequestSettings {
     pub model: String,
     pub timeout: Duration,
     pub reasoning_fields: Vec<String>,
+    /// Where `--log` writes the per-day request log. Always `Some` after
+    /// `resolve`: config `[request] log_dir` (anchored to the config file's
+    /// directory) or the default `log_dir()`. The write site uses this rather
+    /// than re-deriving the directory, so a run cannot log to two places.
+    pub log_dir: Option<PathBuf>,
 }
 
 impl RequestSettings {
@@ -180,12 +191,14 @@ impl RequestSettings {
         } else {
             args.reasoning_field.clone()
         };
+        let log_dir = resolved_log_dir(config);
         Ok(Self {
             base_url,
             api_key,
             model,
             timeout,
             reasoning_fields,
+            log_dir,
         })
     }
 }
@@ -502,14 +515,23 @@ pub fn log_dir() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|d| d.join("llmhelper").join("logs"))
 }
 
+/// The one log directory both halves of the loop use: `--log` writes here and
+/// the `llmhelper` Source reads from here, so they can never disagree. Config
+/// `[request] log_dir` (already anchored to the config file by `Config::load`)
+/// wins; otherwise the platform default.
+pub fn resolved_log_dir(config: &Config) -> Option<PathBuf> {
+    config.request_log_dir.clone().or_else(log_dir)
+}
+
 /// Append one JSON entry (`timestamp`, `direction`, `body`) to the per-day
-/// request log file. Non-fatal: any I/O failure logs a warning to stderr and
-/// is otherwise ignored. The API key is never included in `body`.
-pub fn write_request_log(direction: &str, body: &str) {
-    let Some(base) = log_dir() else {
+/// request log file under `log_dir`. Non-fatal: any I/O failure logs a warning
+/// to stderr and is otherwise ignored. The API key is never included in
+/// `body`.
+pub fn write_request_log(log_dir: Option<&Path>, direction: &str, body: &str) {
+    let Some(base) = log_dir else {
         return;
     };
-    if let Err(e) = std::fs::create_dir_all(&base) {
+    if let Err(e) = std::fs::create_dir_all(base) {
         eprintln!("warn: cannot create request log dir {:?}: {}", base, e);
         return;
     }
@@ -1037,6 +1059,12 @@ mod tests {
         assert_eq!(
             request_exit_code(&RequestError::Request("HTTP 400".to_string())),
             1
+        );
+        // A budget-gate refusal is its own class: the request never left the
+        // machine, so it must not be confused with a provider error.
+        assert_eq!(
+            request_exit_code(&RequestError::Budget("over ceiling".to_string())),
+            3
         );
     }
 

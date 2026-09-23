@@ -10,6 +10,7 @@ pub mod domain;
 pub mod export;
 pub mod filter;
 pub mod output;
+pub mod price;
 pub mod report;
 pub mod request;
 pub mod search;

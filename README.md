@@ -288,6 +288,44 @@ Both keys are fallbacks: a CLI `--reasoning-field`/`--reasoning` overrides them.
 
 Flags: `--base-url` (required unless in config), `--api-key` (env `LLMHELPER_API_KEY` fallback), `--model` (required), `--messages <path>` (JSON array of `{role, content}`), `--prompt <string>` (single user turn), `--json` prints full response, `--text` prints only assistant message content, `--stream` streams the response as SSE, `--reasoning-field <path>` (repeatable) captures reasoning text from a response field, `--reasoning <file>` passes a reasoning configuration object through to the provider, `--thinking` expands the reasoning view in the TUI, `--temperature`, `--top-p`, `--max-tokens`, `--stop` (repeatable). Configuration via `[request]` section in `~/.config/llmhelper/config.toml`.
 
+#### Budget gate: the cost-control loop
+
+`request` accepts the same budget flags as the reporting commands — `--budget <source>:<amount>` (repeatable), `--budget-window` (default `1d`), `--budget-name <name>` (repeatable) — and acts on them. Before any payload is built and before any provider is contacted, the named budgets are evaluated against the loaded Sources (only those the budgets name are read); if any is `over`, the request is refused:
+
+```bash
+# refuse if OpenCode already spent $5 today
+llmhelper request --budget opencode:5.00 --prompt "hi" --text
+#   error: budget gate: 1 budget is already over its ceiling:
+#     cli:opencode (source opencode, window 1d): measured 12.500000 over ceiling 5.000000
+#   refusing to send the request; no provider was contacted
+
+# gate on my own prior llmhelper requests (see the loop below)
+llmhelper request --budget-name mine --prompt "hi" --text
+```
+
+A refusal exits **3** — distinct from the usage errors (1: bad flags, a provider's non-2xx or unparsable answer) and transport errors (2: connection, DNS, timeout) that `request` already distinguishes — so a script can tell "refused by budget" from "provider failed". The gate is opt-in: with no budget flag given, `request` is byte-for-byte unchanged. Unlike the reporting commands, `--budget-name` with no names adopts **no** configured budgets (a gate must not silently inherit historical budgets); configured budgets gate `request` only when named. The gate evaluates once per invocation — follow-up `--interactive` turns are not re-gated.
+
+The gate can also budget `llmhelper`'s own spending, closing the loop **measure → gate → spend → log → re-measure**:
+
+```toml
+# ~/.config/llmhelper/config.toml
+[request]
+log_dir = "logs"            # where --log writes; default ~/.config/llmhelper/logs
+
+[price.gpt-4]               # per-million-token rates, keyed by the exact model
+input_per_mtoken = 2.50     #   the provider echoes (quote keys containing dots)
+output_per_mtoken = 10.00
+# cache_read_per_mtoken / cache_write_per_mtoken are optional;
+# both default to input_per_mtoken
+
+[budget.mine]
+source = "llmhelper"
+window = "1d"
+max_cost = 1.00
+```
+
+`llmhelper request --log --budget-name mine ...` records each turn's tokens to the per-day log; the `llmhelper` Source reads that log back, prices each turn with `[price.<model>]`, and the next invocation's gate refuses on the accumulated spend. `--log` is what feeds the loop: a budget naming `llmhelper` while `--log` is off prints a stderr warning (the gate cannot see unlogged requests) and proceeds. A model with no `[price]` entry reports no cost, and a budget on it is `not measured` — absent pricing is not free. Malformed or truncated log lines are skipped with a per-file warning, never fatal.
+
 ### search
 Full-text search across agent session message text.
 ```bash
@@ -387,22 +425,30 @@ Flags: `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db`, `--since`/`--l
 - opencode – SQLite
 - omp – `~/.omp/agent/sessions`
 - kilo – SQLite `kilo.db` under `~/.local/share/kilo`
+- llmhelper – the per-day request logs written by `request --log`, read back as
+  usage: one record per logged response carrying a `usage` block, priced by the
+  `[price.<model>]` config table (see [Budget gate](#budget-gate-the-cost-control-loop))
 
-Auto-discovered at defaults; override with `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db` or config file.
+Auto-discovered at defaults; override with `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db` or config file. The `llmhelper` Source appears only once its log directory exists — a user who never ran `request --log` sees no phantom row.
 
 ## Budgets
 
 A budget is a spend ceiling for exactly one Source. It answers "has this Source
-cost more than I allowed, over this window?" — and nothing else. Budgets are
-**annotation only**: they change what the report and `usage` TUI display, never
-the exit code, so they are safe to leave configured.
+cost more than I allowed, over this window?" — and nothing else. On the
+reporting commands budgets are **annotation only**: they change what the report
+and `usage` TUI display, never the exit code, so they are safe to leave
+configured. On `request` a budget is a **gate**: an over budget refuses the
+request with exit code 3 before any provider is contacted (see
+[Budget gate](#budget-gate-the-cost-control-loop)).
 
 Because Cost is always source-scoped (a group of records from mixed Sources has
 no single meaningful Cost), a budget binds to one Source and is never summed
-across Sources. Claude Code records no Cost at all, so a budget on it reports
-`not measured` rather than a misleading `ok`.
+across Sources. Claude Code records no Cost at all, and a model with no
+`[price]` entry is unpriced, so a budget on either reports `not measured`
+rather than a misleading `ok`.
 
-Budget flags are accepted by `report` and `usage`. The annotation appears in the
+Budget flags are accepted by `report`, `usage`, `compare` — and, as a gate, by
+`request`. The annotation appears in the
 report Markdown (including `report --output`) and in the `usage` TUI;
 `usage --json`/`--csv` still validate the flags but emit no budget data, since
 those are machine formats with a fixed shape.
@@ -449,7 +495,7 @@ llmhelper report --budget-name opencode-daily
 |---|---|
 | `over` | the Source records Cost, and spend is **strictly greater** than `max_cost` |
 | `ok` | the Source records Cost, and spend is at or below `max_cost` |
-| `not measured` | the Source records no Cost (Claude Code), or contributed no records |
+| `not measured` | the Source records no Cost (Claude Code, or an unpriced `llmhelper` model), or contributed no records |
 
 The boundary is strictly greater on purpose: spend exactly equal to the ceiling
 has not crossed it.

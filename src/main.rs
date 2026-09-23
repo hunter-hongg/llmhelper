@@ -28,7 +28,8 @@ use llmhelper::output::{
 use llmhelper::report::{render_report, ReportMeta};
 use llmhelper::search::{search, SearchHit, SearchOptions};
 use llmhelper::source::{
-    ClaudeSource, KiloSource, MessageStatus, OmpSource, OpenCodeSource, Registry, SourceStatus,
+    ClaudeSource, KiloSource, LlmhelperSource, MessageStatus, OmpSource, OpenCodeSource, Registry,
+    SourceStatus,
 };
 use llmhelper::tui::scroll::Scrollable;
 use llmhelper::tui::{
@@ -118,52 +119,209 @@ fn message_cache(config: &Config, args: &impl CacheArgs) -> CacheSetup {
     ))
 }
 
-fn discover_sources(config: &Config, cache: &CacheSetup) -> Registry {
-    let mut reg = Registry::new();
-    let claude_dir = config.claude_dir.clone().unwrap_or_else(|| {
+/// The Claude projects directory: the config override, else the platform
+/// default. Shared by the full registry and the request gate's restricted one
+/// so the two cannot resolve a Source to different places.
+fn resolved_claude_dir(config: &Config) -> PathBuf {
+    config.claude_dir.clone().unwrap_or_else(|| {
         dirs::home_dir()
             .map(|h| h.join(".claude").join("projects"))
             .unwrap_or_default()
-    });
-    reg.register(Box::new(match cache.handle("claude") {
-        Some(c) => ClaudeSource::with_cache(claude_dir, c),
-        None => ClaudeSource::new(claude_dir),
-    }));
-    let opencode_dbs: Vec<PathBuf> = if let Some(ref overrides) = config.opencode_dbs {
-        overrides.clone()
-    } else {
-        let base = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("opencode");
-        ["opencode.db", "opencode-local.db", "opencode-dev.db"]
-            .iter()
-            .map(|n| base.join(n))
-            .collect()
-    };
-    reg.register(Box::new(match cache.handle("opencode") {
-        Some(c) => OpenCodeSource::with_cache(opencode_dbs, c),
-        None => OpenCodeSource::new(opencode_dbs),
-    }));
-    let omp_dir = config.omp_dir.clone().unwrap_or_else(|| {
+    })
+}
+
+/// The OpenCode databases: the config override(s), else the platform defaults.
+fn resolved_opencode_dbs(config: &Config) -> Vec<PathBuf> {
+    if let Some(overrides) = &config.opencode_dbs {
+        return overrides.clone();
+    }
+    let base = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("opencode");
+    ["opencode.db", "opencode-local.db", "opencode-dev.db"]
+        .iter()
+        .map(|n| base.join(n))
+        .collect()
+}
+
+/// The OMP sessions directory: the config override, else the platform default.
+fn resolved_omp_dir(config: &Config) -> PathBuf {
+    config.omp_dir.clone().unwrap_or_else(|| {
         dirs::home_dir()
             .map(|h| h.join(".omp").join("agent").join("sessions"))
             .unwrap_or_default()
-    });
-    reg.register(Box::new(match cache.handle("omp") {
-        Some(c) => OmpSource::with_cache(omp_dir, c),
-        None => OmpSource::new(omp_dir),
-    }));
-    let kilo_db = config.kilo_dbs.clone().unwrap_or_else(|| {
+    })
+}
+
+/// The Kilo databases: the config override(s), else the platform default.
+fn resolved_kilo_dbs(config: &Config) -> Vec<PathBuf> {
+    config.kilo_dbs.clone().unwrap_or_else(|| {
         vec![dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("kilo")
             .join("kilo.db")]
-    });
+    })
+}
+
+/// The request-log directory, or `None` when it cannot be resolved. Shared by
+/// the full registry and the gate registry through
+/// [`llmhelper::request::resolved_log_dir`], the same function `--log` writes
+/// through, so reader and writer can never disagree.
+fn resolved_llmhelper_log_dir(config: &Config) -> Option<PathBuf> {
+    llmhelper::request::resolved_log_dir(config).filter(|dir| dir.is_dir())
+}
+
+fn discover_sources(config: &Config, cache: &CacheSetup) -> Registry {
+    let mut reg = Registry::new();
+    let claude_dir = resolved_claude_dir(config);
+    reg.register(Box::new(match cache.handle("claude") {
+        Some(c) => ClaudeSource::with_cache(claude_dir, c),
+        None => ClaudeSource::new(claude_dir),
+    }));
+    let opencode_dbs = resolved_opencode_dbs(config);
+    reg.register(Box::new(match cache.handle("opencode") {
+        Some(c) => OpenCodeSource::with_cache(opencode_dbs, c),
+        None => OpenCodeSource::new(opencode_dbs),
+    }));
+    let omp_dir = resolved_omp_dir(config);
+    reg.register(Box::new(match cache.handle("omp") {
+        Some(c) => OmpSource::with_cache(omp_dir, c),
+        None => OmpSource::new(omp_dir),
+    }));
+    let kilo_db = resolved_kilo_dbs(config);
     reg.register(Box::new(match cache.handle("kilo") {
         Some(c) => KiloSource::with_cache(kilo_db, c),
         None => KiloSource::new(kilo_db),
     }));
+    // Registered only when the log directory exists: a user who never ran
+    // `request --log` sees no phantom `llmhelper` row, while one who has sees
+    // it automatically (spec 0027's registration rule).
+    if let Some(log_dir) = resolved_llmhelper_log_dir(config) {
+        reg.register(Box::new(LlmhelperSource::new(
+            log_dir,
+            config.prices.clone(),
+        )));
+    }
     reg
+}
+
+/// Build a [`Registry`] containing only the named Sources, for the `request`
+/// budget gate.
+///
+/// The gate reads only what its budgets can spend: a Source the budgets do not
+/// name is neither loaded nor able to block a request, so an over-budget check
+/// never scans a corpus it will not use. Path resolution is shared with
+/// [`discover_sources`] through the `resolved_*` helpers, so the gate and the
+/// read-only commands cannot resolve the same Source to two different places.
+fn gate_registry(config: &Config, sources: &[String]) -> Registry {
+    let mut reg = Registry::new();
+    // Dedupe in first-seen order; budgets commonly repeat a Source, and a
+    // registry keyed by name would only keep the last registration anyway.
+    let mut seen: Vec<String> = Vec::new();
+    for name in sources {
+        if !seen.contains(name) {
+            seen.push(name.clone());
+        }
+    }
+    for name in &seen {
+        match name.as_str() {
+            "claude" => reg.register(Box::new(ClaudeSource::new(resolved_claude_dir(config)))),
+            "opencode" => {
+                reg.register(Box::new(OpenCodeSource::new(resolved_opencode_dbs(config))))
+            }
+            "omp" => reg.register(Box::new(OmpSource::new(resolved_omp_dir(config)))),
+            "kilo" => reg.register(Box::new(KiloSource::new(resolved_kilo_dbs(config)))),
+            "llmhelper" => {
+                if let Some(log_dir) = resolved_llmhelper_log_dir(config) {
+                    reg.register(Box::new(LlmhelperSource::new(
+                        log_dir,
+                        config.prices.clone(),
+                    )));
+                }
+            }
+            // An unknown source is a configuration error that budget
+            // validation names loudly before the gate builds a registry. A
+            // name that reaches here anyway contributes no records rather than
+            // aborting the request: absent data is not zero, so it reports
+            // `not measured`, not `under`.
+            _ => {}
+        }
+    }
+    reg
+}
+
+/// The pre-flight budget gate for `request`.
+///
+/// Resolves the budget flags, loads only the Sources those budgets name, and
+/// returns an error naming every budget already over its ceiling. `Ok(())`
+/// when no budget flag was given (the gate is off) or when nothing is over.
+///
+/// A budget is measured over spend accumulated *before* this request: the
+/// current request's cost is written to the log only after the response
+/// arrives, so it can only ever be seen by the *next* invocation's gate. That
+/// lag is the loop's design, not a bug — the gate never refuses a request for
+/// its own spend.
+///
+/// `request` has no record window of its own, so `command_since` is `None` and
+/// a budget is measured over its full window.
+fn run_budget_gate(
+    args: &RequestArgs,
+    config: &Config,
+) -> Result<(), llmhelper::request::RequestError> {
+    // Resolution failures (a bad `--budget` spec, an unknown
+    // `--budget-name`, an invalid window) are usage errors: they surface as a
+    // `Request` error, which is exit 1, rather than as a gate refusal.
+    let budgets = args
+        .resolve_request_budgets(&config.budgets)
+        .map_err(|e| llmhelper::request::RequestError::Request(format!("{e:#}")))?;
+
+    let Some(budgets) = budgets else {
+        return Ok(());
+    };
+
+    // A gate on the log Source with logging off can only ever see the past:
+    // this run's spend will never be logged, so the loop is silently open.
+    // Warn and proceed — auto-enabling `--log` was rejected as too magical.
+    if !args.log && budgets.iter().any(|b| b.source == "llmhelper") {
+        eprintln!(
+            "warn: a budget on source llmhelper cannot see unlogged requests; \
+             run with --log to close the loop"
+        );
+    }
+
+    let named: Vec<String> = budgets.iter().map(|b| b.source.clone()).collect();
+    let registry = gate_registry(config, &named);
+    let (records, _) = registry.load_all();
+
+    let now = Utc::now();
+    let overs = llmhelper::budget::over_budget(&budgets, &records, now, None);
+    if overs.is_empty() {
+        return Ok(());
+    }
+
+    let mut msg = String::new();
+    if overs.len() == 1 {
+        msg.push_str("1 budget is already over its ceiling:\n");
+    } else {
+        msg.push_str(&format!(
+            "{} budgets are already over their ceilings:\n",
+            overs.len()
+        ));
+    }
+    for s in &overs {
+        // `spend` is `Some` whenever the state is `Over` — the only way to be
+        // over is to have measured a cost — so the figure is always real here.
+        msg.push_str(&format!(
+            "  {} (source {}, window {}): measured {:.6} over ceiling {:.6}\n",
+            s.budget.name,
+            s.budget.source,
+            s.budget.window.label(),
+            s.spend.unwrap_or(0.0),
+            s.budget.max_cost,
+        ));
+    }
+    msg.push_str("refusing to send the request; no provider was contacted");
+    Err(llmhelper::request::RequestError::Budget(msg))
 }
 
 /// Build the record-scoping predicate shared by every read-only command.
@@ -1837,6 +1995,17 @@ fn request_messages(args: &RequestArgs) -> anyhow::Result<Vec<serde_json::Value>
 fn run_request(args: RequestArgs, config_path: &Option<PathBuf>) -> anyhow::Result<()> {
     args.validate()?;
     let config = Config::load_with(config_path.as_deref());
+
+    // The budget gate is a single pre-flight check: it runs after validation
+    // and before the payload is built or any provider is contacted, so one
+    // call site covers one-shot, --stream, and --interactive (the gate fires
+    // once, before the first turn). With no budget flag it is a no-op and
+    // `request` behaves exactly as before.
+    if let Err(e) = run_budget_gate(&args, &config) {
+        eprintln!("error: {}", e);
+        std::process::exit(llmhelper::request::request_exit_code(&e));
+    }
+
     let settings = llmhelper::request::RequestSettings::resolve(&args, &config)?;
 
     let mut messages = request_messages(&args)?;
@@ -1883,7 +2052,7 @@ fn run_request(args: RequestArgs, config_path: &Option<PathBuf>) -> anyhow::Resu
     let payload = build(&messages);
     if args.log {
         let body = serde_json::to_string(&payload).unwrap_or_default();
-        llmhelper::request::write_request_log("request", &body);
+        llmhelper::request::write_request_log(settings.log_dir.as_deref(), "request", &body);
     }
 
     let rt = Runtime::new()?;
@@ -1904,7 +2073,11 @@ fn run_request(args: RequestArgs, config_path: &Option<PathBuf>) -> anyhow::Resu
             match rt.block_on(run_request_stream_json(&settings, &payload, &args)) {
                 Ok(events) => {
                     if args.log {
-                        llmhelper::request::write_request_log("response", &events);
+                        llmhelper::request::write_request_log(
+                            settings.log_dir.as_deref(),
+                            "response",
+                            &events,
+                        );
                     }
                 }
                 Err(e) => {
@@ -1916,7 +2089,11 @@ fn run_request(args: RequestArgs, config_path: &Option<PathBuf>) -> anyhow::Resu
             match rt.block_on(run_request_stream_text(&settings, &payload, &args)) {
                 Ok(content) => {
                     if args.log {
-                        llmhelper::request::write_request_log("response", &content);
+                        llmhelper::request::write_request_log(
+                            settings.log_dir.as_deref(),
+                            "response",
+                            &content,
+                        );
                     }
                 }
                 Err(e) => {
@@ -1954,7 +2131,7 @@ fn run_request(args: RequestArgs, config_path: &Option<PathBuf>) -> anyhow::Resu
         let duration_ms = start.elapsed().as_millis();
         if args.log {
             let body = serde_json::to_string(&response.raw).unwrap_or_default();
-            llmhelper::request::write_request_log("response", &body);
+            llmhelper::request::write_request_log(settings.log_dir.as_deref(), "response", &body);
         }
 
         if args.json {
@@ -2150,7 +2327,11 @@ fn run_request_interactive(
                         let payload = params.build(&current_messages);
                         if args.log {
                             let body = serde_json::to_string(&payload).unwrap_or_default();
-                            llmhelper::request::write_request_log("request", &body);
+                            llmhelper::request::write_request_log(
+                                settings.log_dir.as_deref(),
+                                "request",
+                                &body,
+                            );
                         }
                         tui.state.body_lines =
                             vec![format!("> {}", text), "(waiting for response…)".to_string()];

@@ -264,6 +264,7 @@ pub enum SourceArg {
     Opencode,
     Omp,
     Kilo,
+    Llmhelper,
 }
 
 impl std::fmt::Display for SourceArg {
@@ -273,6 +274,7 @@ impl std::fmt::Display for SourceArg {
             Self::Opencode => write!(f, "opencode"),
             Self::Omp => write!(f, "omp"),
             Self::Kilo => write!(f, "kilo"),
+            Self::Llmhelper => write!(f, "llmhelper"),
         }
     }
 }
@@ -1287,6 +1289,21 @@ pub struct RequestArgs {
     pub max_tokens: Option<u32>,
     #[arg(long = "stop")]
     pub stop: Vec<String>,
+    /// Refuse the request when any of these one-off budgets — `source:amount`,
+    /// e.g. `opencode:5.00` — is already over. Repeatable. With no budget flag
+    /// given the gate is off and `request` is unchanged.
+    #[arg(long = "budget")]
+    pub budget: Vec<String>,
+    /// Window applied to the `--budget` one-offs (e.g. 1d, 7d, 30d, 1w, 1mo).
+    /// Defaults to 1d.
+    #[arg(long = "budget-window")]
+    pub budget_window: Option<String>,
+    /// Also gate on these configured [budget.<name>] entries, by name.
+    /// Repeatable. Unlike the read-only commands, an empty list means *no*
+    /// configured budgets, not all of them — a gate that silently adopted a
+    /// user's historical budgets would make `request` unusable.
+    #[arg(long = "budget-name")]
+    pub budget_name: Vec<String>,
 }
 
 impl RequestArgs {
@@ -1304,6 +1321,58 @@ impl RequestArgs {
             anyhow::bail!("--copy is mutually exclusive with --json and --text");
         }
         Ok(())
+    }
+
+    /// Whether any budget flag was given. Only when one is does `request`
+    /// enable the pre-flight budget gate; with none the command is unchanged.
+    pub fn has_budget_gate(&self) -> bool {
+        !self.budget.is_empty() || !self.budget_name.is_empty()
+    }
+
+    /// Resolve the effective gate budget list: the named configured budgets
+    /// plus any `--budget` one-offs. Unlike [`BudgetArgs::resolve_budgets`], an
+    /// empty `--budget-name` means *no* configured budgets — a gate that
+    /// silently adopted every historical budget would make `request` unusable.
+    /// Returns `Ok(None)` when no budget flag was given, i.e. the gate is off.
+    pub fn resolve_request_budgets(
+        &self,
+        configured: &[crate::budget::Budget],
+    ) -> anyhow::Result<Option<Vec<crate::budget::Budget>>> {
+        if !self.has_budget_gate() {
+            return Ok(None);
+        }
+        let mut out: Vec<crate::budget::Budget> = Vec::new();
+
+        for name in &self.budget_name {
+            let found = configured.iter().find(|b| &b.name == name).ok_or_else(|| {
+                let known = if configured.is_empty() {
+                    "(none configured)".to_string()
+                } else {
+                    configured
+                        .iter()
+                        .map(|b| b.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                anyhow::anyhow!(
+                    "unknown --budget-name '{}' (configured budgets: {})",
+                    name,
+                    known
+                )
+            })?;
+            out.push(found.clone());
+        }
+        // Deterministic render order for the named configured budgets; the
+        // one-offs below keep their flag order, which the user chose.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let window_text = self.budget_window.as_deref().unwrap_or("1d");
+        for spec in &self.budget {
+            out.push(parse_budget_spec(spec, window_text)?);
+        }
+
+        crate::budget::validate_all(&out)?;
+        Ok(Some(out))
     }
 }
 
@@ -2002,5 +2071,129 @@ mod tests {
             }
             other => panic!("expected report, got {other:?}"),
         }
+    }
+
+    // `request` is the money-spending command, so its budget resolution is the
+    // inverse of the read-only commands': with no `--budget-name` it adopts
+    // *none* of the configured budgets, never all of them.
+
+    fn request_from(argv: &[&str]) -> RequestArgs {
+        let mut full = vec!["llmhelper", "request"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full).unwrap().command {
+            Command::Request(args) => args,
+            other => panic!("expected request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_with_no_budget_flags_has_no_gate() {
+        // The opt-in contract: nothing is resolved, so `request` is unchanged.
+        let args = request_from(&[]);
+        assert!(!args.has_budget_gate());
+        assert!(args
+            .resolve_request_budgets(&[configured("daily")])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn request_one_off_budget_enables_the_gate_without_adopting_configured() {
+        let args = request_from(&["--budget", "opencode:5.00"]);
+        assert!(args.has_budget_gate());
+        let resolved = args
+            .resolve_request_budgets(&[configured("daily")])
+            .unwrap()
+            .unwrap();
+        // The configured budget is NOT adopted — the one-off alone is the gate.
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].source, "opencode");
+        assert_eq!(resolved[0].max_cost, 5.00);
+        assert_eq!(resolved[0].name, "cli:opencode");
+    }
+
+    #[test]
+    fn request_budget_window_applies_to_one_offs() {
+        let args = request_from(&["--budget", "opencode:5.00", "--budget-window", "7d"]);
+        let resolved = args.resolve_request_budgets(&[]).unwrap().unwrap();
+        assert_eq!(resolved[0].window, BudgetWindow::parse("7d").unwrap());
+    }
+
+    #[test]
+    fn request_one_off_budget_defaults_window_to_one_day() {
+        let args = request_from(&["--budget", "opencode:5.00"]);
+        let resolved = args.resolve_request_budgets(&[]).unwrap().unwrap();
+        assert_eq!(resolved[0].window, BudgetWindow::parse("1d").unwrap());
+    }
+
+    #[test]
+    fn request_one_off_budgets_are_repeatable() {
+        let args = request_from(&["--budget", "opencode:5", "--budget", "omp:2"]);
+        let resolved = args.resolve_request_budgets(&[]).unwrap().unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].source, "opencode");
+        assert_eq!(resolved[1].source, "omp");
+    }
+
+    #[test]
+    fn request_bad_one_off_spec_is_rejected() {
+        let args = request_from(&["--budget", "opencode"]);
+        let err = args.resolve_request_budgets(&[]).unwrap_err().to_string();
+        assert!(err.contains("expected <source>:<amount>"), "{err}");
+    }
+
+    #[test]
+    fn request_non_numeric_amount_is_rejected() {
+        let args = request_from(&["--budget", "opencode:abc"]);
+        let err = args.resolve_request_budgets(&[]).unwrap_err().to_string();
+        assert!(err.contains("not a number"), "{err}");
+    }
+
+    #[test]
+    fn request_unknown_one_off_source_is_rejected() {
+        let args = request_from(&["--budget", "nemo:5"]);
+        let err = args.resolve_request_budgets(&[]).unwrap_err().to_string();
+        assert!(err.contains("unknown source"), "{err}");
+    }
+
+    #[test]
+    fn request_bad_budget_window_is_rejected() {
+        let args = request_from(&["--budget", "opencode:5", "--budget-window", "x"]);
+        let err = args.resolve_request_budgets(&[]).unwrap_err().to_string();
+        assert!(err.contains("invalid --budget-window"), "{err}");
+    }
+
+    #[test]
+    fn request_budget_name_selects_only_the_named_configured_budget() {
+        let args = request_from(&["--budget-name", "daily"]);
+        let resolved = args
+            .resolve_request_budgets(&[configured("daily"), configured("weekly")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "daily");
+    }
+
+    #[test]
+    fn request_unknown_budget_name_lists_configured_names() {
+        let args = request_from(&["--budget-name", "nope"]);
+        let err = args
+            .resolve_request_budgets(&[configured("daily"), configured("weekly")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown --budget-name 'nope'"), "{err}");
+        assert!(err.contains("daily, weekly"), "{err}");
+    }
+
+    #[test]
+    fn request_budget_names_combine_with_one_offs() {
+        let args = request_from(&["--budget-name", "daily", "--budget", "omp:2"]);
+        let resolved = args
+            .resolve_request_budgets(&[configured("daily")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "daily");
+        assert_eq!(resolved[1].source, "omp");
     }
 }

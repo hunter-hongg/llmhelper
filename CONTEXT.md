@@ -9,7 +9,7 @@ The token consumption and activity of a single agent session, broken into input,
 _Avoid_: stats, metrics, usage-data
 
 **Source**:
-One of the agent tools whose local files the CLI reads. The four known sources are Claude Code (transcript JSONL), OpenCode (SQLite), OMP (per-session JSONL under `~/.omp/agent/sessions`), and Kilo Code (SQLite `kilo.db` under `~/.local/share/kilo`). Each source has a distinct storage format and field coverage. Sources are auto-discovered at default paths and may be overridden by flags or a config file; reading all OpenCode DB variants and merging them is part of Source behavior.
+One of the agent tools whose local files the CLI reads — plus `llmhelper` itself, whose Source reads back the request log that `request --log` writes. The five known sources are Claude Code (transcript JSONL), OpenCode (SQLite), OMP (per-session JSONL under `~/.omp/agent/sessions`), Kilo Code (SQLite `kilo.db` under `~/.local/share/kilo`), and llmhelper (per-day `request-*.log` under the resolved log dir, registered only when that directory exists). Each source has a distinct storage format and field coverage. Sources are auto-discovered at default paths and may be overridden by flags or a config file; reading all OpenCode DB variants and merging them is part of Source behavior.
 _Avoid_: provider, backend, agent
 
 **Project**:
@@ -17,8 +17,8 @@ The working directory a Session ran in. Claude Code encodes it into the transcri
 _Avoid_: repo, workspace
 
 **Cost**:
-The monetary spend attributed to a Session by a Source that records it. OpenCode and OMP expose it directly; Claude Code does not, so its Cost is absent. Cost is always source-scoped — it must never be summed or averaged across Sources, only displayed per Source.
-_Avoid_: price, spend, expense
+The monetary spend attributed to a Session by a Source that records it. OpenCode and OMP expose it directly; Claude Code does not, so its Cost is absent. The llmhelper Source logs tokens and never money, so its Cost is computed from the `[price.<model>]` rates at read time — a model with no price entry has no Cost, and a Budget on it is NotMeasured. Cost is always source-scoped — it must never be summed or averaged across Sources, only displayed per Source.
+_Avoid_: price, spend, expense — the `[price]` table holds per-million-token *rates*, which is the one place "price" names a different concept rather than Cost itself
 
 **Token Breakdown**:
 The canonical four-part token accounting of a Session: input, output, cache_read, cache_write. Reasoning tokens are folded into `output` at load time, so there is no source-specific token field downstream.

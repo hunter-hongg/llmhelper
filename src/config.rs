@@ -13,9 +13,20 @@ pub struct Config {
     pub request_timeout_seconds: Option<u64>,
     pub request_reasoning_fields: Option<Vec<String>>,
     pub request_reasoning: Option<PathBuf>,
+    /// `[request] log_dir` — where `--log` writes the per-day request log.
+    /// A relative value is anchored next to the config file (same rule as
+    /// `reasoning`); `None` falls back to `request::log_dir()`.
+    pub request_log_dir: Option<PathBuf>,
     /// Source-scoped spend budgets declared under `[budget.<name>]`, in the
     /// file's declaration order. Empty when the table is absent.
     pub budgets: Vec<crate::budget::Budget>,
+    /// `[price.<model>]` — per-million-token rates used to convert a logged
+    /// turn's tokens into a Cost. Empty when the table is absent, which prices
+    /// nothing (an unpriced model is `not measured`, not free).
+    /// Omitted cache rates fall back to the input rate; an entry missing
+    /// `input_per_mtoken` or `output_per_mtoken` is skipped with a warning —
+    /// a half-declared price is not a price.
+    pub prices: crate::price::PriceTable,
     /// `[cache]` — the message-extraction cache's declared settings. Resolution
     /// (CLI flag > config > default) happens in [`Config::resolve_cache`],
     /// because only the CLI layer knows about the flags.
@@ -94,7 +105,9 @@ impl Default for Config {
             request_timeout_seconds: None,
             request_reasoning_fields: None,
             request_reasoning: None,
+            request_log_dir: None,
             budgets: Vec::new(),
+            prices: crate::price::PriceTable::new(),
             cache: CacheConfig::default(),
         }
     }
@@ -170,6 +183,11 @@ impl Config {
                 .as_ref()
                 .and_then(|r| r.reasoning.clone())
                 .map(|p| resolve_relative(&path, p)),
+            request_log_dir: parsed
+                .request
+                .as_ref()
+                .and_then(|r| r.log_dir.clone())
+                .map(|p| resolve_relative(&path, p)),
             budgets: parsed
                 .budget
                 .unwrap_or_default()
@@ -184,6 +202,7 @@ impl Config {
                     }
                 })
                 .collect(),
+            prices: resolve_prices(parsed.price.unwrap_or_default(), &path),
             cache: CacheConfig {
                 enabled: parsed.cache.as_ref().and_then(|c| c.enabled),
                 dir: parsed.cache.as_ref().and_then(|c| c.dir.clone()),
@@ -233,6 +252,9 @@ struct ConfigTable {
     request: Option<RequestConfig>,
     /// `[budget.<name>]` tables, in declaration order.
     budget: Option<std::collections::BTreeMap<String, BudgetConfig>>,
+    /// `[price.<model>]` tables. The key is the exact model string a provider
+    /// echoes; `gpt-4o` and `gpt-4o-2024-08-06` are two different entries.
+    price: Option<std::collections::BTreeMap<String, PriceConfig>>,
     /// `[cache]`
     cache: Option<CacheTable>,
 }
@@ -248,6 +270,17 @@ struct BudgetConfig {
     source: String,
     window: String,
     max_cost: f64,
+}
+
+/// A `[price.<model>]` table. The two cache rates are optional and default to
+/// the input rate: a provider that bills cache reads at the prompt rate needs
+/// only the two required keys.
+#[derive(serde::Deserialize, Debug, Default)]
+struct PriceConfig {
+    input_per_mtoken: Option<f64>,
+    output_per_mtoken: Option<f64>,
+    cache_read_per_mtoken: Option<f64>,
+    cache_write_per_mtoken: Option<f64>,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -291,6 +324,7 @@ struct RequestConfig {
     timeout_seconds: Option<u64>,
     reasoning_fields: Option<Vec<String>>,
     reasoning: Option<PathBuf>,
+    log_dir: Option<PathBuf>,
 }
 
 /// Resolve a path against the directory of a config file. A relative path is
@@ -322,6 +356,36 @@ pub fn resolve_against_config(
 /// anchor.
 fn resolve_relative(config_path: &std::path::Path, candidate: PathBuf) -> PathBuf {
     resolve_against_config(Some(config_path), candidate)
+}
+
+/// Convert parsed `[price.<model>]` tables into a `crate::price::PriceTable`.
+/// An omitted cache rate falls back to the input rate; an entry missing one of
+/// the two required rates is skipped with a warning — a half-declared price is
+/// not a price, and silently zero-pricing half a turn would understate spend.
+fn resolve_prices(
+    parsed: std::collections::BTreeMap<String, PriceConfig>,
+    config_path: &Path,
+) -> crate::price::PriceTable {
+    let mut table = crate::price::PriceTable::new();
+    for (model, p) in parsed {
+        let (Some(input), Some(output)) = (p.input_per_mtoken, p.output_per_mtoken) else {
+            eprintln!(
+                "warn: {:?} [price.{}] needs both input_per_mtoken and output_per_mtoken; entry skipped",
+                config_path, model
+            );
+            continue;
+        };
+        table.insert(
+            model,
+            crate::price::ModelPrice {
+                input_per_mtoken: input,
+                output_per_mtoken: output,
+                cache_read_per_mtoken: p.cache_read_per_mtoken.unwrap_or(input),
+                cache_write_per_mtoken: p.cache_write_per_mtoken.unwrap_or(input),
+            },
+        );
+    }
+    table
 }
 
 #[cfg(test)]
@@ -538,5 +602,68 @@ max_cost = 0.0
             "{}",
             err
         );
+    }
+
+    fn load_str(s: &str) -> Config {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, s).unwrap();
+        Config::load_with(Some(&path))
+    }
+
+    #[test]
+    fn price_table_declared_cache_rates_are_used() {
+        let cfg = load_str(
+            r#"
+[price.gpt-4o]
+input_per_mtoken = 2.5
+output_per_mtoken = 10.0
+cache_read_per_mtoken = 0.3
+cache_write_per_mtoken = 1.25
+"#,
+        );
+        let p = &cfg.prices["gpt-4o"];
+        assert_eq!(p.input_per_mtoken, 2.5);
+        assert_eq!(p.output_per_mtoken, 10.0);
+        assert_eq!(p.cache_read_per_mtoken, 0.3);
+        assert_eq!(p.cache_write_per_mtoken, 1.25);
+    }
+
+    #[test]
+    fn price_table_omitted_cache_rates_fall_back_to_input() {
+        let cfg = load_str(
+            r#"
+[price.m]
+input_per_mtoken = 2.0
+output_per_mtoken = 8.0
+"#,
+        );
+        let p = &cfg.prices["m"];
+        assert_eq!(p.cache_read_per_mtoken, 2.0);
+        assert_eq!(p.cache_write_per_mtoken, 2.0);
+    }
+
+    #[test]
+    fn price_table_half_declared_entry_is_skipped() {
+        // output_per_mtoken missing on "broken": not a price. The other
+        // entry must still load.
+        let cfg = load_str(
+            r#"
+[price.broken]
+input_per_mtoken = 1.0
+
+[price.good]
+input_per_mtoken = 1.0
+output_per_mtoken = 2.0
+"#,
+        );
+        assert!(!cfg.prices.contains_key("broken"));
+        assert!(cfg.prices.contains_key("good"));
+    }
+
+    #[test]
+    fn price_table_absent_prices_nothing() {
+        let cfg = load_str("[ui]\nrefresh_interval_seconds = 5\n");
+        assert!(cfg.prices.is_empty());
     }
 }

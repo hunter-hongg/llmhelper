@@ -363,9 +363,7 @@ fn load_sqlite_messages_all(
             matches!(Path::new(&wal).try_exists(), Ok(false))
         });
         let result = if wal_absent {
-            cached_file_messages(cache, db_path, || {
-                load_sqlite_messages(db_path, source)
-            })
+            cached_file_messages(cache, db_path, || load_sqlite_messages(db_path, source))
         } else if let Some(handle) = cache {
             // No fingerprint means neither old entries nor WAL-derived results
             // are reused/stored, but extraction is still counted. Once SQLite
@@ -374,8 +372,7 @@ fn load_sqlite_messages_all(
             // The DB file itself was still reached (its WAL merely disallows
             // reuse), so record it: pruning must not drop an entry for a file
             // this load did visit.
-            let seen = std::fs::canonicalize(db_path)
-                .unwrap_or_else(|_| db_path.to_path_buf());
+            let seen = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
             handle.lock().mark_seen(&seen);
             handle
                 .lock()
@@ -1542,8 +1539,432 @@ mod kilo {
     }
 }
 
+/// The `llmhelper` Source: the request log read back as usage data.
+///
+/// `request --log` writes one JSON envelope per line (`timestamp`, `direction`,
+/// `body`, where `body` is a stringified provider payload). This Source walks
+/// those files and emits one [`Record`] per logged *response* that carries a
+/// `usage` block — the token counts `request` parses, logs, and otherwise
+/// drops. That is what closes spec 0027's loop: the accumulated spend of past
+/// `request` runs becomes the measurement a budget gate can refuse on.
+///
+/// The log records tokens and never money, so a Cost exists only for models
+/// the `[price]` table prices; an unpriced model is `not measured`, not free.
+mod llmhelper {
+    use super::*;
+    use crate::price::PriceTable;
+
+    pub struct LlmhelperSource {
+        log_dir: PathBuf,
+        prices: PriceTable,
+    }
+
+    impl LlmhelperSource {
+        pub fn new(log_dir: PathBuf, prices: PriceTable) -> Self {
+            Self { log_dir, prices }
+        }
+    }
+
+    fn is_request_log(name: &str) -> bool {
+        name.starts_with("request-") && name.ends_with(".log")
+    }
+
+    /// Parse one log file's text into Records, returning the count of lines
+    /// that were malformed enough to discard.
+    ///
+    /// The only clock is the envelope's own `timestamp`, and the only identity
+    /// is `{file_name}#{1-based line number}` — an append-only log therefore
+    /// re-reads to byte-identical output, which is what makes `usage` diffable
+    /// across runs. Pairing is positional: the most recent `request` line
+    /// supplies the model fallback for later `response` lines that omit it
+    /// (some providers do not echo the model).
+    pub fn parse_log_file(
+        file_name: &str,
+        contents: &str,
+        prices: &PriceTable,
+    ) -> (Vec<Record>, usize) {
+        let mut records = Vec::new();
+        let mut skipped = 0usize;
+        let mut last_request_model: Option<String> = None;
+
+        for (idx, line) in contents.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let line_no = idx + 1;
+            let envelope: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let body: serde_json::Value = match envelope.get("body").and_then(|b| b.as_str()) {
+                Some(b) => match serde_json::from_str(b) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    }
+                },
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            match envelope.get("direction").and_then(|d| d.as_str()) {
+                Some("request") => {
+                    last_request_model = body
+                        .get("model")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string);
+                }
+                Some("response") => {
+                    // A response with no usage block (a non-usage endpoint, a
+                    // truncated stream) yields no Record at all — inventing a
+                    // zero-token Record would dilute the sum, not measure it.
+                    let Some(usage) = body.get("usage").filter(|u| u.is_object()) else {
+                        continue;
+                    };
+                    let Some(started_at) = envelope
+                        .get("timestamp")
+                        .and_then(|t| t.as_str())
+                        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                        .map(|t| t.with_timezone(&Utc))
+                    else {
+                        skipped += 1;
+                        continue;
+                    };
+                    let model = body
+                        .get("model")
+                        .and_then(|m| m.as_str())
+                        .or(last_request_model.as_deref())
+                        .unwrap_or_default()
+                        .to_string();
+                    let tokens = TokenBreakdown {
+                        input: usage
+                            .get("prompt_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        output: usage
+                            .get("completion_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        cache_read: usage
+                            .get("prompt_tokens_details")
+                            .and_then(|d| d.get("cached_tokens"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        // The log carries no cache-write field; see spec 0027
+                        // Out of Scope.
+                        cache_write: 0,
+                    };
+                    let cost = crate::price::cost_for(prices, &model, &tokens);
+                    records.push(Record {
+                        session_id: format!("{}#{}", file_name, line_no),
+                        source: "llmhelper".to_string(),
+                        // The log records no project, and inventing one would
+                        // lie: `--project` simply never matches these Records.
+                        project: String::new(),
+                        model,
+                        agent: None,
+                        started_at,
+                        ended_at: None,
+                        tokens,
+                        // One Record is one completed turn; the request's
+                        // message array is deliberately not paired in.
+                        message_count: 1,
+                        cost,
+                    });
+                }
+                _ => {}
+            }
+        }
+        (records, skipped)
+    }
+
+    impl Source for LlmhelperSource {
+        fn name(&self) -> &str {
+            "llmhelper"
+        }
+
+        fn load(&self) -> Result<Vec<Record>, SourceError> {
+            if !self.log_dir.is_dir() {
+                return Err(SourceError::Absent(
+                    self.log_dir.to_string_lossy().to_string(),
+                ));
+            }
+            let mut logs: Vec<PathBuf> = match std::fs::read_dir(&self.log_dir) {
+                Ok(entries) => entries
+                    .flatten()
+                    .filter_map(|e| {
+                        let path = e.path();
+                        let name = path.file_name()?.to_str()?;
+                        is_request_log(name).then_some(path)
+                    })
+                    .collect(),
+                Err(e) => return Err(SourceError::Unreadable(e.to_string())),
+            };
+            // Sorted file order plus each file's line order is the whole
+            // determinism story; a BTreeMap of names would do the same but the
+            // names are needed for `session_id` anyway.
+            logs.sort();
+            let mut records = Vec::new();
+            for path in logs {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                let contents = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // A log truncated mid-write is recoverable, not fatal
+                        // — the same warn-don't-abort posture as a failed
+                        // Source elsewhere.
+                        eprintln!("warn: cannot read request log {:?}: {}", path, e);
+                        continue;
+                    }
+                };
+                let (batch, skipped) = parse_log_file(name, &contents, &self.prices);
+                if skipped > 0 {
+                    eprintln!("warn: {}: {} malformed line(s) skipped", name, skipped);
+                }
+                records.extend(batch);
+            }
+            Ok(records)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::price::ModelPrice;
+        use chrono::TimeZone;
+
+        fn envelope(direction: &str, body: serde_json::Value, ts: &str) -> String {
+            serde_json::json!({
+                "timestamp": ts,
+                "direction": direction,
+                "body": body.to_string(),
+            })
+            .to_string()
+        }
+
+        fn request_line(model: &str) -> String {
+            envelope(
+                "request",
+                serde_json::json!({"model": model, "messages": []}),
+                "2026-09-22T10:00:00+00:00",
+            )
+        }
+
+        fn response_line(model: Option<&str>, usage: serde_json::Value) -> String {
+            let mut body = serde_json::json!({"usage": usage});
+            if let Some(m) = model {
+                body["model"] = serde_json::Value::String(m.to_string());
+            }
+            envelope("response", body, "2026-09-22T10:00:05+00:00")
+        }
+
+        fn usage(prompt: u64, completion: u64, cached: Option<u64>) -> serde_json::Value {
+            let mut u =
+                serde_json::json!({"prompt_tokens": prompt, "completion_tokens": completion});
+            if let Some(c) = cached {
+                u["prompt_tokens_details"] = serde_json::json!({"cached_tokens": c});
+            }
+            u
+        }
+
+        fn prices() -> PriceTable {
+            PriceTable::from([(
+                "gpt-4o".to_string(),
+                ModelPrice {
+                    input_per_mtoken: 2.0,
+                    output_per_mtoken: 10.0,
+                    cache_read_per_mtoken: 2.0,
+                    cache_write_per_mtoken: 2.0,
+                },
+            )])
+        }
+
+        fn parse(text: &str) -> (Vec<Record>, usize) {
+            parse_log_file("request-2026-09-22.log", text, &prices())
+        }
+
+        #[test]
+        fn a_paired_request_and_response_yields_one_record() {
+            let text = format!(
+                "{}\n{}\n",
+                request_line("gpt-4o"),
+                response_line(Some("gpt-4o"), usage(1000, 200, Some(50)))
+            );
+            let (records, skipped) = parse(&text);
+            assert_eq!(skipped, 0);
+            assert_eq!(records.len(), 1);
+            let r = &records[0];
+            assert_eq!(r.source, "llmhelper");
+            assert_eq!(r.session_id, "request-2026-09-22.log#2");
+            assert_eq!(r.project, "");
+            assert_eq!(r.model, "gpt-4o");
+            assert_eq!(r.agent, None);
+            assert_eq!(
+                r.started_at,
+                Utc.with_ymd_and_hms(2026, 9, 22, 10, 0, 5).unwrap()
+            );
+            assert_eq!(r.ended_at, None);
+            assert_eq!(
+                r.tokens,
+                TokenBreakdown {
+                    input: 1000,
+                    output: 200,
+                    cache_read: 50,
+                    cache_write: 0
+                }
+            );
+            assert_eq!(r.message_count, 1);
+            // (1000×2 + 200×10 + 50×2) / 1e6
+            assert_eq!(r.cost, Some(0.0041));
+        }
+
+        #[test]
+        fn a_response_without_usage_yields_no_record() {
+            let text = format!(
+                "{}\n",
+                envelope(
+                    "response",
+                    serde_json::json!({"choices": []}),
+                    "2026-09-22T10:00:00+00:00"
+                )
+            );
+            let (records, skipped) = parse(&text);
+            assert!(
+                records.is_empty(),
+                "no usage means no Record, not a zero one"
+            );
+            assert_eq!(skipped, 0);
+        }
+
+        #[test]
+        fn a_response_whose_body_is_not_json_is_skipped_and_counted() {
+            let bad = serde_json::json!({
+                "timestamp": "2026-09-22T10:00:00+00:00",
+                "direction": "response",
+                "body": "{truncated mid-write",
+            })
+            .to_string();
+            let (records, skipped) = parse(&bad);
+            assert!(records.is_empty());
+            assert_eq!(skipped, 1);
+        }
+
+        #[test]
+        fn a_line_that_is_not_json_at_all_is_skipped_and_counted() {
+            let (records, skipped) = parse("not json\n");
+            assert!(records.is_empty());
+            assert_eq!(skipped, 1);
+        }
+
+        #[test]
+        fn a_request_with_no_following_response_yields_no_record() {
+            let (records, skipped) = parse(&request_line("gpt-4o"));
+            assert!(records.is_empty());
+            assert_eq!(skipped, 0);
+        }
+
+        #[test]
+        fn model_falls_back_to_the_remembered_request_line() {
+            let text = format!(
+                "{}\n{}\n",
+                request_line("gpt-4o"),
+                response_line(None, usage(10, 1, None))
+            );
+            let (records, _) = parse(&text);
+            assert_eq!(records[0].model, "gpt-4o");
+        }
+
+        #[test]
+        fn cached_tokens_absent_is_zero_not_an_error() {
+            let text = format!("{}\n", response_line(Some("gpt-4o"), usage(10, 1, None)));
+            let (records, _) = parse(&text);
+            assert_eq!(records[0].tokens.cache_read, 0);
+        }
+
+        #[test]
+        fn an_unpriced_model_costs_nothing_yet_is_not_priced() {
+            let text = format!("{}\n", response_line(Some("mistral"), usage(10, 1, None)));
+            let (records, _) = parse(&text);
+            // cost: None → a budget on it evaluates NotMeasured, never Under.
+            assert_eq!(records[0].cost, None);
+        }
+
+        #[test]
+        fn parsing_is_deterministic_and_line_numbers_stable() {
+            let text = format!(
+                "{}\n{}\n{}\n",
+                request_line("gpt-4o"),
+                response_line(Some("gpt-4o"), usage(5, 5, None)),
+                response_line(Some("gpt-4o"), usage(7, 7, None))
+            );
+            let (first, _) = parse(&text);
+            let (second, _) = parse(&text);
+            assert_eq!(first, second);
+            let ids: Vec<&str> = first.iter().map(|r| r.session_id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["request-2026-09-22.log#2", "request-2026-09-22.log#3"]
+            );
+        }
+
+        #[test]
+        fn blank_lines_are_ignored_without_counting_as_malformed() {
+            let (records, skipped) = parse("\n\n");
+            assert!(records.is_empty());
+            assert_eq!(skipped, 0);
+        }
+
+        #[test]
+        fn an_absent_log_directory_is_absent_not_empty() {
+            let dir = tempfile::tempdir().unwrap();
+            let source = LlmhelperSource::new(dir.path().join("nope"), PriceTable::new());
+            // Absent (not Ok(empty)) so `--source llmhelper` on a machine with
+            // no logs reports nothing measured rather than a false zero.
+            assert!(matches!(source.load(), Err(SourceError::Absent(_))));
+        }
+
+        #[test]
+        fn files_load_in_sorted_order_and_other_names_are_ignored() {
+            let dir = tempfile::tempdir().unwrap();
+            let line = response_line(Some("gpt-4o"), usage(1, 1, None));
+            std::fs::write(
+                dir.path().join("request-2026-09-21.log"),
+                format!("{line}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("request-2026-09-22.log"),
+                format!("{line}\n"),
+            )
+            .unwrap();
+            std::fs::write(dir.path().join("notes.log"), format!("{line}\n")).unwrap();
+            std::fs::write(
+                dir.path().join("request-2026-09-23.txt"),
+                format!("{line}\n"),
+            )
+            .unwrap();
+            let source = LlmhelperSource::new(dir.path().to_path_buf(), PriceTable::new());
+            let records = source.load().unwrap();
+            let sessions: Vec<&str> = records.iter().map(|r| r.session_id.as_str()).collect();
+            assert_eq!(
+                sessions,
+                vec!["request-2026-09-21.log#1", "request-2026-09-22.log#1",]
+            );
+        }
+    }
+}
+
 pub use claude::ClaudeSource;
 pub use kilo::KiloSource;
+pub use llmhelper::LlmhelperSource;
 pub use omp::OmpSource;
 pub use opencode::OpenCodeSource;
 
