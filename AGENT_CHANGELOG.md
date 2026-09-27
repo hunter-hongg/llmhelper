@@ -1,5 +1,17 @@
 # Agent Changelog
 
+## 2026-09-25 — spec 0026 landed
+
+- **spec 0026（`search --match substring|regex|fuzzy`）收尾并提交**：功能代码、ADR 0006、README/CONTEXT.md/changelog 条目早已写完并全绿（790 测试、clippy 0 warning、`cargo fmt --check` 干净），但整份工作只存在于工作区未提交，spec 状态仍是 `in-progress`——下一个 session 会误以为还有活要干，且这份工作一次误操作就全丢。本次只做落地：spec frontmatter 置 `done`/`done`（triage 同步）、四张 ticket 的验收项逐条核对后勾选、34 个文件的改动 + ADR 0006 + spec 0026 提交。**未改动任何实现代码**——0026 的实现内容与 2026-09-21 那条 changelog 记录完全一致。
+- ticket 勾选前逐条验证过而非照抄：tickets 01/02/03 要求的 clippy `-D warnings` 与 `cargo fmt --check` 均在本次重跑通过（`cargo fmt --check` 退出 0、clippy 30s 干净）；ticket 04 要求的「实测而非承诺的模式开销」在 2026-09-21 那条 changelog 里已有实测数字（release 真实语料 15,174 条消息、暖缓存：substring 1.82–1.86 s、regex 0.39–0.41 s、fuzzy 1.24–1.26 s），故 04 的「changelog entry drafted with measurements」可据实勾选。
+- 遗留（不在 0026 范围内，留给 0010 的 Out of Scope）：glob 与 typo-tolerance 仍 parked 在 spec 0010；注意 0026 的 Out of Scope 已判定 **glob 匹配不值得做**（"Globs address names, not text content; the corpus is message text"），所以那条 parked 项是**被否决**而非待办。
+
+## 2026-09-25 — Cleanup pass
+
+- **spec 状态修正**：将 13 个已实现但仍标 `ready-for-agent` 的 spec（0001–0014）状态更新为 `done`，triage 同步为 `done`；0020/0021 补上缺失的 frontmatter（status/triage 均为 done）；0022 trend 由 `in-progress` 更改为 `done`（功能已在 `3468da3` 实现，changelog 已记录）；0026 search-match-modes 由 `ready-for-agent` 更新为 `in-progress`（工作树中已实现 regex/fuzzy，awaiting commit）；0027 由 `ready-for-agent` 更新为 `done`（已在 `82d53ca` 实现）。
+- **README Budgets 节同步**：修正"annotation appears"的描述——将 `compare` 加入标注命令列表（compare 的 JSON/CSV 会携带 `budget_state` 字段/列），并澄清 `usage --json/--csv` 仍然不发预算数据（固定 shape）。
+- **TUI 回路去重**：新增 `src/tui/mod.rs` 中的 `TuiLoopState` trait + `run_static_tui` 泛化跑手，取代 `run_report_tui` 与 `run_search_tui` 中的 5 份 draw-poll-handle 样板；`ReportTuiState`、`SearchTuiState`、`SessionsTuiState` 实现该 trait。循环体缩减约 60 行，200ms poll 间隔统一。
+
 ## 2026-09-24
 
 - **request 预算闸门（spec 0027, ADR 0007）**：`request` 接受与报告命令同名的三个 flag（`--budget <source>:<amount>` 可重复、`--budget-window`（默认 `1d`）、`--budget-name` 可重复），但语义是**闸门而非注解**——在 payload 构建之前、联系任何 provider 之前评估一次；有预算已 `over` 就拒绝请求并退出 **3**（与 usage 错误 1、传输错误 2 并列），脚本能区分"被预算拦下"和"provider 失败"。没有任何 budget flag 时 `request` 逐字节不变。与报告命令相反：`--budget-name` 为空意味着**不采用**任何历史配置预算（静默继承会让 `request` 直接不可用），只有点名的才参与闸门；一次调用只闸一次，`--interactive` 的后续回合不重闸。
@@ -11,6 +23,19 @@
 - **文档**：新增 `docs/specs/0027-request-cost-loop.md` 与 `docs/adr/0007-request-reads-usage-data.md`（姿态变化：闸门让*发送*决定依赖本地语料的读取，而 0008 的"`request` 对用量数据只读"约束字面仍成立——不写任何 Source；被拒替代方案是自建 spend ledger，理由是同一份花费的第二个真相源、重复 0012 已建立的日志、且等于让被测量的命令自己生产测量数）；README 的 `request` 节新增 **Budget gate: the cost-control loop** 小节（可跑示例、退出码 3 说明、`[request] log_dir` + `[price.gpt-4]` + `[budget.mine]` 完整 toml、`--log` 关闭时的警告、畸形行姿态），Sources 列表补 llmhelper 与其注册条件，Budgets 节改写为"报告命令 = 注解 / request = 闸门"并更新 `not measured` 表行；CONTEXT.md 的 Source 词条改为五个已知 Source、Cost 词条补"llmhelper 的 Cost 由 `[price.<model>]` 在读时算出"，`_Avoid_` 里说明 `[price]` 表是费率而非 Cost。
 - 双轴 code-review 后落地：README 退出码释文校正（1 = 坏 flag / provider 非 2xx / 响应不可解析，2 = 连接层），`log_dir` 解析收敛为单一函数。经核查**否决**两条结论：闸门 registry"绕过缓存"（记录级 `load()` 本就不查缓存，ADR 0005 只覆盖消息抽取）、流式/交互存在日志缺口（`7cd5852` 即如此，且 spec 声明日志格式不变）。
 - 门禁：`cargo test` 758 全通过——lib 467 → 491（+24：price 5、config 4、llmhelper Source 12、`over_budget` 3），`tests/request.rs` 31 → 46（+15，含端到端闭环 `the_loop_closes_measure_gate_spend_log_remeasure`：$0.70 实际花费配 $0.01 上限 ⇒ exit 3 并打印 `refusing to send the request; no provider was contacted`，上限换成 $1000 ⇒ exit 0）。成本一律 `{:.6}`、`Over` 严格大于上限，与既有报告命令同契约；`cargo clippy --all-targets` 0 warning。
+
+## 2026-09-21
+
+- **search 匹配模式（spec 0026, ADR 0006）**：`search --match substring|regex|fuzzy`（默认 substring，逐字节不变）。`regex` 用 `regex = "1"`（RE2 线性时间，刻意无 lookaround/回溯——57 MB 级语料不被灾难性回溯暴露），`fuzzy` 用 `fuzzy-matcher = "0.3"`（SkimMatcherV2，Box 装箱进 Matcher enum 以过 clippy large_enum_variant，每 run 构建一次）。引擎核心是 `Matcher::compile(mode, query, case_sensitive)`（仅 regex 可失败）+ `evaluate(text) -> MatchOutcome{count, span, score}`，三个模式各自一次遍历。
+- 计数与排序语义按模式分流：substring/regex 数非重叠出现（`find_iter` 与既有 find 计数同契约），fuzzy 诚实地恒为 1、相关性在 `score: Option<i64>`（仅 fuzzy 为 `Some`，序列化时跳过 `None`、绝不渲染成 0）；主排序键 count desc / score desc，时间戳/source/session tiebreaker 不变，各模式下全序确定。snippet 改为字节 span（substring=首命中、regex=首 span、fuzzy=首尾匹配字符的字符索引映射回字节），换行拍平与 `…` 标记不变，`--context` 全模式生效。
+- **输出字节恒等按模式门控**（spec 核心 compat 承诺）：substring run 的 JSON 无 `match` 键、hit 无 `score` 字段、CSV 无 score 列、TUI 无新 span——由集成测试机械锁定；非默认模式只在挣到时加三样：JSON `"match"` 键、fuzzy 的 `score` 字段/CSV 列（compare 的 `budget_state` 条件列同款规则）、TUI 头部 `match:regex`/`match:fuzzy` span（fuzzy 时命中表数字列头切换为 score）。
+- **regex 在参数验证期编译、任何 Source 发现之前**：坏模式毫秒级退出 1，`Error: invalid --match regex: <regex 错误>`，stderr 无 `warn:` 漏斗行（集成测试断言无 source 加载痕迹）；同一文本在 substring/fuzzy 下只是普通查询（flag 而非文本决定是否模式错误）。**空查询守卫先于一切模式**：空 regex 在引擎内合法且匹配一切，会把忘传参数变成全语料转储，故沿用既有 `query must not be empty` 验证、模式构造之前拦截。
+- **缓存（ADR 0005）零改动**：匹配发生在抽取之后，指纹索引不感知模式；0025 的冷/热逐字节恒等护栏按非默认模式重跑（`--match regex`/`--match fuzzy` 各一个 `*_is_byte_identical_with_and_without_the_cache`），退出码不变（各模式空结果仍 exit 0），诊断漏斗永不出现模式字样（漏斗数的是消息不是命中）。
+- 测试 707 → 737（+30）：单测 24 个新引擎用例（各模式 match/no-match、alternation 计数、多字节、大小写×模式、span 起点/终点/跨行、regex 按 count 排序、fuzzy 按 score 排序 + **非空洞排序守卫**（两个命中 matches 同为 1、时间戳方向与 score 相反——若 score 键被静默忽略，tiebreaker 会让断言翻转；两个 fixture 文本都是模式真子序列，scorer 给紧密连续者 91 分、宽间隙者 76 分）、空查询守卫、score 仅 fuzzy 为 Some）；集成 +13（`--match regex` 端到端、fuzzy score 有序、每模式 `--case-sensitive`、组合 `--role/--project/--since`、坏 regex 精确 stderr 且无 source 警告、`--json/--csv/--text` 各模式形状、CSV score 列仅在 fuzzy、substring 无新键/字段、空结果各模式 exit 0）；缓存集成 +2（regex/fuzzy 冷热逐字节恒等）。修复测试期间发现的自身问题：`run_search_raw` helper 写死 `--json` 与 `--csv`/`--text` 冲突（重构为全 flag 列表参数）；CSV 断言按引号包裹 snippet 的真实列数放宽；`regrx` fuzzy 命中的真实角色是 user/thinking（先探针验证 fixture 再写断言）。
+- **文档**：新增 `docs/adr/0006-search-match-modes.md`（三个 load-bearing 决策：默认模式即旧代码非新模式、计数各模式诚实、RE2-on-purpose + 验证期编译；smart-case 被拒——结果不应依赖查询自身大小写，`--case-sensitive` 已存在且全模式可组合；fuzzy-matcher 2020 年后未更仍接受——纯算法 crate，Matcher seam 把换实现风险圈住）；spec 0010 Out-of-Scope 补 0026 指针（glob/typo-tolerance 仍 parked）；README search 节加两个可跑示例（`--match regex "cach(e|e)|401"`、`--match fuzzy "cacheinvaldaton"`）、TUI 行为与 flags 行补 `--match`；CONTEXT.md Language 节新增 **Match Mode** 术语（含"主排序键随模式""fuzzy `matches:1` + score""输出增量按模式挣得""模式不改语料/过滤器/退出码/缓存"）。
+- 实测（release 构建，真实语料 15,174 条消息，暖缓存）：substring `cache` 1.82–1.86 s、regex 0.39–0.41 s、fuzzy 1.24–1.26 s（冷 +0.1 s 量级）；regex 模式带 alternation `cach(e|e)` 与字面 `cache` 同量级——RE2 线性时间的直接体现。debug 构建下 substring 13.7 s、fuzzy 9.4 s、regex 1.45 s（同一量级差，数字仅相对参考）。
+- 逐项 smoke（release, 真实数据）：substring/fuzzy/regex 各模式 `--text` 前 3 行命中与 `--json` hits/match/score 结构逐项对上（regex `cach(e|e)` 100 hits、fuzzy `cacheinvaldaton` 100 hits 且 score 降序、substring 211/192… 与 regex `matches` 数完全一致——两模式同语料同查询同计数）；坏 regex `[unclosed` exit 1 且 stderr 为 `Error: invalid --match regex: regex parse error: … unclosed character class`，无任何 `warn:` 行。
+- 门禁：`cargo test` 737 全通过（lib 470、cache 16、集成 113、watch 21、export 26、explain 19、request 31、trend 22、compare 18、omp 1 等），`cargo clippy --all-targets -- -D warnings` 0 warning，`cargo fmt --check` 干净。新增依赖 `regex = "1"`、`fuzzy-matcher = "0.3"`。
 
 ## 2026-09-15
 

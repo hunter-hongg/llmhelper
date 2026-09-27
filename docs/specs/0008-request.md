@@ -1,9 +1,9 @@
 ---
 id: 0008
 title: "request — OpenAI Compatible request command"
-status: ready-for-agent
+status: done
 created: 2026-09-07
-triage: ready-for-agent
+triage: done
 ---
 
 ## Problem Statement

@@ -257,6 +257,39 @@ impl From<SortByArg> for crate::compare::SortBy {
     }
 }
 
+/// How `search` interprets its query (spec 0026). `substring` is the default
+/// and reproduces today's behaviour byte for byte.
+#[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
+pub enum MatchModeArg {
+    /// Literal case-insensitive substring matching (the default).
+    #[default]
+    Substring,
+    /// Interpret the query as an RE2-style regular expression.
+    Regex,
+    /// Rank by fzf-style subsequence score instead of match count.
+    Fuzzy,
+}
+
+impl std::fmt::Display for MatchModeArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Substring => write!(f, "substring"),
+            Self::Regex => write!(f, "regex"),
+            Self::Fuzzy => write!(f, "fuzzy"),
+        }
+    }
+}
+
+impl From<MatchModeArg> for crate::search::MatchMode {
+    fn from(v: MatchModeArg) -> Self {
+        match v {
+            MatchModeArg::Substring => Self::Substring,
+            MatchModeArg::Regex => Self::Regex,
+            MatchModeArg::Fuzzy => Self::Fuzzy,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
 pub enum SourceArg {
     #[default]
@@ -1427,6 +1460,11 @@ pub struct SearchArgs {
     #[arg(long = "role")]
     pub role: Option<String>,
 
+    /// How to interpret the query: substring (default, literal text), regex
+    /// (RE2-style pattern), or fuzzy (fzf-style subsequence scoring).
+    #[arg(long = "match", value_enum, default_value_t = MatchModeArg::Substring)]
+    pub match_mode: MatchModeArg,
+
     /// Match the query with case sensitivity. Case-insensitive by default.
     #[arg(long = "case-sensitive")]
     pub case_sensitive: bool,
@@ -1489,6 +1527,16 @@ impl SearchArgs {
         }
         if self.limit == 0 {
             anyhow::bail!("--limit must be at least 1");
+        }
+        // Compile the regex at validation time, before any source is read: a
+        // bad pattern must fail loudly in milliseconds, never masquerade as
+        // "no matches". The engine's own constructor is shared, so what is
+        // validated here is exactly what the search will compile.
+        // substring and fuzzy never fail here.
+        if self.match_mode == MatchModeArg::Regex {
+            if let Err(e) = crate::search::compile_pattern(self.query.trim(), self.case_sensitive) {
+                anyhow::bail!("invalid --match regex: {e}");
+            }
         }
         Ok(())
     }

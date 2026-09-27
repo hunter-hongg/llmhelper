@@ -1,9 +1,9 @@
 ---
 id: 0014
 title: "export — flat record dump for downstream tools"
-status: ready-for-agent
+status: done
 created: 2026-09-12
-triage: ready-for-agent
+triage: done
 ---
 
 ## Problem Statement

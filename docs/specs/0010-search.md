@@ -1,10 +1,10 @@
 ---
 id: 0010
 title: "search — full-text search across session transcripts"
-status: ready-for-agent
+status: done
 created: 2026-09-09
-updated: 2026-09-10
-triage: ready-for-agent
+updated: 2026-09-25
+triage: done
 ---
 
 ## Problem Statement
@@ -63,7 +63,8 @@ Search is implemented as a pure, independently testable function over an in-memo
 ## Out of Scope
 
 - **Message-level transcript browsing or export** with no query — that remains out of scope for `sessions` and is a separate future command.
-- **Regex, glob, fuzzy, and typo-tolerant matching.** Substring only in this iteration.
+- **Regex and fuzzy matching** are built as match modes: see spec 0026.
+  **Glob and typo-tolerant matching** remain out of scope.
 - **Semantic or embedding-based search.** No vector store, no model calls.
 - **Tool output and code diff search.** `toolResult`, `tool_use`, `patch`, and `image` parts are excluded from the corpus.
 - **Cross-session ranking or relevance scoring** beyond match count and recency.

@@ -27,6 +27,15 @@ impl ReportTuiState {
     }
 }
 
+impl crate::tui::TuiLoopState for ReportTuiState {
+    fn is_running(&self) -> bool {
+        self.running
+    }
+    fn quit(&mut self) {
+        ReportTuiState::quit(self);
+    }
+}
+
 impl Scrollable for ReportTuiState {
     fn scroll(&self) -> usize {
         self.scroll

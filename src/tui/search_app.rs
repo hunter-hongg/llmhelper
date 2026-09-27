@@ -1,5 +1,5 @@
 use crate::cache::CacheStats;
-use crate::search::SearchHit;
+use crate::search::{MatchMode, SearchHit};
 use crate::source::MessageStatus;
 use crate::tui::list_detail::{ListDetail, ViewSwitcher};
 use crate::tui::scroll::Scrollable;
@@ -39,6 +39,9 @@ pub struct SearchTuiState {
     pub list: ListDetail<SearchHit, SearchView>,
     pub query: String,
     pub case_sensitive: bool,
+    /// How the query is interpreted (spec 0026): drives the header's mode
+    /// span and the hit table's score column, only when not the default.
+    pub match_mode: MatchMode,
     pub role: Option<String>,
     /// `--project`/`--model`/`--since`/`--last`/`--source`/`--limit`/`--context`
     /// as one line, so a scoped search never looks unscoped on screen.
@@ -57,6 +60,7 @@ impl SearchTuiState {
     pub fn new(
         query: String,
         case_sensitive: bool,
+        match_mode: MatchMode,
         role: Option<String>,
         filters: String,
         data: SearchData,
@@ -68,6 +72,7 @@ impl SearchTuiState {
             list: ListDetail::new(),
             query,
             case_sensitive,
+            match_mode,
             role,
             filters,
             message_statuses: data.message_statuses,
@@ -141,6 +146,15 @@ impl Scrollable for SearchTuiState {
     }
 }
 
+impl crate::tui::TuiLoopState for SearchTuiState {
+    fn is_running(&self) -> bool {
+        self.list.running
+    }
+    fn quit(&mut self) {
+        self.list.quit();
+    }
+}
+
 /// Word-wrap `text` to `width` characters, preserving explicit newlines and
 /// hard-splitting words that are longer than the width.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -192,13 +206,14 @@ impl SearchTuiApp {
     pub fn new(
         query: String,
         case_sensitive: bool,
+        match_mode: MatchMode,
         role: Option<String>,
         filters: String,
         data: SearchData,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             terminal: super::terminal::enter()?,
-            state: SearchTuiState::new(query, case_sensitive, role, filters, data),
+            state: SearchTuiState::new(query, case_sensitive, match_mode, role, filters, data),
         })
     }
     pub fn exit(&mut self) -> anyhow::Result<()> {
@@ -220,6 +235,7 @@ mod tests {
             role: "assistant".to_string(),
             timestamp: Some(DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::minutes(id as i64)),
             matches,
+            score: None,
             snippet: text.to_string(),
             text: text.to_string(),
         }
@@ -229,6 +245,7 @@ mod tests {
         let mut state = SearchTuiState::new(
             "query".to_string(),
             false,
+            MatchMode::Substring,
             None,
             String::new(),
             SearchData {

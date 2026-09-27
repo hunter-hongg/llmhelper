@@ -1,9 +1,9 @@
 ---
 id: 0013
 title: "request — reasoning (thinking) capture and streaming"
-status: ready-for-agent
+status: done
 created: 2026-09-11
-triage: ready-for-agent
+triage: done
 ---
 
 ## Problem Statement

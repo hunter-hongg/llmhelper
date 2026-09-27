@@ -1,3 +1,11 @@
+---
+id: 0020
+title: "Why did I get no results? (filter diagnostics)"
+status: done
+created: 2026-09-03
+updated: 2026-09-25
+triage: done
+---
 # 0020 — Why did I get no results? (filter diagnostics)
 
 ## Problem

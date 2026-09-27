@@ -331,10 +331,14 @@ Full-text search across agent session message text.
 ```bash
 llmhelper search "cache invalidation"
 llmhelper search --last 7d --source omp --role assistant "refactor"
+llmhelper search --match regex "cach(e|e)|401"      # RE2-style patterns
+llmhelper search --match fuzzy "cacheinvaldaton"    # typo-tolerant recall
 ```
-Without `--json`/`--csv`/`--text`, `search` opens an interactive TUI: select a hit and press `Enter` for the message detail, `Esc` to return, `↑↓`/`j k` to move, `g`/`G` for top/bottom, `r` to rerun, `q` to quit. The header shows the query plus any non-default active filters.
+Without `--json`/`--csv`/`--text`, `search` opens an interactive TUI: select a hit and press `Enter` for the message detail, `Esc` to return, `↑↓`/`j k` to move, `g`/`G` for top/bottom, `r` to rerun, `q` to quit. The header shows the query plus any non-default active filters (`match:regex` / `match:fuzzy` appears when the mode is not the default; in fuzzy mode the hit table's numeric column becomes the relevance score).
 
-Flags: `--source`, `--project`, `--model`, `--role`, `--since`/`--last`, `--context` (snippet context, default 80), `--limit` (default 100), `--case-sensitive`, `--json`/`--csv`/`--text`, `--explain`. Messages without a timestamp never match a time filter. Tool output and image/patch blocks are excluded from the searchable corpus.
+`--match` selects how the query is interpreted: `substring` (the default — literal text, ranked by occurrence count), `regex` (RE2-style patterns — linear-time, no lookaround or backreferences; a bad pattern fails validation before any source is read with `invalid --match regex: …` and exit 1), or `fuzzy` (fzf-style subsequence scoring, ranked by score; each hit reports `matches: 1` and its `score`). All modes honour `--case-sensitive`, `--limit`, `--context`, and the record filters. Non-default modes add output only where it changes something: a `"match"` key in JSON, a `score` field/column under fuzzy — substring output stays byte-identical.
+
+Flags: `--source`, `--project`, `--model`, `--role`, `--since`/`--last`, `--context` (snippet context, default 80), `--limit` (default 100), `--match <substring|regex|fuzzy>`, `--case-sensitive`, `--json`/`--csv`/`--text`, `--explain`. Messages without a timestamp never match a time filter. Tool output and image/patch blocks are excluded from the searchable corpus.
 
 #### Message cache
 
@@ -448,10 +452,10 @@ across Sources. Claude Code records no Cost at all, and a model with no
 rather than a misleading `ok`.
 
 Budget flags are accepted by `report`, `usage`, `compare` — and, as a gate, by
-`request`. The annotation appears in the
-report Markdown (including `report --output`) and in the `usage` TUI;
-`usage --json`/`--csv` still validate the flags but emit no budget data, since
-those are machine formats with a fixed shape.
+`request`. The annotation appears in the `report` Markdown (including
+`report --output`), the `usage` TUI, and the `compare` table/JSON/CSV output
+(when budgets are configured); `usage --json`/`--csv` still validate the flags
+but emit no budget data, since those are machine formats with a fixed shape.
 
 ### Declaring a budget
 

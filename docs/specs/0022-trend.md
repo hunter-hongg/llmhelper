@@ -1,9 +1,9 @@
 ---
 id: 0022
 title: "trend — usage bucketed over time"
-status: in-progress
+status: done
 created: 2026-09-15
-updated: 2026-09-15
+updated: 2026-09-25
 triage: done
 ---
 ## Problem Statement

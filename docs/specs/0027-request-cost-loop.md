@@ -1,10 +1,10 @@
 ---
 id: 0027
 title: "request — cost-control closed loop: budget gate and the request log as a Source"
-status: ready-for-agent
+status: done
 created: 2026-09-22
-updated: 2026-09-22
-triage: ready-for-agent
+updated: 2026-09-25
+triage: done
 ---
 
 ## Problem Statement

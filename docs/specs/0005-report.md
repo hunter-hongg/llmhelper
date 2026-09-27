@@ -1,9 +1,9 @@
 ---
 id: 0005
 title: "report — shareable Markdown usage summary"
-status: ready-for-agent
+status: done
 created: 2026-09-06
-triage: ready-for-agent
+triage: done
 ---
 
 ## Problem Statement

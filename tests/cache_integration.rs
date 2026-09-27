@@ -183,6 +183,59 @@ fn search_json_is_byte_identical_with_and_without_the_cache() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Spec 0026: the byte-identity contract holds in every match mode — the
+/// corpus may rank differently, but cached and uncached runs of the same
+/// query must never differ by a byte.
+#[test]
+fn search_regex_json_is_byte_identical_with_and_without_the_cache() {
+    let dir = temp_cache_dir("search-regex-identical");
+    let config = config_pointing_at(&dir, &dir);
+
+    let args = &["--json", "--match", "regex", "cach(e|e)"];
+    let cold = run_with_config("search", &config, args);
+    let cached = run_with_config("search", &config, args);
+    let uncached = run_with_config(
+        "search",
+        &config,
+        &["--json", "--no-cache", "--match", "regex", "cach(e|e)"],
+    );
+
+    let cached_out = stdout_of(&cached, "search regex (warm cache)");
+    assert_eq!(stdout_of(&cold, "search regex (cold cache)"), cached_out);
+    assert_eq!(
+        cached_out,
+        stdout_of(&uncached, "search regex (--no-cache)"),
+        "a cached regex search must be byte-identical to an uncached one"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn search_fuzzy_json_is_byte_identical_with_and_without_the_cache() {
+    let dir = temp_cache_dir("search-fuzzy-identical");
+    let config = config_pointing_at(&dir, &dir);
+
+    let args = &["--json", "--match", "fuzzy", "cachwrit"];
+    let cold = run_with_config("search", &config, args);
+    let cached = run_with_config("search", &config, args);
+    let uncached = run_with_config(
+        "search",
+        &config,
+        &["--json", "--no-cache", "--match", "fuzzy", "cachwrit"],
+    );
+
+    let cached_out = stdout_of(&cached, "search fuzzy (warm cache)");
+    assert_eq!(stdout_of(&cold, "search fuzzy (cold cache)"), cached_out);
+    assert_eq!(
+        cached_out,
+        stdout_of(&uncached, "search fuzzy (--no-cache)"),
+        "a cached fuzzy search must be byte-identical to an uncached one"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The same byte-identity guard for `export --messages`, the other
 /// message-reading command.
 #[test]
@@ -605,9 +658,7 @@ fn refresh_cache_rebuilds_even_when_the_index_cannot_be_deleted() {
         stderr
             .lines()
             .find(|l| l.contains("cache:"))
-            .unwrap_or_else(|| {
-                panic!("--refresh-cache run did not report cache stats: {stderr}")
-            }),
+            .unwrap_or_else(|| panic!("--refresh-cache run did not report cache stats: {stderr}")),
         "files reused",
     )
     .unwrap_or_else(|| panic!("--refresh-cache run did not report reuse: {stderr}"));
@@ -708,8 +759,7 @@ fn deleting_a_source_file_drops_its_index_entry() {
         .map(|f| std::fs::read_to_string(f).unwrap_or_default())
         .collect::<Vec<_>>()
         .join("\n");
-    let deleted =
-        std::fs::canonicalize(&victim).unwrap_or_else(|_| victim.clone());
+    let deleted = std::fs::canonicalize(&victim).unwrap_or_else(|_| victim.clone());
     assert!(
         !body.contains(&deleted.to_string_lossy().to_string()),
         "the deleted file's entry survived the rewrite: {body}"
@@ -751,7 +801,8 @@ fn an_empty_corpus_prunes_only_its_own_index() {
     cmd.arg("--opencode-db")
         .arg(fixture_dir().join("opencode").join("opencode.db"));
     cmd.arg("--omp-dir").arg(fixture_dir().join("omp"));
-    cmd.arg("--kilo-db").arg(fixture_dir().join("kilo").join("kilo.db"));
+    cmd.arg("--kilo-db")
+        .arg(fixture_dir().join("kilo").join("kilo.db"));
     let output = cmd.output().expect("run llmhelper");
     assert!(
         output.status.success(),
@@ -769,10 +820,7 @@ fn an_empty_corpus_prunes_only_its_own_index() {
         })
         .map(|(_, body)| body)
         .unwrap_or_default();
-    let claude_lines = claude_body
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .count();
+    let claude_lines = claude_body.lines().filter(|l| !l.trim().is_empty()).count();
     assert_eq!(
         claude_lines, 0,
         "an empty corpus must prune its own Source's index: {claude_body}"

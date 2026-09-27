@@ -1,9 +1,9 @@
 ---
 id: 0004
 title: "usage — Agent drill-down detail view"
-status: ready-for-agent
+status: done
 created: 2026-09-05
-triage: ready-for-agent
+triage: done
 ---
 
 ## Problem Statement

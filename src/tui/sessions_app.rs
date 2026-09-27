@@ -57,6 +57,15 @@ impl SessionsTuiState {
     }
 }
 
+impl crate::tui::TuiLoopState for SessionsTuiState {
+    fn is_running(&self) -> bool {
+        self.list.running
+    }
+    fn quit(&mut self) {
+        self.list.quit();
+    }
+}
+
 pub struct SessionsTuiApp {
     pub terminal: super::terminal::StdoutTerminal,
     pub state: SessionsTuiState,

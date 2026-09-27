@@ -1,4 +1,7 @@
 use chrono::{DateTime, Utc};
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::message::Message;
@@ -9,10 +12,42 @@ pub const DEFAULT_CONTEXT: usize = 80;
 /// Default hit cap.
 pub const DEFAULT_LIMIT: usize = 100;
 
+/// How the query is interpreted.
+///
+/// The CLI carries the clap mirror (`MatchModeArg`), the same layering as
+/// `SortBy`/`SortByArg`: the engine speaks in domain terms, the CLI in flags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MatchMode {
+    /// Literal substring — today's behaviour, byte-frozen. The default.
+    #[default]
+    Substring,
+    /// RE2-style regular expression (`regex` crate). No lookaround and no
+    /// backreferences: linear-time matching over the whole corpus is the
+    /// safety property, not a limitation to apologize for.
+    Regex,
+    /// fzf/skim-style in-order subsequence scoring (`fuzzy-matcher` crate).
+    /// A message either fuzzy-matches once or not at all; how *well* it
+    /// matched lives in `SearchHit::score`.
+    Fuzzy,
+}
+
+impl MatchMode {
+    /// The name used in the JSON payload's gated `match` key and the TUI
+    /// header span. Stable output contract: do not reword.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Substring => "substring",
+            Self::Regex => "regex",
+            Self::Fuzzy => "fuzzy",
+        }
+    }
+}
+
 /// Options for a full-text search over a message corpus.
 #[derive(Clone, Debug)]
 pub struct SearchOptions {
     pub query: String,
+    pub match_mode: MatchMode,
     pub case_sensitive: bool,
     pub role: Option<String>,
     pub context: usize,
@@ -23,6 +58,7 @@ impl Default for SearchOptions {
     fn default() -> Self {
         Self {
             query: String::new(),
+            match_mode: MatchMode::default(),
             case_sensitive: false,
             role: None,
             context: DEFAULT_CONTEXT,
@@ -44,6 +80,11 @@ pub struct SearchHit {
     pub role: String,
     pub timestamp: Option<DateTime<Utc>>,
     pub matches: usize,
+    /// Fuzzy relevance score. `Some` only for fuzzy hits — substring and
+    /// regex hits count occurrences and carry no score, so serialization
+    /// omits the key entirely and ordinary payloads gain nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<i64>,
     pub snippet: String,
     pub text: String,
 }
@@ -87,6 +128,27 @@ fn find_ci(text: &str, query: &str) -> Option<usize> {
     Some(map[idx])
 }
 
+/// Byte span (start, end) of the first occurrence of `query` in `text`.
+///
+/// The end is the offset past the next `query.chars().count()` characters of
+/// the original text — the same approximation today's snippet has always made,
+/// kept here so the substring path stays byte-frozen.
+fn find_span(text: &str, query: &str, case_sensitive: bool) -> Option<(usize, usize)> {
+    let start = if case_sensitive {
+        text.find(query)
+    } else {
+        find_ci(text, query)
+    }?;
+    let qlen = query.chars().count();
+    let end = start
+        + text[start..]
+            .chars()
+            .take(qlen)
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
+    Some((start, end))
+}
+
 /// Count every non-overlapping occurrence of `query` in `text`.
 /// Case sensitivity follows `case_sensitive`.
 pub fn count_matches(text: &str, query: &str, case_sensitive: bool) -> usize {
@@ -109,28 +171,142 @@ pub fn count_matches(text: &str, query: &str, case_sensitive: bool) -> usize {
     count
 }
 
-/// Single-line excerpt of `text` centred on its first match.
+/// What one matcher pass concluded about one text.
+struct MatchOutcome {
+    /// Non-overlapping occurrence count. Fuzzy matches count as exactly 1.
+    count: usize,
+    /// Byte span of the first match; `Some` exactly when `count > 0`.
+    span: Option<(usize, usize)>,
+    /// Fuzzy relevance score; `None` for substring and regex.
+    score: Option<i64>,
+}
+
+/// One compiled matcher, built once per run and reused for every message.
+enum Matcher {
+    Substring {
+        needle: String,
+        case_sensitive: bool,
+    },
+    Regex {
+        re: Regex,
+    },
+    Fuzzy {
+        // Boxed because SkimMatcherV2 carries ~1.6 KB of scoring caches —
+        // it is built once per run, so the indirection is free and keeps the
+        // enum one pointer wide-ish.
+        matcher: Box<SkimMatcherV2>,
+        pattern: String,
+    },
+}
+
+/// Compile a pattern-matching-mode regex with the run's case setting.
+///
+/// CLI validation and the engine share this one constructor: the pattern the
+/// CLI lets through is compiled by exactly the code that will search with it,
+/// so a settings drift can never make a rejected-anyway pattern reach the
+/// engine's fail-closed empty result (ADR 0006).
+pub fn compile_pattern(query: &str, case_sensitive: bool) -> Result<Regex, regex::Error> {
+    RegexBuilder::new(query)
+        .case_insensitive(!case_sensitive)
+        .build()
+}
+
+impl Matcher {
+    /// Compile the matcher for one run. Only the regex mode can fail; the
+    /// CLI surfaces that error at validation time, before any source is read.
+    fn compile(mode: MatchMode, query: &str, case_sensitive: bool) -> Result<Self, regex::Error> {
+        Ok(match mode {
+            MatchMode::Substring => Self::Substring {
+                needle: query.to_string(),
+                case_sensitive,
+            },
+            MatchMode::Regex => Self::Regex {
+                re: compile_pattern(query, case_sensitive)?,
+            },
+            MatchMode::Fuzzy => {
+                // Explicit case configuration, never smart-case: the same
+                // explicit contract as the substring mode.
+                let matcher = if case_sensitive {
+                    SkimMatcherV2::default().respect_case()
+                } else {
+                    SkimMatcherV2::default().ignore_case()
+                };
+                Self::Fuzzy {
+                    matcher: Box::new(matcher),
+                    pattern: query.to_string(),
+                }
+            }
+        })
+    }
+
+    /// Match one text. One pass per mode: the fuzzy scorer runs once (its
+    /// indices also produce the span), the regex iterates its matches once
+    /// recording the first span, the substring path reuses the frozen helpers.
+    fn evaluate(&self, text: &str) -> MatchOutcome {
+        match self {
+            Self::Substring {
+                needle,
+                case_sensitive,
+            } => MatchOutcome {
+                count: count_matches(text, needle, *case_sensitive),
+                span: find_span(text, needle, *case_sensitive),
+                score: None,
+            },
+            Self::Regex { re } => {
+                let mut count = 0;
+                let mut span = None;
+                for m in re.find_iter(text) {
+                    if span.is_none() {
+                        span = Some((m.start(), m.end()));
+                    }
+                    count += 1;
+                }
+                MatchOutcome {
+                    count,
+                    span,
+                    score: None,
+                }
+            }
+            Self::Fuzzy { matcher, pattern } => match matcher.fuzzy_indices(text, pattern) {
+                Some((score, indices)) if !indices.is_empty() => {
+                    // The span covers the first through last matched character,
+                    // mapped back to byte offsets.
+                    let lo = *indices.iter().min().unwrap();
+                    let hi = *indices.iter().max().unwrap();
+                    let mut span = None;
+                    for (char_idx, (byte_off, c)) in text.char_indices().enumerate() {
+                        if char_idx == lo {
+                            span = Some((byte_off, byte_off + c.len_utf8()));
+                        } else if char_idx == hi {
+                            span = span.map(|(s, _)| (s, byte_off + c.len_utf8()));
+                        }
+                    }
+                    MatchOutcome {
+                        count: 1,
+                        span,
+                        score: Some(score),
+                    }
+                }
+                _ => MatchOutcome {
+                    count: 0,
+                    span: None,
+                    score: None,
+                },
+            },
+        }
+    }
+}
+
+/// Single-line excerpt of `text` centred on the byte span `start..end`.
 ///
 /// The window is `context` characters around the whole match, not just around
-/// its start, so a long query is never cut off by its own snippet. Newlines
+/// its start, so a long match is never cut off by its own snippet. Newlines
 /// become spaces so the result fits one table cell. Either end is marked with
-/// `…` only when text was actually elided from that side. When nothing matches,
-/// the head of the text is returned instead.
-pub fn snippet(text: &str, query: &str, case_sensitive: bool, context: usize) -> String {
-    let start = if case_sensitive {
-        text.find(query)
-    } else {
-        find_ci(text, query)
-    };
+/// `…` only when text was actually elided from that side.
+pub fn snippet_at(text: &str, start: usize, end: usize, context: usize) -> String {
+    let char_start = text[..start].chars().count();
+    let matched = text[start..end].chars().count();
     let chars: Vec<char> = text.chars().collect();
-    // (char offset of the match, chars consumed by it).
-    let (char_start, matched) = match start {
-        Some(o) => (
-            text[..o].chars().count(),
-            text[o..].chars().take(query.chars().count()).count(),
-        ),
-        None => (0, 0),
-    };
     let win_start = char_start.saturating_sub(context);
     let win_end = (char_start + matched + context).min(chars.len());
     let prefix = if win_start > 0 { "…" } else { "" };
@@ -144,15 +320,35 @@ pub fn snippet(text: &str, query: &str, case_sensitive: bool, context: usize) ->
     )
 }
 
+/// Substring-mode convenience wrapper around [`snippet_at`]: resolves the
+/// first occurrence's span, and when nothing matches, returns the head of the
+/// text instead — exactly the historical behaviour, kept for its tests.
+pub fn snippet(text: &str, query: &str, case_sensitive: bool, context: usize) -> String {
+    match find_span(text, query, case_sensitive) {
+        Some((start, end)) => snippet_at(text, start, end, context),
+        None => snippet_at(text, 0, 0, context),
+    }
+}
+
 /// Rank all matching messages and cap the result at `options.limit`.
 ///
-/// Ranking is match count descending, then timestamp descending, with source
-/// and session id as stable tiebreakers so output order is deterministic.
+/// The ranking primary key follows the mode: fuzzy ranks by relevance score
+/// descending, substring and regex by match count descending. The remaining
+/// tiebreakers are unchanged in every mode — timestamp descending, then
+/// source, then session id — so output order stays deterministic.
 pub fn search(messages: &[Message], options: &SearchOptions) -> Vec<SearchHit> {
     let query = options.query.trim();
     if query.is_empty() {
         return Vec::new();
     }
+    // The CLI compiles the regex at validation time and fails loudly; at the
+    // engine level an invalid pattern matches nothing (fail closed) — the
+    // corpus is never searched with a broken pattern.
+    let matcher = match Matcher::compile(options.match_mode, query, options.case_sensitive) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let rank_by_score = options.match_mode == MatchMode::Fuzzy;
     let mut hits: Vec<SearchHit> = messages
         .iter()
         .filter(|m| {
@@ -162,10 +358,11 @@ pub fn search(messages: &[Message], options: &SearchOptions) -> Vec<SearchHit> {
                 .is_none_or(|r| m.role.eq_ignore_ascii_case(r))
         })
         .filter_map(|m| {
-            let matches = count_matches(&m.text, query, options.case_sensitive);
-            if matches == 0 {
+            let outcome = matcher.evaluate(&m.text);
+            if outcome.count == 0 {
                 return None;
             }
+            let (start, end) = outcome.span?;
             Some(SearchHit {
                 source: m.source.clone(),
                 session_id: m.session_id.clone(),
@@ -173,15 +370,22 @@ pub fn search(messages: &[Message], options: &SearchOptions) -> Vec<SearchHit> {
                 model: m.model.clone(),
                 role: m.role.clone(),
                 timestamp: m.timestamp,
-                matches,
-                snippet: snippet(&m.text, query, options.case_sensitive, options.context),
+                matches: outcome.count,
+                score: outcome.score,
+                snippet: snippet_at(&m.text, start, end, options.context),
                 text: m.text.clone(),
             })
         })
         .collect();
     hits.sort_by(|a, b| {
-        b.matches
-            .cmp(&a.matches)
+        let primary = if rank_by_score {
+            b.score
+                .unwrap_or(i64::MIN)
+                .cmp(&a.score.unwrap_or(i64::MIN))
+        } else {
+            b.matches.cmp(&a.matches)
+        };
+        primary
             .then_with(|| b.timestamp.cmp(&a.timestamp))
             .then_with(|| a.source.cmp(&b.source))
             .then_with(|| a.session_id.cmp(&b.session_id))
@@ -214,6 +418,13 @@ mod tests {
         SearchOptions {
             query: query.to_string(),
             ..Default::default()
+        }
+    }
+
+    fn opts_mode(query: &str, mode: MatchMode) -> SearchOptions {
+        SearchOptions {
+            match_mode: mode,
+            ..opts(query)
         }
     }
 
@@ -277,6 +488,25 @@ mod tests {
         assert!(s.contains("no match"));
         assert!(s.ends_with('…'));
         assert!(!s.starts_with('…'));
+    }
+
+    #[test]
+    fn snippet_wrapper_matches_the_span_core_for_substring() {
+        // The wrapper and the span core must agree for every matched span, so
+        // the engine's snippets cannot drift from the historical ones.
+        for (text, query) in [
+            ("zebra is fast", "zebra"),
+            ("one two regex three four", "regex"),
+            ("alpha\nbeta\ngamma", "beta"),
+            ("Hello World", "hello"),
+            ("你好 你好 world", "你好"),
+        ] {
+            let (start, end) = find_span(text, query, false).unwrap();
+            assert_eq!(
+                snippet(text, query, false, 7),
+                snippet_at(text, start, end, 7)
+            );
+        }
     }
 
     #[test]
@@ -420,5 +650,176 @@ mod tests {
         };
         let hits = search(&[unts, one.clone()], &opts("word"));
         assert_eq!(hits[0].timestamp, with_ts.timestamp);
+    }
+
+    // ---- match modes (spec 0026) ----
+
+    #[test]
+    fn regex_alternation_counts_each_occurrence() {
+        let hits = search(
+            &[msg("a b a", "assistant")],
+            &opts_mode("a|b", MatchMode::Regex),
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].matches, 3);
+    }
+
+    #[test]
+    fn regex_word_boundary_excludes_longer_identifiers() {
+        let hits = search(
+            &[msg("parse_duration and parse_durations", "assistant")],
+            &opts_mode(r"\bparse_duration\b", MatchMode::Regex),
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].matches, 1);
+        // The snippet points at the first (unprefixed) occurrence.
+        assert!(hits[0].snippet.starts_with("parse_duration"));
+    }
+
+    #[test]
+    fn regex_is_case_insensitive_by_default_and_honours_the_flag() {
+        let text = "error Error ERROR";
+        let hits = search(
+            &[msg(text, "assistant")],
+            &opts_mode("ERROR", MatchMode::Regex),
+        );
+        assert_eq!(hits[0].matches, 3);
+        let cs = SearchOptions {
+            case_sensitive: true,
+            ..opts_mode("ERROR", MatchMode::Regex)
+        };
+        assert_eq!(search(&[msg(text, "assistant")], &cs)[0].matches, 1);
+    }
+
+    #[test]
+    fn regex_inline_flags_work_in_the_pattern() {
+        // Case sensitivity is off at the builder, but the pattern's own (?i)
+        // re-enables it — pattern-level control needs no extra flag.
+        let hits = search(
+            &[msg("Error during call", "assistant")],
+            &opts_mode("(?i)error", MatchMode::Regex),
+        );
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn regex_multibyte_snippet_lands_on_the_match() {
+        let hits = search(
+            &[msg("你好 regex 世界", "assistant")],
+            &opts_mode("regex", MatchMode::Regex),
+        );
+        assert!(hits[0].snippet.contains("你好 regex 世界"));
+    }
+
+    #[test]
+    fn regex_empty_match_pattern_counts_honestly_without_panic() {
+        // `x*` matches the empty string at every position: 4 matches in "abc".
+        let hits = search(
+            &[msg("abc", "assistant")],
+            &opts_mode("x*", MatchMode::Regex),
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].matches, 4);
+    }
+
+    #[test]
+    fn regex_and_substring_hits_carry_no_score() {
+        let messages = [msg("regex target", "assistant")];
+        for mode in [MatchMode::Substring, MatchMode::Regex] {
+            let hits = search(&messages, &opts_mode("target", mode));
+            assert_eq!(hits[0].score, None, "{mode:?} hits must have no score");
+        }
+    }
+
+    #[test]
+    fn invalid_regex_matches_nothing_at_engine_level() {
+        // Fail closed: the CLI rejects this at validation; the engine simply
+        // never searches with a broken pattern.
+        let messages = vec![msg("anything", "assistant")];
+        assert!(search(&messages, &opts_mode("[unclosed", MatchMode::Regex)).is_empty());
+    }
+
+    #[test]
+    fn fuzzy_hit_counts_once_and_carries_a_score() {
+        let hits = search(
+            &[msg("window filter handles time bounds", "assistant")],
+            &opts_mode("winflt", MatchMode::Fuzzy),
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].matches, 1);
+        assert!(hits[0].score.unwrap() > 0);
+        // The snippet spans the matched region (window filter...).
+        assert!(hits[0].snippet.contains("window filter"));
+    }
+
+    #[test]
+    fn fuzzy_no_match_produces_no_hit() {
+        let hits = search(
+            &[msg("nothing relevant here", "assistant")],
+            &opts_mode("zzzqqq", MatchMode::Fuzzy),
+        );
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn fuzzy_ranks_by_score_not_by_timestamp() {
+        // Both hits have matches == 1, so a score key that is silently ignored
+        // would fall through to the timestamp tiebreaker and flip this order.
+        // That flip is what makes this guard non-vacuous. Both texts contain
+        // the pattern as a subsequence; only the tight one is contiguous, and
+        // the scorer gives it the higher score (91 vs 76).
+        let tight = Message {
+            timestamp: Some(ts("2026-08-28T10:00:00+00:00")),
+            ..msg("abcd", "assistant")
+        };
+        let loose = Message {
+            timestamp: Some(ts("2026-08-28T11:00:00+00:00")),
+            ..msg("a quick brown cursor dance", "assistant")
+        };
+        let hits = search(&[loose, tight], &opts_mode("abcd", MatchMode::Fuzzy));
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].text, "abcd");
+        assert!(hits[0].score.unwrap() > hits[1].score.unwrap());
+    }
+
+    #[test]
+    fn fuzzy_case_follows_the_flag() {
+        let text = "window filter";
+        let hits = search(
+            &[msg(text, "assistant")],
+            &opts_mode("WIN", MatchMode::Fuzzy),
+        );
+        assert_eq!(hits.len(), 1, "insensitive by default, like substring");
+        let cs = SearchOptions {
+            case_sensitive: true,
+            ..opts_mode("WIN", MatchMode::Fuzzy)
+        };
+        assert!(search(&[msg(text, "assistant")], &cs).is_empty());
+    }
+
+    #[test]
+    fn mode_ranking_is_deterministic_across_runs() {
+        let messages = vec![
+            msg("word word word", "assistant"),
+            msg("word", "assistant"),
+            msg("other word here", "assistant"),
+        ];
+        for mode in [MatchMode::Substring, MatchMode::Regex, MatchMode::Fuzzy] {
+            let a = search(&messages, &opts_mode("word", mode));
+            let b = search(&messages, &opts_mode("word", mode));
+            assert_eq!(
+                a.iter().map(|h| &h.text).collect::<Vec<_>>(),
+                b.iter().map(|h| &h.text).collect::<Vec<_>>(),
+                "{mode:?} must rank deterministically"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mode_is_substring() {
+        assert_eq!(MatchMode::default(), MatchMode::Substring);
+        assert_eq!(MatchMode::default().as_str(), "substring");
+        assert_eq!(MatchMode::Regex.as_str(), "regex");
+        assert_eq!(MatchMode::Fuzzy.as_str(), "fuzzy");
     }
 }

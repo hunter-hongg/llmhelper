@@ -1,4 +1,4 @@
-use crate::search::SearchHit;
+use crate::search::{MatchMode, SearchHit};
 use crate::source::MessageStatus;
 use crate::tui::render::{
     source_color, ACCENT, ACCENT2, BG, BORDER, HILITE, MUTED, RED, SURFACE, TEXT, TITLE, YELLOW,
@@ -68,6 +68,12 @@ fn header_lines(state: &SearchTuiState) -> Vec<Line<'static>> {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
     ];
+    if state.match_mode != MatchMode::Substring {
+        query_spans.push(Span::styled(
+            format!("  match:{}", state.match_mode.as_str()),
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        ));
+    }
     if state.case_sensitive {
         query_spans.push(Span::styled(
             "  case-sensitive",
@@ -236,6 +242,17 @@ fn render_detail(hit: &SearchHit, state: &SearchTuiState) -> Paragraph<'static> 
         .scroll((state.scroll as u16, 0))
 }
 
+/// The numeric column's header: fuzzy ranks by relevance, so its column is the
+/// score; substring and regex keep the match count (spec 0026). Kept separate
+/// from [`render_table`] so the mode-gating is assertable without a terminal.
+fn numeric_column_header(mode: MatchMode) -> &'static str {
+    if mode == MatchMode::Fuzzy {
+        "Score"
+    } else {
+        "Match"
+    }
+}
+
 fn render_table(state: &mut SearchTuiState) -> Table<'static> {
     let block = panel("hits");
     let hits = &state.list.items;
@@ -248,7 +265,17 @@ fn render_table(state: &mut SearchTuiState) -> Table<'static> {
         .header(Row::new(vec![Cell::from("")]))
         .block(block);
     }
-    let headers = ["#", "Role", "Source", "Project", "Time", "Match", "Snippet"];
+    let match_header = numeric_column_header(state.match_mode);
+    let score_column = state.match_mode == MatchMode::Fuzzy;
+    let headers = [
+        "#",
+        "Role",
+        "Source",
+        "Project",
+        "Time",
+        match_header,
+        "Snippet",
+    ];
     let col_fg = [MUTED, ACCENT2, ACCENT2, TEXT, MUTED, YELLOW, TEXT];
     let col_right = [true, false, false, false, false, true, false];
     let col_widths = [
@@ -302,7 +329,19 @@ fn render_table(state: &mut SearchTuiState) -> Table<'static> {
                 Cell::new(h.source.clone()).style(style(source_color(&h.source))),
                 Cell::new(h.project.chars().take(26).collect::<String>()).style(style(TEXT)),
                 Cell::new(time).style(style(TEXT)),
-                Cell::from(Text::from(h.matches.to_string()).alignment(Alignment::Right)).style(
+                // Fuzzy shows the relevance score; substring and regex show
+                // the occurrence count. Fuzzy hits always carry a score, and
+                // the column only exists in fuzzy mode, so the fallback never
+                // prints for a real hit.
+                Cell::from(
+                    Text::from(if score_column {
+                        h.score.unwrap_or(0).to_string()
+                    } else {
+                        h.matches.to_string()
+                    })
+                    .alignment(Alignment::Right),
+                )
+                .style(
                     Style::default()
                         .fg(YELLOW)
                         .bg(row_bg)
@@ -328,6 +367,7 @@ mod tests {
         SearchTuiState::new(
             "hello".to_string(),
             false,
+            MatchMode::Substring,
             None,
             "project:foo".to_string(),
             SearchData {
@@ -377,5 +417,42 @@ mod tests {
     fn no_cache_segment_when_there_is_no_cache() {
         assert!(!header_text(&state_with(None)).contains("cache:"));
         assert!(!header_text(&state_with(Some(CacheStats::default()))).contains("cache:"));
+    }
+
+    fn state_with_mode(mode: MatchMode) -> SearchTuiState {
+        SearchTuiState::new(
+            "hello".to_string(),
+            false,
+            mode,
+            None,
+            String::new(),
+            SearchData {
+                hits: Vec::new(),
+                message_statuses: Vec::new(),
+                cache_stats: None,
+            },
+        )
+    }
+
+    /// The header's mode span is mode-gated (spec 0026): a substring run —
+    /// today's behaviour — shows no `match:` at all, and each non-default mode
+    /// names itself.
+    #[test]
+    fn header_mode_span_appears_only_for_non_default_modes() {
+        assert!(
+            !header_text(&state_with_mode(MatchMode::Substring)).contains("match:"),
+            "substring header must be unchanged"
+        );
+        assert!(header_text(&state_with_mode(MatchMode::Regex)).contains("match:regex"));
+        assert!(header_text(&state_with_mode(MatchMode::Fuzzy)).contains("match:fuzzy"));
+    }
+
+    /// The numeric column becomes the score column only in fuzzy mode;
+    /// substring and regex keep the match-count header.
+    #[test]
+    fn score_column_header_switches_only_in_fuzzy_mode() {
+        assert_eq!(numeric_column_header(MatchMode::Substring), "Match");
+        assert_eq!(numeric_column_header(MatchMode::Regex), "Match");
+        assert_eq!(numeric_column_header(MatchMode::Fuzzy), "Score");
     }
 }

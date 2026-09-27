@@ -1736,6 +1736,307 @@ fn search_rejects_since_and_last_together() {
     assert!(!output.status.success());
 }
 
+// --- Match modes (spec 0026) --------------------------------------------------
+
+/// Run `llmhelper search <query> <flags...>` against the fixtures and return
+/// the raw process output, for tests that need exit codes or stderr bytes.
+/// The full flag list is the caller's business — output modes conflict.
+fn run_search_raw(args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd.arg("search");
+    add_fixture_source_args(&mut cmd);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.output().expect("failed to run llmhelper search")
+}
+
+#[test]
+fn search_substring_never_echoes_the_mode_or_the_score() {
+    // The byte-identity promise: a default-mode payload is exactly today's —
+    // no `match` key at the top level, no `score` on any hit.
+    let out = run_search_json("cache", &[]);
+    assert!(
+        out.get("match").is_none(),
+        "substring runs must not gain a match key: {out}"
+    );
+    for hit in out["hits"].as_array().unwrap() {
+        assert!(
+            hit.get("score").is_none(),
+            "substring hits must not gain a score field: {hit}"
+        );
+        assert!(hit["matches"].as_u64().unwrap() >= 1);
+    }
+}
+
+#[test]
+fn search_regex_mode_adds_the_match_key_and_counts_occurrences() {
+    // The literal query contains a pipe: substring mode reads it as text and
+    // finds nothing, regex mode reads it as an alternation over words the
+    // fixtures really contain (each hit text carries both branches).
+    let literal = run_search_json("regex|migration", &[]);
+    assert!(literal["hits"].as_array().unwrap().is_empty());
+
+    let out = run_search_json("regex|migration", &["--match", "regex"]);
+    assert_eq!(out["match"], "regex", "non-default modes are echoed");
+    let hits = out["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "the alternation must hit fixture texts");
+    for hit in hits {
+        // The claude fixtures discuss "the regex migration helper" twice, so
+        // every hit carries at least two alternation occurrences.
+        assert!(
+            hit["matches"].as_u64().unwrap() >= 2,
+            "regex counting slipped below the fixture floor: {hit}"
+        );
+    }
+}
+
+#[test]
+fn search_regex_empty_matches_count_honestly() {
+    // `.?` matches the empty string at every position, so every message is a
+    // hit and the count is text length + 1. Substring mode reads the same
+    // query as literal text and finds only the exact ".?" occurrences.
+    let out = run_search_json(".?", &["--match", "regex"]);
+    let hits = out["hits"].as_array().unwrap();
+    assert!(
+        hits.iter().any(|h| h["matches"].as_u64().unwrap() > 100),
+        "regex `.?` must count every empty match, not collapse to 1: {hits:?}"
+    );
+
+    let literal = run_search_json(".?", &[]);
+    for hit in literal["hits"].as_array().unwrap() {
+        assert_eq!(
+            hit["matches"].as_u64().unwrap(),
+            1,
+            "substring `.?` counts literal occurrences only: {hit}"
+        );
+    }
+}
+
+#[test]
+fn search_case_flag_composes_with_regex_mode() {
+    // The fixtures contain "The" (capital, sentence starts) and lowercase
+    // "the" inside the same sentences, so the case flag must visibly change
+    // the result: case-insensitive counts strictly more than case-sensitive.
+    let ci = run_search_json("The\\b", &["--match", "regex"]);
+    let cs = run_search_json("the\\b", &["--match", "regex", "--case-sensitive"]);
+    let sum = |v: &serde_json::Value| -> u64 {
+        v["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["matches"].as_u64().unwrap())
+            .sum()
+    };
+    assert!(!ci["hits"].as_array().unwrap().is_empty());
+    assert!(!cs["hits"].as_array().unwrap().is_empty());
+    assert!(
+        sum(&ci) > sum(&cs),
+        "case-insensitive regex must count more `the` matches: {} vs {}",
+        sum(&ci),
+        sum(&cs)
+    );
+    assert_eq!(cs["case_sensitive"], true);
+}
+
+#[test]
+fn search_fuzzy_mode_scores_and_ranks_by_score() {
+    // `regrx` is a misspelling no substring or regex would find, but the
+    // fixture texts contain the letters as a subsequence — fuzzy mode hits,
+    // the others honestly do not.
+    let literal = run_search_json("regrx", &[]);
+    assert!(literal["hits"].as_array().unwrap().is_empty());
+
+    let out = run_search_json("regrx", &["--match", "fuzzy"]);
+    assert_eq!(out["match"], "fuzzy");
+    let hits = out["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "fuzzy must find the misspelling");
+    let scores: Vec<i64> = hits
+        .iter()
+        .map(|h| {
+            assert_eq!(h["matches"].as_u64().unwrap(), 1, "fuzzy counts once: {h}");
+            assert!(
+                h.get("score").and_then(|s| s.as_i64()).is_some(),
+                "fuzzy hits must carry a score: {h}"
+            );
+            h["score"].as_i64().unwrap()
+        })
+        .collect();
+    let mut sorted = scores.clone();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        scores, sorted,
+        "fuzzy hits must be ordered by score, descending"
+    );
+}
+
+#[test]
+fn search_invalid_regex_fails_before_reading_sources() {
+    let output = run_search_raw(&["--json", "[unclosed", "--match", "regex"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "invalid patterns must exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("Error: invalid --match regex: "),
+        "the error must name the failing flag: {stderr}"
+    );
+    assert!(
+        !stderr.contains("warn:"),
+        "validation must run before sources load — no funnel lines allowed: {stderr}"
+    );
+}
+
+#[test]
+fn search_invalid_regex_only_rejects_regex_mode() {
+    // The same bracket text is an ordinary substring (and a fuzzy query) —
+    // the flag, not the text, decides whether it is a pattern error.
+    for extra in [vec!["--match", "substring"], vec!["--match", "fuzzy"]] {
+        let output = run_search_raw(&["--json", "[unclosed", extra[0], extra[1]]);
+        assert!(
+            output.status.success(),
+            "{} must accept text that only looks like a pattern: {:?}",
+            extra[1],
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn search_empty_result_stays_exit_zero_in_every_mode() {
+    for extra in [vec!["--match", "regex"], vec!["--match", "fuzzy"]] {
+        let output = run_search_raw(&["--json", "zzzqqqzzz", extra[0], extra[1]]);
+        assert!(
+            output.status.success(),
+            "an empty result is not an error ({:?}): {:?}",
+            extra[1],
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let out: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        assert!(out["hits"].as_array().unwrap().is_empty());
+        assert_eq!(out["match"], extra[1]);
+    }
+}
+
+#[test]
+fn search_csv_header_per_mode() {
+    // Fuzzy gains exactly one `score` column after `matches`; substring and
+    // regex keep today's header byte for byte.
+    let fuzzy = run_search_raw(&["cache", "--match", "fuzzy", "--csv"]);
+    assert!(fuzzy.status.success(), "stderr: {:?}", fuzzy.stderr);
+    let header = String::from_utf8(fuzzy.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        header,
+        "source,session_id,project,model,role,timestamp,matches,score,snippet"
+    );
+
+    let plain = run_search_raw(&["cache", "--csv"]);
+    let regex_csv = run_search_raw(&["cache", "--match", "regex", "--csv"]);
+    let plain_header = String::from_utf8(plain.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        plain_header,
+        "source,session_id,project,model,role,timestamp,matches,snippet"
+    );
+    assert_eq!(
+        String::from_utf8(regex_csv.stdout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+        plain_header
+    );
+}
+
+#[test]
+fn search_non_default_modes_compose_with_record_filters() {
+    // The mode changes matching, nothing else: role, project, and window
+    // predicates keep their meaning in every mode (spec 0026). The unfiltered
+    // fuzzy hits for this query are a `user` and a `thinking` message.
+    let out = run_search_json("regrx", &["--match", "fuzzy", "--role", "user"]);
+    let hits = out["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "fuzzy + role must still find the hit");
+    assert!(hits.iter().all(|h| h["role"] == "user"));
+    let out = run_search_json("regrx", &["--match", "fuzzy", "--role", "assistant"]);
+    assert!(
+        out["hits"].as_array().unwrap().is_empty(),
+        "the role predicate must still exclude across modes"
+    );
+
+    let out = run_search_json(
+        "regex|migration",
+        &["--match", "regex", "--project", "test"],
+    );
+    let hits = out["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "regex + project must still find hits");
+    assert!(hits
+        .iter()
+        .all(|h| h["project"].as_str().unwrap().contains("test")));
+
+    let out = run_search_json(
+        "regex|migration",
+        &["--match", "regex", "--since", "2999-01-01T00:00:00Z"],
+    );
+    assert!(out["hits"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn search_fuzzy_csv_rows_carry_integer_scores() {
+    let output = run_search_raw(&["cache", "--match", "fuzzy", "--csv"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for row in stdout.lines().skip(1) {
+        // Snippets are quoted and may contain commas, so the split can yield
+        // more than the 9 fields — but every field before the score is
+        // comma-free, so the leading indexes stay fixed.
+        let cells: Vec<&str> = row.split(',').collect();
+        assert!(cells.len() >= 9, "fuzzy rows carry the score cell: {row}");
+        assert_eq!(cells[6], "1", "fuzzy matches count is 1: {row}");
+        let score: i64 = cells[7]
+            .parse()
+            .unwrap_or_else(|_| panic!("score must be an integer, row: {row}"));
+        assert!(score > 0, "fuzzy scores are positive: {row}");
+    }
+}
+
+#[test]
+fn search_text_mode_is_unchanged_by_the_mode_flag() {
+    // --text keeps today's shape: no mode echo, no score column — the mode is
+    // visible in JSON and the TUI, where it changes something real.
+    let output = run_search_raw(&["cache", "--match", "fuzzy", "--text"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("[1]"), "indexed hits stay: {stdout}");
+    assert!(
+        !stdout.contains("match:"),
+        "--text never echoes the mode: {stdout}"
+    );
+}
+
+#[test]
+fn search_diagnostics_funnel_is_unchanged_by_the_mode_flag() {
+    let output = run_search_raw(&["cache", "--match", "regex", "--json", "--explain"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("filters: loaded"),
+        "--explain funnel wording is the same in every mode: {stderr}"
+    );
+    assert!(
+        !stderr.contains("match:"),
+        "the mode never appears in diagnostics: {stderr}"
+    );
+}
+
 // --- Budget annotation -------------------------------------------------------
 
 /// The opencode fixture records 0.17 total Cost; omp records 1.5. Claude

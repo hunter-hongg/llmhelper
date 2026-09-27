@@ -1,9 +1,9 @@
 ---
 id: 0011
 title: "request — documentation and spec sync"
-status: ready-for-agent
+status: done
 created: 2026-09-11
-triage: ready-for-agent
+triage: done
 ---
 
 ## Problem Statement

@@ -1,9 +1,9 @@
 ---
 id: 0009
 title: "request --stream — SSE streaming"
-status: ready-for-agent
+status: done
 created: 2026-09-08
-triage: ready-for-agent
+triage: done
 ---
 
 ## Problem Statement

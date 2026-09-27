@@ -1,3 +1,11 @@
+---
+id: 0021
+title: "Per-source matched counts"
+status: done
+created: 2026-09-09
+updated: 2026-09-25
+triage: done
+---
 # 0021 — Per-source matched counts
 
 ## Problem

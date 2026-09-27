@@ -1,9 +1,9 @@
 ---
 id: 0001
 title: "usage — Agent/LLM usage introspection"
-status: ready-for-agent
+status: done
 created: 2026-08-30
-triage: ready-for-agent
+triage: done
 ---
 
 ## Problem Statement

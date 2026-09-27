@@ -1,7 +1,7 @@
 ---
 id: 0012
 title: "request — tool calling, logging, exit codes, --config, interactive, search fail-open, --copy, release metadata"
-status: ready-for-agent
+status: done
 created: 2026-09-11
 ---
 

@@ -26,7 +26,7 @@ use llmhelper::output::{
     render_diff_json, render_trend_csv, render_trend_json, OutputRenderer,
 };
 use llmhelper::report::{render_report, ReportMeta};
-use llmhelper::search::{search, SearchHit, SearchOptions};
+use llmhelper::search::{search, MatchMode, SearchHit, SearchOptions};
 use llmhelper::source::{
     ClaudeSource, KiloSource, LlmhelperSource, MessageStatus, OmpSource, OpenCodeSource, Registry,
     SourceStatus,
@@ -1153,6 +1153,7 @@ fn scoped_message_statuses(scoped: &[Message], statuses: &[MessageStatus]) -> Ve
 fn search_options(args: &SearchArgs) -> SearchOptions {
     SearchOptions {
         query: args.query.trim().to_string(),
+        match_mode: args.match_mode.into(),
         case_sensitive: args.case_sensitive,
         role: args.role.clone(),
         context: args.context,
@@ -1273,6 +1274,12 @@ fn run_search_non_tui(
             "hits": hits,
             "sources": message_sources_json(&statuses),
         });
+        // Mode is echoed only when it is not the default: a substring run's
+        // payload stays byte-identical to today's, the same gating rule the
+        // `cache` key below follows (added, never null).
+        if options.match_mode != MatchMode::Substring {
+            payload["match"] = serde_json::json!(options.match_mode.as_str());
+        }
         // Gated on `--explain` like the diagnostics funnel (0020): the key is
         // *added*, not set to null, because a `"cache": null` in normal `--json`
         // would break the byte-identity between cached and uncached runs — the
@@ -1295,28 +1302,62 @@ fn run_search_non_tui(
         return Ok(());
     }
     if args.csv {
+        // Fuzzy runs append a `score` column, the same conditional-column rule
+        // as compare's budget column: substring and regex keep the exact
+        // current column set, so existing consumers see no change.
+        let fuzzy = options.match_mode == MatchMode::Fuzzy;
         let mut w = csv::Writer::from_writer(std::io::stdout());
-        w.write_record([
-            "source",
-            "session_id",
-            "project",
-            "model",
-            "role",
-            "timestamp",
-            "matches",
-            "snippet",
-        ])?;
-        for h in &hits {
+        if fuzzy {
             w.write_record([
-                &h.source,
-                &h.session_id,
-                &h.project,
-                h.model.as_deref().unwrap_or(""),
-                &h.role,
-                &h.timestamp.map(|t| t.to_rfc3339()).unwrap_or_default(),
-                &h.matches.to_string(),
-                &h.snippet,
+                "source",
+                "session_id",
+                "project",
+                "model",
+                "role",
+                "timestamp",
+                "matches",
+                "score",
+                "snippet",
             ])?;
+        } else {
+            w.write_record([
+                "source",
+                "session_id",
+                "project",
+                "model",
+                "role",
+                "timestamp",
+                "matches",
+                "snippet",
+            ])?;
+        }
+        for h in &hits {
+            let matches_cell = h.matches.to_string();
+            let snippet_cell = &h.snippet;
+            if fuzzy {
+                w.write_record([
+                    &h.source,
+                    &h.session_id,
+                    &h.project,
+                    h.model.as_deref().unwrap_or(""),
+                    &h.role,
+                    &h.timestamp.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                    &matches_cell,
+                    &h.score.unwrap_or(0).to_string(),
+                    snippet_cell,
+                ])?;
+            } else {
+                w.write_record([
+                    &h.source,
+                    &h.session_id,
+                    &h.project,
+                    h.model.as_deref().unwrap_or(""),
+                    &h.role,
+                    &h.timestamp.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                    &matches_cell,
+                    snippet_cell,
+                ])?;
+            }
         }
         w.flush()?;
         return Ok(());
@@ -1353,50 +1394,51 @@ fn run_search_tui(
     let mut tui = llmhelper::tui::search_app::SearchTuiApp::new(
         options.query.clone(),
         options.case_sensitive,
+        options.match_mode,
         options.role.clone(),
         filter_summary,
         load(&registry),
     )?;
     tui.state.list.running = true;
     let reg_arc = Arc::new(registry);
-    while tui.state.list.running {
-        tui.terminal.draw(|frame| {
-            llmhelper::tui::search_render::render(frame, &mut tui.state);
-        })?;
-        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                match key.code {
-                    crossterm::event::KeyCode::Char('q') => tui.state.list.quit(),
-                    crossterm::event::KeyCode::Esc => {
-                        if tui.state.list.view == llmhelper::tui::search_app::SearchView::Detail {
-                            tui.state.list.close_detail();
-                        } else {
-                            tui.state.list.quit();
-                        }
-                    }
-                    crossterm::event::KeyCode::Enter => tui.state.list.open_detail(),
-                    crossterm::event::KeyCode::Char('r') => {
-                        tui.state.apply_data(load(&reg_arc));
-                    }
-                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                        tui.state.list.select_next();
-                    }
-                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                        tui.state.list.select_previous();
-                    }
-                    crossterm::event::KeyCode::Home | crossterm::event::KeyCode::Char('g') => {
-                        tui.state.list.select_first();
-                    }
-                    crossterm::event::KeyCode::End | crossterm::event::KeyCode::Char('G') => {
-                        tui.state.list.select_last();
-                    }
-                    crossterm::event::KeyCode::PageDown => tui.state.page_down(),
-                    crossterm::event::KeyCode::PageUp => tui.state.page_up(),
-                    _ => {}
+    llmhelper::tui::run_static_tui(
+        &mut tui.terminal,
+        &mut tui.state,
+        |terminal, state| {
+            terminal.draw(|frame| {
+                llmhelper::tui::search_render::render(frame, state);
+            })?;
+            Ok(())
+        },
+        |state, code| {
+            use crossterm::event::KeyCode;
+            use llmhelper::tui::scroll::Scrollable;
+            match code {
+                KeyCode::Char('q') => {
+                    state.list.quit();
                 }
+                KeyCode::Esc => {
+                    if state.list.view == llmhelper::tui::search_app::SearchView::Detail {
+                        state.list.close_detail();
+                    } else {
+                        state.list.quit();
+                    }
+                }
+                KeyCode::Enter => state.list.open_detail(),
+                KeyCode::Char('r') => {
+                    state.apply_data(load(&reg_arc));
+                }
+                KeyCode::Down | KeyCode::Char('j') => state.list.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => state.list.select_previous(),
+                KeyCode::Home | KeyCode::Char('g') => state.list.select_first(),
+                KeyCode::End | KeyCode::Char('G') => state.list.select_last(),
+                KeyCode::PageDown => state.page_down(),
+                KeyCode::PageUp => state.page_up(),
+                _ => return false,
             }
-        }
-    }
+            true
+        },
+    )?;
     tui.exit()?;
     Ok(())
 }
@@ -1929,36 +1971,30 @@ fn run_report(args: ReportArgs, config_path: &Option<PathBuf>) -> anyhow::Result
 fn run_report_tui(markdown: &str) -> anyhow::Result<()> {
     let mut tui = ReportTuiApp::new(markdown)?;
     tui.state.running = true;
-    while tui.state.running {
-        tui.terminal.draw(|frame| {
-            llmhelper::tui::report_render::render(frame, &mut tui.state);
-        })?;
-
-        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                match key.code {
-                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
-                        tui.state.quit();
-                    }
-                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                        tui.state.scroll_down();
-                    }
-                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                        tui.state.scroll_up();
-                    }
-                    crossterm::event::KeyCode::PageDown => tui.state.page_down(),
-                    crossterm::event::KeyCode::PageUp => tui.state.page_up(),
-                    crossterm::event::KeyCode::Home | crossterm::event::KeyCode::Char('g') => {
-                        tui.state.scroll_top();
-                    }
-                    crossterm::event::KeyCode::End | crossterm::event::KeyCode::Char('G') => {
-                        tui.state.scroll_bottom();
-                    }
-                    _ => {}
-                }
+    llmhelper::tui::run_static_tui(
+        &mut tui.terminal,
+        &mut tui.state,
+        |terminal, state| {
+            terminal.draw(|frame| {
+                llmhelper::tui::report_render::render(frame, state);
+            })?;
+            Ok(())
+        },
+        |state, code| {
+            use crossterm::event::KeyCode;
+            use llmhelper::tui::scroll::Scrollable;
+            match code {
+                KeyCode::Down | KeyCode::Char('j') => state.scroll_down(),
+                KeyCode::Up | KeyCode::Char('k') => state.scroll_up(),
+                KeyCode::PageDown => state.page_down(),
+                KeyCode::PageUp => state.page_up(),
+                KeyCode::Home | KeyCode::Char('g') => state.scroll_top(),
+                KeyCode::End | KeyCode::Char('G') => state.scroll_bottom(),
+                _ => return false,
             }
-        }
-    }
+            true
+        },
+    )?;
     tui.exit()?;
     Ok(())
 }

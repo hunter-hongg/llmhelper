@@ -1,10 +1,10 @@
 ---
 id: 0003
 title: "sessions — TUI Session inventory with Enter detail"
-status: ready-for-agent
+status: done
 created: 2026-09-05
-updated: 2026-09-05
-triage: ready-for-agent
+updated: 2026-09-25
+triage: done
 ---
 
 ## Problem Statement

@@ -22,6 +22,10 @@ dirs = "6"
 anyhow = "1"
 parking_lot = "0.12"
 reqwest = { version = "0.11", features = ["json", "stream"] }
+# Match modes (spec 0026): RE2-style linear-time regex, and fzf-style
+# subsequence scoring for the fuzzy mode.
+regex = "1"
+fuzzy-matcher = "0.3"
 
 # Restore the default SIGPIPE disposition on Unix so `llmhelper ... | head`
 # terminates quietly instead of panicking on the first failed stdout write.
