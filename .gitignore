@@ -6,3 +6,7 @@
 .crush/
 .reasonix/
 .cargo-home/
+# Agent-tool scratch/config directories. `.mimocode/` carries a vendored
+# node_modules tree; cargo builds its published file list from tracked files,
+# so ignoring these keeps them out of the packaged crate (spec 0028).
+.mimocode/

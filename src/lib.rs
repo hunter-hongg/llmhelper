@@ -6,6 +6,7 @@ pub mod compare;
 pub mod config;
 pub mod diagnostics;
 pub mod diff;
+pub mod dist;
 pub mod domain;
 pub mod export;
 pub mod filter;

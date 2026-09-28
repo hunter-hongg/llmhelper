@@ -509,6 +509,40 @@ the command loads a narrower range than the budget declares (a `30d` budget
 inside a `--last 7d` run), the `## Budget` section says so and names the bound,
 because the spend can then only be measured over the data that was loaded.
 
+## Install
+```bash
+cargo install --path .          # from a checkout
+llmhelper --version
+```
+
+**Prerequisite: OpenSSL development headers.** `reqwest` 0.11 uses `native-tls`,
+so a build needs OpenSSL headers and `pkg-config` *before* it can compile
+llmhelper at all:
+
+| Platform | Command |
+| --- | --- |
+| Debian / Ubuntu | `sudo apt-get install pkg-config libssl-dev` |
+| Fedora / RHEL | `sudo dnf install pkgconf-pkg-config openssl-devel` |
+| macOS (Homebrew) | `brew install openssl pkg-config` |
+
+SQLite is **not** a prerequisite: `rusqlite` is built with `bundled`, so its C
+source is vendored. A Rust toolchain is required (`rust-toolchain.toml` pins
+the channel).
+
+### Man page and shell completions
+Both are generated from the binary's own command definitions, so they cannot
+drift from the flags the tool actually accepts:
+
+```bash
+llmhelper man                             # writes target/dist/*.1 + completions
+llmhelper man --completions zsh --stdout  # one script on stdout, for a package prefix
+man target/dist/usage.1
+```
+
+`llmhelper man` is hidden from `--help` — it is a packaging affordance, not a
+feature — but always reachable. Output goes to `target/dist/`, never the source
+tree, so nothing generated can be mistaken for source.
+
 ## Build & Test
 ```bash
 cargo build --release
@@ -517,4 +551,4 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 ## Specs
-See `docs/specs/` for the usage, diff, sessions, usage-agent-detail, report, report-output-title, report-tui, request, request-stream, request-reasoning, search, export, budget, message-export, diff-calendar, usage-report-calendar, watch, empty-diagnostics, per-source-matched, trend, compare and compare-budget specifications. Architecture notes in `docs/adr/`.
+See `docs/specs/` for the specifications. Architecture notes in `docs/adr/`.

@@ -162,10 +162,22 @@ pub fn merge_source_paths<A: SourcePathArgs>(
 
 /// Main CLI entry point.
 #[derive(Parser, Debug)]
-#[command(name = "llmhelper", about = "Agent usage introspection")]
+// `version` is what makes `--version`/`-V` exist at all: without the attribute
+// clap emits neither, and the flag errors with "unexpected argument" — the
+// single most universal smoke test a distributed CLI has to pass.
+#[command(
+    name = "llmhelper",
+    about = "Agent usage introspection",
+    version,
+    long_about = "Agent/LLM usage introspection and OpenAI-compatible chat requests.\n\n\
+                  Reads usage data written by Claude Code, OpenCode, OMP, Kilo Code \
+                  and llmhelper's own request log, and renders it as a terminal UI, a \
+                  Markdown report, or machine-readable JSON/CSV."
+)]
 pub struct Cli {
-    /// Path to a TOML config file. Defaults to
-    /// ~/.config/llmhelper/config.toml.
+    /// Path to a TOML config file. Defaults to the platform config directory
+    /// (e.g. ~/.config/llmhelper/config.toml on Linux,
+    /// ~/Library/Application Support/llmhelper/config.toml on macOS).
     #[arg(long = "config", global = true)]
     pub config: Option<std::path::PathBuf>,
 
@@ -195,6 +207,54 @@ pub enum Command {
     Trend(TrendArgs),
     /// Rank groups against each other within one window.
     Compare(CompareArgs),
+    /// Generate man pages and shell completions from this binary's own
+    /// command definitions.
+    #[command(hide = true)]
+    Man(ManArgs),
+}
+
+/// Arguments for the hidden `man` subcommand (spec 0028).
+///
+/// Both artifacts are derived from the *live* `Cli` tree rather than from a
+/// checked-in copy, so a man page cannot describe a flag that no longer
+/// exists. `clap_mangen`/`clap_complete` own the output formats; this struct
+/// only chooses where they land.
+#[derive(Parser, Debug, Clone)]
+pub struct ManArgs {
+    /// Directory to write the generated files into. Created if absent.
+    /// Defaults to `target/dist`.
+    #[arg(long = "out-dir")]
+    pub out_dir: Option<PathBuf>,
+
+    /// Print the generated files to stdout instead of writing them.
+    /// Useful for inspecting one page without creating a directory.
+    #[arg(long)]
+    pub stdout: bool,
+
+    /// Emit only the completion script for this shell.
+    #[arg(long, value_enum)]
+    pub completions: Option<CompletionShellArg>,
+}
+
+/// The shells whose completion scripts can be generated.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionShellArg {
+    Bash,
+    Zsh,
+    Fish,
+    #[value(name = "powershell")]
+    PowerShell,
+}
+
+impl From<CompletionShellArg> for clap_complete::Shell {
+    fn from(s: CompletionShellArg) -> Self {
+        match s {
+            CompletionShellArg::Bash => Self::Bash,
+            CompletionShellArg::Zsh => Self::Zsh,
+            CompletionShellArg::Fish => Self::Fish,
+            CompletionShellArg::PowerShell => Self::PowerShell,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]

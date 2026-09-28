@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the job's build directory inside the workspace so an action that
+  # caches `target/` does not silently miss.
+  CARGO_TARGET_DIR: target
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is included because `dirs` resolves a different config path
+        # there and the TUI is the only part that is not exercised headless.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-toolchain.toml` already pins the channel and components, so
+      # dtolnay/rust-toolchain reads it rather than taking a version here.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-
+
+      - name: Install OpenSSL development headers
+        # Not optional: `reqwest` resolves `native-tls` -> `openssl-sys`, so a
+        # build without these headers fails before compiling llmhelper at all.
+        # This is the one hard native prerequisite (spec 0028).
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+          else
+            brew install openssl pkg-config
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Verify the crate packages cleanly
+        # `cargo package` is the exact command that must succeed for a publish;
+        # it also catches a manifest that references a file `include` misses.
+        run: cargo package --allow-dirty --no-verify --list | head -40
+
+  install:
+    name: cargo install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install OpenSSL development headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      # The command a user actually runs (spec 0028). Building it here is what
+      # proves the release profile compiles, not just the debug one CI tests.
+      - name: Install from path
+        run: cargo install --path . --root /tmp/llmhelper-install
+      - name: Smoke-test the installed binary
+        run: |
+          /tmp/llmhelper-install/bin/llmhelper --version
+          /tmp/llmhelper-install/bin/llmhelper man --completions bash --stdout | head -1
+          /tmp/llmhelper-install/bin/llmhelper --help

@@ -2770,5 +2770,8 @@ fn main() -> anyhow::Result<()> {
         Command::Watch(args) => run_watch(args, &config_path),
         Command::Trend(args) => run_trend(args, &config_path),
         Command::Compare(args) => run_compare(args, &config_path),
+        // Reads no usage data and needs no config, so it dispatches before
+        // the shared config load rather than after it.
+        Command::Man(args) => llmhelper::dist::run(&args),
     }
 }

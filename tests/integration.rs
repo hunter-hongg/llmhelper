@@ -1202,6 +1202,15 @@ fn run_report(extra_args: &[&str]) -> String {
     std::fs::read_to_string(&path).unwrap()
 }
 
+/// A window wide enough to contain every fixture, whatever the calendar says.
+///
+/// The fixtures carry absolute 2026-08 timestamps, so any test that meant
+/// "all the fixture data" by writing `--last 30d` silently became a test of
+/// "the fixtures are recent" — and started failing the day the data aged past
+/// 30 days, with no code change at all. This is that window, named so the
+/// intent is obvious at the call site.
+const ALL_FIXTURES: &str = "3650d";
+
 fn run_report_to(path: &std::path::Path, extra_args: &[&str]) {
     let mut cmd = Command::new(bin());
     cmd.arg("report").arg("--output").arg(path);
@@ -1226,7 +1235,7 @@ fn run_report_to(path: &std::path::Path, extra_args: &[&str]) {
 
 #[test]
 fn report_markdown_structure() {
-    let out = run_report(&["--last", "30d"]);
+    let out = run_report(&["--last", ALL_FIXTURES]);
     assert!(out.starts_with("# llmhelper report\n"));
     assert!(out.contains("## Totals"));
     assert!(out.contains("## Cost by source"));
@@ -1238,7 +1247,7 @@ fn report_markdown_structure() {
 
 #[test]
 fn report_custom_title_heading() {
-    let out = run_report(&["--last", "30d", "--title", "Team weekly LLM usage"]);
+    let out = run_report(&["--last", ALL_FIXTURES, "--title", "Team weekly LLM usage"]);
     assert!(out.starts_with("# Team weekly LLM usage\n"));
 }
 
@@ -1246,7 +1255,7 @@ fn report_custom_title_heading() {
 fn report_output_writes_file_and_keeps_stdout_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("report.md");
-    run_report_to(&path, &["--last", "30d"]);
+    run_report_to(&path, &["--last", ALL_FIXTURES]);
     let contents = std::fs::read_to_string(&path).unwrap();
     assert!(contents.starts_with("# llmhelper report\n"));
     assert!(contents.contains("## Totals"));
@@ -1259,7 +1268,7 @@ fn report_output_unwritable_path_errors() {
     cmd.args([
         "report",
         "--last",
-        "30d",
+        ALL_FIXTURES,
         "--output",
         "/nonexistent-dir-xyz-llmhelper/report.md",
     ]);
@@ -1285,8 +1294,15 @@ fn report_output_unwritable_path_errors() {
 
 #[test]
 fn report_window_and_filter_echo() {
-    let out = run_report(&["--last", "30d", "--project", "proj", "--source", "opencode"]);
-    assert!(out.contains("window: last 30d"));
+    let out = run_report(&[
+        "--last",
+        ALL_FIXTURES,
+        "--project",
+        "proj",
+        "--source",
+        "opencode",
+    ]);
+    assert!(out.contains(&format!("window: last {ALL_FIXTURES}")));
     assert!(out.contains("project=proj"));
     assert!(out.contains("source=opencode"));
 }
@@ -1299,15 +1315,15 @@ fn report_all_time_window_when_unbounded() {
 
 #[test]
 fn report_top_collapses_groups() {
-    let full = run_report(&["--last", "30d"]);
+    let full = run_report(&["--last", ALL_FIXTURES]);
     assert!(!full.contains("(+ "), "no --top must show every group");
-    let capped = run_report(&["--last", "30d", "--top", "1"]);
+    let capped = run_report(&["--last", ALL_FIXTURES, "--top", "1"]);
     assert!(capped.contains("(+ 3 more"));
 }
 
 #[test]
 fn report_cost_by_source_excludes_claude() {
-    let out = run_report(&["--last", "30d"]);
+    let out = run_report(&["--last", ALL_FIXTURES]);
     assert!(out.contains("## Cost by source"));
     let cost_section = out.split("## Usage by").next().unwrap();
     let cost_table = cost_section.split("## Cost by source").nth(1).unwrap();
@@ -1367,13 +1383,13 @@ fn report_top_zero_errors() {
 
 #[test]
 fn report_group_by_model_heading() {
-    let out = run_report(&["--last", "30d", "--group-by", "model"]);
+    let out = run_report(&["--last", ALL_FIXTURES, "--group-by", "model"]);
     assert!(out.contains("## Usage by model"));
 }
 
 #[test]
 fn report_cost_by_source_order_is_deterministic() {
-    let out = run_report(&["--last", "30d"]);
+    let out = run_report(&["--last", ALL_FIXTURES]);
     // Cost table rows should list sources in alphabetical order for
     // deterministic output across runs. We identify data rows as those
     // whose last cell looks like a decimal cost (e.g. " 1.500000 ").
@@ -2069,7 +2085,7 @@ fn run_report_raw(extra_args: &[&str]) -> std::process::Output {
 
 #[test]
 fn report_without_budgets_omits_budget_section() {
-    let out = run_report(&["--last", "30d"]);
+    let out = run_report(&["--last", ALL_FIXTURES]);
     assert!(!out.contains("## Budget"));
 }
 

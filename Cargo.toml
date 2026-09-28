@@ -3,7 +3,34 @@ name = "llmhelper"
 version = "0.1.0"
 edition = "2021"
 description = "Agent/LLM usage introspection and OpenAI-compatible chat requests from the terminal"
-keywords = ["llm", "agent", "usage", "cli", "tui", "ratatui"]
+keywords = ["llm", "agent", "usage", "cli", "tui"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/hunter-hongg/llmhelper"
+categories = ["command-line-utilities", "development-tools"]
+# MSRV, not a guess: `is_multiple_of` (src/cache.rs) is stable since 1.87 and
+# `is_none_or` (src/filter.rs, src/diagnostics.rs, src/search.rs) since 1.82,
+# so the floor is 1.87. `cargo clippy --all-targets` enforces this — a
+# too-low `rust-version` is a build error, not a warning.
+rust-version = "1.87"
+# Packaging is a plain `exclude` deny-list rather than an `include` allow-list.
+# Measured, not assumed: with an `include` globs cargo still packaged 41 files
+# out of `.mimocode/node_modules` (it lists files on disk, and `include` does
+# not prune an untracked vendored tree), while the same manifest with only
+# `exclude` packaged none. `exclude` is the deny-list cargo applies last, so it
+# is the one that actually holds.
+exclude = [
+    "**/node_modules/**",
+    ".mimocode/**",
+    ".qwen/**",
+    ".codewhale/**",
+    ".kilo/**",
+    ".crush/**",
+    ".reasonix/**",
+    ".scratch/**",
+    ".cargo-home/**",
+    ".github/**",
+]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -26,6 +53,13 @@ reqwest = { version = "0.11", features = ["json", "stream"] }
 # subsequence scoring for the fuzzy mode.
 regex = "1"
 fuzzy-matcher = "0.3"
+# Spec 0028: the hidden `man` subcommand generates man pages and shell
+# completions from the live `Cli` definition at *run* time, so a checked-in
+# copy can never describe a flag that no longer exists. Ordinary dependencies
+# because the generator ships in the binary: the user who wants a man page is
+# the user who installed the binary.
+clap_complete = "4"
+clap_mangen = "0.2"
 
 # Restore the default SIGPIPE disposition on Unix so `llmhelper ... | head`
 # terminates quietly instead of panicking on the first failed stdout write.
