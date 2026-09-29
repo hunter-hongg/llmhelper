@@ -1,10 +1,10 @@
 ---
 id: 0028
 title: "distribution — make llmhelper installable and discoverable outside this checkout"
-status: ready-for-agent
+status: done
 created: 2026-09-27
-updated: 2026-09-27
-triage: ready-for-agent
+updated: 2026-09-29
+triage: done
 ---
 
 ## Problem Statement

@@ -1,10 +1,10 @@
 ---
 id: 0029
 title: "source — the llmhelper Source becomes first-class: real Projects and honest Model identity"
-status: ready-for-agent
+status: done
 created: 2026-09-27
-updated: 2026-09-27
-triage: ready-for-agent
+updated: 2026-09-29
+triage: done
 ---
 
 ## Problem Statement
@@ -55,11 +55,12 @@ make the one fact that is genuinely absent stay honestly absent.
 
 - **Record the working directory at request time.** The log envelope gains a
   `cwd` field. The `llmhelper` Source reads it and populates `project` with
-  the directory's *name* (not its full path), matching how Kilo and OMP
-  present a Project. A log written before this change has no `cwd`, so its
-  Records keep `project: ""` — the empty value is then a *fact about the log*
-  (written by an older version) rather than a permanent gap, and both behave
-  the same way: no Project.
+  the directory's full path, matching how Kilo, OMP, Claude Code, and
+  OpenCode present a Project (each records the working directory as a path).
+  A log written before this change has no `cwd`, so its Records keep
+  `project: ""` — the empty value is then a *fact about the log* (written by
+  an older version) rather than a permanent gap, and both behave the same
+  way: no Project.
 - **Make the model fallback explicit instead of positional.** The `request`
   envelope already carries the model. The `llmhelper` Source stops guessing
   across interleaved lines and only falls back to a remembered request model
@@ -99,26 +100,35 @@ inputs it depends on — *which project* and *which model* — trustworthy.
   current working directory. The envelope's existing keys (`timestamp`,
   `direction`, `body`) are unchanged; `cwd` is **added**, so old readers that
   ignore unknown keys keep working and the log format is append-compatible.
-- The `llmhelper` Source reads `cwd` and sets `project` to the **final path
-  component** of that directory (`/home/u/code/api` → `api`), matching Kilo
-  and OMP's presentation. An empty or absent `cwd` (an old log) leaves
-  `project` empty.
+- The `llmhelper` Source reads `cwd` and sets `project` to the directory path
+  **as-is**, matching Kilo, OMP, Claude Code, and OpenCode — which all store a
+  full working directory (`/home/u/code/api`), not a name. An empty or absent
+  `cwd` (an old log) leaves `project` empty. Using the full path is what makes
+  `--project /some/dir` match a logged request and `--group-by project`
+  aggregate turns across sources; a basename would split the same directory
+  into two buckets depending on which Source produced the turn.
 - The API key is still never written; `cwd` is a path the user already knows.
 
-### Unambiguous model pairing
+### Honest model pairing (consume-once)
 
 - A `response` line's Model is: the response body's `model` if present;
-  otherwise the model of the **most recent `request` line that was paired to
-  this response**.
-- **Pairing rule:** a `request` line supplies its model to the next `response`
-  line *in the same file*, and is then consumed. If a `response` line has no
-  `model` and no unconsumed `request` line precedes it, the Model is empty —
-  never a stale value from an earlier, already-paired request.
-- This is strictly more honest than the current positional fallback and is
-  byte-identical for the common case (one request → one response).
+  otherwise the model held by the most recent unconsumed `request` line.
+  That `request` line is then consumed and cannot supply a model to any
+  later `response`. If a `response` has no echo and no unconsumed `request`
+  precedes it, the Model is empty — never a stale value from an
+  earlier, already-consumed request.
+- **Pairing rule (same-file, positional, consume-once):** a `request` line
+  supplies its model to the next `response` line that lacks one, and is then
+  taken. This is byte-identical to the old positional fallback for the common
+  case (one request → one response). It is strictly more honest under
+  **interleaving**: `request(A) request(B) response response` lets the first
+  response take B and leaves the second response empty (`["B", ""]`), which is
+  mispriced on B but never silently priced on A's rate — the second error is
+  the old one being fixed, the first is accepted as the format's limit.
 - An empty Model means `cost_for` finds no price → `cost: None` → a budget on
   `llmhelper` is `not measured`, exactly as spec 0027 specifies for an
   unpriced model.
+
 
 ### What does not change
 
@@ -134,11 +144,13 @@ inputs it depends on — *which project* and *which model* — trustworthy.
   Spec 0027 ruled exact-match out of scope and this spec does not reopen it;
   a user with a versioned echo still writes that exact string as their
   `[price.…]` key.
-- **Full absolute paths as Project.** Projects are directory *names*
-  throughout the tool (Claude Code's folder-name encoding sets the precedent);
-  the full path is not a Project value. Two directories named `api` in
-  different parents aggregate together, as they already do for every other
-  Source.
+- **Project normalization.** The four other Sources store a directory *path*,
+  not a name — Claude Code's decoded folder name is a full path, OMP's `cwd`
+  field is a full path, and Kilo/OpenCode's `directory` column is a full path.
+  This spec follows them and stores the `cwd` as-is. Normalizing either
+  direction is not defined here: trimming a trailing separator is; collapsing
+  `..` or symlinks is out of scope, as is reducing a path to a basename (which
+  would be inconsistent with every other Source).
 - **Request profiles / per-endpoint budgets.** Spec 0027 filed this as a real
   gap and a natural follow-up; it is configuration ergonomics, not Source
   identity, and it stays filed there.
@@ -163,11 +175,14 @@ inputs it depends on — *which project* and *which model* — trustworthy.
   from the wrong request). The tool's stated preference — an unmarked value
   is "not over", `not measured` is reported explicitly, absent is not zero —
   only holds if the pairing is honest.
-- **Project is a directory name, consistent with every other Source.** Using
-  the full path here and the name elsewhere would make the same project look
-  like two buckets depending on which Source a turn came from, which is
-  exactly the cross-Source inconsistency the aggregator's `mixed` handling
-  exists to prevent.
+- **Project is a directory path, consistent with every other Source.** Claude
+  Code, OMP, Kilo, and OpenCode all store a full working directory, so the
+  llmhelper Source stores one too. The directory name is not a Project value
+  anywhere; using only the tail here — while the other Sources store the path
+  — is what would split the same directory into two buckets depending on which
+  Source produced the turn. The aggregator's `mixed` handling (ADR 0001) is
+  about Source cost attribution, not project formatting; cross-Source
+  consistency here comes from matching the path, not from invoking `mixed`.
 - **The empty-Project old-log case is not backfilled.** The alternative —
   attributing old requests to the project the user is currently in — would
   put spend in the wrong place. Absent stays absent.
@@ -175,14 +190,17 @@ inputs it depends on — *which project* and *which model* — trustworthy.
 ## Testing Decisions
 
 - Unit tests in `src/source.rs` for the `llmhelper` Source: a log with `cwd`
-  populates `project` to the directory name; a log without `cwd` leaves it
-  empty; an envelope with `cwd` but no trailing component (e.g. `/`) yields an
-  empty Project rather than `/`.
+  populates `project` to the directory **path** as-is; a log without `cwd`
+  leaves it empty; an envelope with `cwd` but no path (e.g. `/`, empty, or a
+  Windows root) yields an empty Project rather than a root.
 - Model pairing: response with `model` wins; response without `model` uses the
   immediately preceding request's model; a second response with no `model` and
-  no unconsumed request does **not** reuse the earlier request's model
-  (the regression this spec exists to fix); an interleaved log pairs each
-  response to its own request.
+  no unconsumed request does **not** reuse the earlier request's model (the
+  regression this spec exists to fix). An interleaved log is *conservative*,
+  not correct: the first response still pairs to the later request's model (the
+  test `an_interleaved_log_never_invents_a_second_model` asserts this openly —
+  `["mistral", ""]`), so it is mispriced; the second is unpriced. Recovering
+  the first pairs needs a request id the log does not carry (ADR 0009).
 - Unpriced/empty Model yields `cost: None` (reuse the existing
   `unpriced_model_is_not_measured_so_the_gate_cannot_refuse` shape).
 - An integration test that runs `request --log` through the real binary and

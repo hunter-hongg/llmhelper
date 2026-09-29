@@ -1281,6 +1281,95 @@ fn usage_llmhelper_json(cfg: &tempfile::TempDir) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+/// A real `--log` request from a known working directory, measured back: the
+/// Project written into the envelope by `request` is the Project the
+/// `llmhelper` Source reports (spec 0029). This is the only test that exercises
+/// the writer and the reader together, which is the seam the unit tests cannot
+/// reach — they construct envelopes by hand, so they would pass even if the
+/// writer stopped writing `cwd`.
+#[test]
+fn a_logged_request_carries_its_working_directory_as_the_project() {
+    let cfg = loop_env(PRICE);
+    let workdir = cfg.path().join("myproj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let (addr, handle) = start_server("200 OK", LOOP_BODY);
+    let output = Command::new(bin())
+        .current_dir(&workdir)
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .args([
+            "request",
+            "--text",
+            "--prompt",
+            "hi",
+            "--api-key",
+            "k",
+            "--model",
+            "gpt-4",
+            "--base-url",
+            &format!("http://{}", addr),
+            "--log",
+        ])
+        .output()
+        .expect("run request");
+    let _req = handle.join().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The loop still closes: the turn is measured and priced.
+    let json = usage_llmhelper_json(&cfg);
+    assert_eq!(json["groups"][0]["source"], "llmhelper");
+    assert!((json["groups"][0]["cost"].as_f64().unwrap() - 0.7).abs() < 1e-9);
+
+    // And it is now attributed to a Project, not to the anonymous bucket.
+    let grouped = request_in(
+        &cfg,
+        &[
+            "usage",
+            "--json",
+            "--source",
+            "llmhelper",
+            "--group-by",
+            "project",
+        ],
+    );
+    let json: serde_json::Value = serde_json::from_slice(&grouped.stdout).unwrap();
+    assert!(
+        json["groups"][0]["key"].as_str().unwrap().ends_with("myproj"),
+        "a logged request must report the directory it was sent from"
+    );
+
+    // Which means `--project` can finally see it: the filtering gap spec 0027
+    // documented as permanent. `--project` is a substring match against the
+    // stored Project (the cwd as-is, matching Claude Code / OMP / Kilo /
+    // OpenCode), so the same filter a user writes for their Claude Code turns
+    // now covers their own requests.
+    let filtered = request_in(
+        &cfg,
+        &[
+            "usage",
+            "--json",
+            "--source",
+            "llmhelper",
+            "--project",
+            "myproj",
+        ],
+    );
+    assert!(
+        filtered.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(
+        json["groups"][0]["sessions"], 1,
+        "--project must now match a logged request"
+    );
+}
+
 /// The whole loop, end to end: spend (a real `--log` request against the test
 /// server) → measure (the log read back as the `llmhelper` Source) → gate (the
 /// next request refused on that measured spend) → pass (a ceiling above it).

@@ -431,7 +431,14 @@ Flags: `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db`, `--since`/`--l
 - kilo – SQLite `kilo.db` under `~/.local/share/kilo`
 - llmhelper – the per-day request logs written by `request --log`, read back as
   usage: one record per logged response carrying a `usage` block, priced by the
-  `[price.<model>]` config table (see [Budget gate](#budget-gate-the-cost-control-loop))
+  `[price.<model>]` config table (see [Budget gate](#budget-gate-the-cost-control-loop)).
+  Each logged request records the directory it was sent from (`cwd`), reported
+  as the record's Project (full path, like every other Source); log
+  lines written before that field existed keep an empty Project rather than
+  being backfilled. When the provider's response does not echo its model, the
+  record is charged against the model of the immediately preceding request
+  line, consumed once — a response that cannot be paired to a request gets no
+  model, hence no cost, hence a `not measured` budget (ADR 0009)
 
 Auto-discovered at defaults; override with `--claude-dir`, `--opencode-db`, `--omp-dir`, `--kilo-db` or config file. The `llmhelper` Source appears only once its log directory exists — a user who never ran `request --log` sees no phantom row.
 

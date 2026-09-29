@@ -523,10 +523,24 @@ pub fn resolved_log_dir(config: &Config) -> Option<PathBuf> {
     config.request_log_dir.clone().or_else(log_dir)
 }
 
-/// Append one JSON entry (`timestamp`, `direction`, `body`) to the per-day
-/// request log file under `log_dir`. Non-fatal: any I/O failure logs a warning
-/// to stderr and is otherwise ignored. The API key is never included in
-/// `body`.
+/// Append one JSON entry (`timestamp`, `direction`, `body`, `cwd`) to the
+/// per-day request log file under `log_dir`. Non-fatal: any I/O failure logs a
+/// warning to stderr and is otherwise ignored. The API key is never included
+/// in `body`.
+///
+/// `cwd` (spec 0029) is the directory the request was sent from, so the
+/// `llmhelper` Source can report a real Project instead of an empty one. It is
+/// the field the other four Sources already have, by a different mechanism:
+/// Claude Code encodes it into a folder name, OpenCode and Kilo store it in a
+/// `session.directory` column, OMP records a `cwd` field. The request log had
+/// no equivalent, so a turn was written to a file and the directory it was
+/// sent from was thrown away.
+///
+/// Adding a key is deliberately the whole format change: a JSON-lines log is
+/// append-compatible, and a reader that ignores unknown keys (every existing
+/// one) is unaffected. Old lines simply lack `cwd`, and their Records keep an
+/// empty Project — which is now a fact about the log rather than a permanent
+/// gap.
 pub fn write_request_log(log_dir: Option<&Path>, direction: &str, body: &str) {
     let Some(base) = log_dir else {
         return;
@@ -537,10 +551,17 @@ pub fn write_request_log(log_dir: Option<&Path>, direction: &str, body: &str) {
     }
     let day = chrono::Utc::now().format("%Y-%m-%d");
     let path = base.join(format!("request-{}.log", day));
+    // A failed `current_dir` (the directory was removed underneath us) yields
+    // `None`, which the reader treats exactly like an old log line: no
+    // Project, rather than a wrong one.
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     let line = serde_json::json!({
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "direction": direction,
         "body": body,
+        "cwd": cwd,
     });
     let line = format!("{}\n", serde_json::to_string(&line).unwrap_or_default());
     if let Err(e) = std::fs::OpenOptions::new()

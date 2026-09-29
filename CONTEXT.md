@@ -9,15 +9,22 @@ The token consumption and activity of a single agent session, broken into input,
 _Avoid_: stats, metrics, usage-data
 
 **Source**:
-One of the agent tools whose local files the CLI reads — plus `llmhelper` itself, whose Source reads back the request log that `request --log` writes. The five known sources are Claude Code (transcript JSONL), OpenCode (SQLite), OMP (per-session JSONL under `~/.omp/agent/sessions`), Kilo Code (SQLite `kilo.db` under `~/.local/share/kilo`), and llmhelper (per-day `request-*.log` under the resolved log dir, registered only when that directory exists). Each source has a distinct storage format and field coverage. Sources are auto-discovered at default paths and may be overridden by flags or a config file; reading all OpenCode DB variants and merging them is part of Source behavior.
+One of the agent tools whose local files the CLI reads — plus `llmhelper` itself, whose Source reads back the request log that `request --log` writes. The five known sources are Claude Code (transcript JSONL), OpenCode (SQLite), OMP (per-session JSONL under `~/.omp/agent/sessions`), Kilo Code (SQLite `kilo.db` under `~/.local/share/kilo`), and llmhelper (per-day `request-*.log` under the resolved log dir, registered only when that directory exists). Each source has a distinct storage format and field coverage. Sources are auto-discovered at default paths and may be overridden by flags or a config file; reading all OpenCode DB variants and merging them is part of Source behavior. Every Source knows its own Project the same way — a recorded fact: Claude Code encodes it in a folder name, OpenCode and Kilo in a `directory` column, OMP in `cwd`, and llmhelper in the request's `cwd`, written into the log envelope by `request` itself (pre-0029 logs lack the field and keep an empty Project rather than being backfilled).
 _Avoid_: provider, backend, agent
 
 **Project**:
-The working directory a Session ran in. Claude Code encodes it into the transcript folder name; OpenCode stores it in the session's `directory` field; OMP records it in the session entry's `cwd` (with the project directory name as fallback). Used to group Sessions across sources.
+The working directory a Session ran in — a full path in every Source: Claude
+  Code's transcript folder name decodes to an absolute path
+  (`decode_project_name` strips the `-`→`/` encoding back to a path); OpenCode
+  and Kilo's `directory` column is already a full path; OMP records it in the
+  session entry's `cwd` (falling back to the directory name only when the log
+  carries no `cwd`). llmhelper stores the request log's `cwd` envelope key as-
+  is. An empty or absent `cwd` leaves the Project empty rather than guessed.
+  Used to group Sessions across sources.
 _Avoid_: repo, workspace
 
 **Cost**:
-The monetary spend attributed to a Session by a Source that records it. OpenCode and OMP expose it directly; Claude Code does not, so its Cost is absent. The llmhelper Source logs tokens and never money, so its Cost is computed from the `[price.<model>]` rates at read time — a model with no price entry has no Cost, and a Budget on it is NotMeasured. Cost is always source-scoped — it must never be summed or averaged across Sources, only displayed per Source.
+The monetary spend attributed to a Session by a Source that records it. OpenCode and OMP expose it directly; Claude Code does not, so its Cost is absent. The llmhelper Source logs tokens and never money, so its Cost is computed from the `[price.<model>]` rates at read time — a model with no price entry has no Cost, and a Budget on it is NotMeasured. The model a logged response is charged against is taken, in order, from the response's own `model` field, then from the immediately preceding `request` line's model, consumed once so an interleaved log cannot hand a response another request's model (ADR 0009); a response that cannot be honestly paired gets no Model, therefore no Cost, and is NotMeasured — a wrong rate, silently selected, is the failure this avoids. Cost is always source-scoped — it must never be summed or averaged across Sources, only displayed per Source.
 _Avoid_: price, spend, expense — the `[price]` table holds per-million-token *rates*, which is the one place "price" names a different concept rather than Cost itself
 
 **Token Breakdown**:

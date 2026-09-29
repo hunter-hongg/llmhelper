@@ -1541,12 +1541,13 @@ mod kilo {
 
 /// The `llmhelper` Source: the request log read back as usage data.
 ///
-/// `request --log` writes one JSON envelope per line (`timestamp`, `direction`,
-/// `body`, where `body` is a stringified provider payload). This Source walks
-/// those files and emits one [`Record`] per logged *response* that carries a
-/// `usage` block — the token counts `request` parses, logs, and otherwise
-/// drops. That is what closes spec 0027's loop: the accumulated spend of past
-/// `request` runs becomes the measurement a budget gate can refuse on.
+/// `request --log` writes one JSON envelope per line: `timestamp`, `direction`,
+/// `body` (a stringified provider payload) and `cwd`.
+/// This Source walks those files and emits one [`Record`] per logged
+/// *response* that carries a `usage` block — the token counts `request`
+/// parses, logs, and otherwise drops. That is what closes spec 0027's loop:
+/// the accumulated spend of past `request` runs becomes the measurement a
+/// budget gate can refuse on.
 ///
 /// The log records tokens and never money, so a Cost exists only for models
 /// the `[price]` table prices; an unpriced model is `not measured`, not free.
@@ -1569,15 +1570,47 @@ mod llmhelper {
         name.starts_with("request-") && name.ends_with(".log")
     }
 
+    /// The Project for a logged request's `cwd` (spec 0029).
+    ///
+    /// The directory path **as-is**, matching the four other Sources: Claude
+    /// Code's decoded folder name, OpenCode/Kilo's `directory` column, and OMP's
+    /// `cwd` field all store a full path, so the llmhelper Source stores one too.
+    /// A full path here is what makes `--project /some/dir` match a logged request
+    /// at all (the project filter is a substring match), and the only thing that
+    /// lets a project aggregate across sources for `--group-by project`. A
+    /// basename would split the same directory into two buckets depending on
+    /// which Source a turn came from — the cross-Source inconsistency the
+    /// aggregator's `mixed` handling exists to prevent.
+    ///
+    /// Returns `""` for an empty, null, or root-only `cwd` (the directory has
+    /// no name to group by). The writer stores a null `cwd` (JSON `None`) when
+    /// `current_dir()` fails; `None` and `""` are both no-Project, which is the
+    /// honest state rather than an invented one.
+    fn project_from_cwd(cwd: Option<&str>) -> String {
+        let Some(cwd) = cwd.map(str::trim).filter(|c| !c.is_empty()) else {
+            return String::new();
+        };
+        // A trailing separator (`/home/u/api/`, or `/`) must not survive
+        // into the stored value — normalize it away so `/home/u/api` and
+        // `/home/u/api/` are one group, not two.
+        let trimmed = cwd.trim_end_matches(['/', '\\']);
+        // A filesystem root ("/", "C:\\") has a path but no name — and on a
+        // single-component Windows root the trimmed form is ≤2 chars, which a
+        // non-root single-segment path is not.
+        if trimmed.is_empty() || trimmed.len() <= 2 {
+            return String::new();
+        }
+        trimmed.to_string()
+    }
+
     /// Parse one log file's text into Records, returning the count of lines
     /// that were malformed enough to discard.
     ///
     /// The only clock is the envelope's own `timestamp`, and the only identity
     /// is `{file_name}#{1-based line number}` — an append-only log therefore
     /// re-reads to byte-identical output, which is what makes `usage` diffable
-    /// across runs. Pairing is positional: the most recent `request` line
-    /// supplies the model fallback for later `response` lines that omit it
-    /// (some providers do not echo the model).
+    /// across runs. A `response` that omits the model falls back to the model of
+    /// the one still-unconsumed `request` line, or to nothing (spec 0029, ADR 0009).
     pub fn parse_log_file(
         file_name: &str,
         contents: &str,
@@ -1585,7 +1618,15 @@ mod llmhelper {
     ) -> (Vec<Record>, usize) {
         let mut records = Vec::new();
         let mut skipped = 0usize;
-        let mut last_request_model: Option<String> = None;
+        // Spec 0029: a request line's model is *consumed* by the response that
+        // uses it, rather than remembered indefinitely. The old "most recent
+        // request line" rule is only right when a log is strictly
+        // request-then-response; in an interleaved log it hands a response
+        // another request's model, and a wrong model picks the wrong
+        // `[price.<model>]` row, so a budget silently measures the wrong spend.
+        // Consuming makes the fallback conservative: no unconsumed request
+        // means an unknown Model, which is `not measured` — not mispriced.
+        let mut pending_request_model: Option<String> = None;
 
         for (idx, line) in contents.lines().enumerate() {
             if line.trim().is_empty() {
@@ -1614,7 +1655,7 @@ mod llmhelper {
             };
             match envelope.get("direction").and_then(|d| d.as_str()) {
                 Some("request") => {
-                    last_request_model = body
+                    pending_request_model = body
                         .get("model")
                         .and_then(|m| m.as_str())
                         .map(str::to_string);
@@ -1635,10 +1676,15 @@ mod llmhelper {
                         skipped += 1;
                         continue;
                     };
+                    // Response echo wins; the remembered request is a fallback
+                    // and is consumed here (spec 0029), so a later response
+                    // cannot reuse it. `take()` rather than a borrow: the
+                    // value must be dropped even when the echo is present.
+                    let request_model = pending_request_model.take();
                     let model = body
                         .get("model")
                         .and_then(|m| m.as_str())
-                        .or(last_request_model.as_deref())
+                        .or(request_model.as_deref())
                         .unwrap_or_default()
                         .to_string();
                     let tokens = TokenBreakdown {
@@ -1663,9 +1709,13 @@ mod llmhelper {
                     records.push(Record {
                         session_id: format!("{}#{}", file_name, line_no),
                         source: "llmhelper".to_string(),
-                        // The log records no project, and inventing one would
-                        // lie: `--project` simply never matches these Records.
-                        project: String::new(),
+                        // The directory the request was sent from, written into
+                        // the log envelope as `cwd` (spec 0029). A log line
+                        // without it — written before that field existed —
+                        // leaves this empty, which is now a fact about the log
+                        // rather than a permanent gap: `--project` does not
+                        // match those Records, and says so.
+                        project: project_from_cwd(envelope.get("cwd").and_then(|c| c.as_str())),
                         model,
                         agent: None,
                         started_at,
@@ -1746,6 +1796,22 @@ mod llmhelper {
                 "timestamp": ts,
                 "direction": direction,
                 "body": body.to_string(),
+            })
+            .to_string()
+        }
+
+        /// An envelope carrying the `cwd` key spec 0029 added.
+        fn envelope_with_cwd(
+            direction: &str,
+            body: serde_json::Value,
+            ts: &str,
+            cwd: &str,
+        ) -> String {
+            serde_json::json!({
+                "timestamp": ts,
+                "direction": direction,
+                "body": body.to_string(),
+                "cwd": cwd,
             })
             .to_string()
         }
@@ -1958,6 +2024,181 @@ mod llmhelper {
                 sessions,
                 vec!["request-2026-09-21.log#1", "request-2026-09-22.log#1",]
             );
+        }
+
+        // --- spec 0029: Project and Model identity -------------------------
+
+        #[test]
+        fn a_logged_cwd_becomes_the_project_full_path() {
+            let text = format!(
+                "{}\n{}\n",
+                envelope_with_cwd(
+                    "request",
+                    serde_json::json!({"model": "gpt-4o"}),
+                    "2026-09-22T10:00:00+00:00",
+                    "/home/u/code/api",
+                ),
+                envelope_with_cwd(
+                    "response",
+                    serde_json::json!({"usage": usage(10, 5, None)}),
+                    "2026-09-22T10:00:05+00:00",
+                    "/home/u/code/api",
+                )
+            );
+            let (records, skipped) = parse(&text);
+            assert_eq!(skipped, 0);
+            assert_eq!(records[0].project, "/home/u/code/api");
+        }
+
+        #[test]
+        fn an_old_log_without_cwd_keeps_an_empty_project() {
+            // The pre-0029 format had no `cwd`. Its Records stay
+            // project-less rather than being backfilled: reconstructing a
+            // directory the log never recorded would be invention.
+            let text = format!(
+                "{}\n{}\n",
+                request_line("gpt-4o"),
+                response_line(Some("gpt-4o"), usage(10, 5, None))
+            );
+            let (records, _) = parse(&text);
+            assert_eq!(records[0].project, "");
+        }
+
+        #[test]
+        fn a_cwd_with_a_trailing_separator_is_normalized_to_its_full_path() {
+            let text = format!(
+                "{}\n",
+                envelope_with_cwd(
+                    "response",
+                    serde_json::json!({"usage": usage(10, 5, None)}),
+                    "2026-09-22T10:00:05+00:00",
+                    "/home/u/code/api/",
+                )
+            );
+            let (records, _) = parse(&text);
+            assert_eq!(records[0].project, "/home/u/code/api");
+        }
+
+        #[test]
+        fn a_root_or_useless_cwd_yields_no_project_rather_than_a_slash() {
+            for cwd in ["/", "", "   ", "C:\\"] {
+                let text = format!(
+                    "{}\n",
+                    envelope_with_cwd(
+                        "response",
+                        serde_json::json!({"usage": usage(10, 5, None)}),
+                        "2026-09-22T10:00:05+00:00",
+                        cwd,
+                    )
+                );
+                let (records, skipped) = parse(&text);
+                assert_eq!(skipped, 0, "cwd {cwd:?} should still parse");
+                assert_eq!(
+                    records[0].project, "",
+                    "cwd {cwd:?} must not invent a project"
+                );
+            }
+        }
+
+        #[test]
+        fn a_null_cwd_is_absent_not_a_crash() {
+            // `current_dir` can fail, so the writer emits JSON `null`.
+            let line = serde_json::json!({
+                "timestamp": "2026-09-22T10:00:05+00:00",
+                "direction": "response",
+                "body": serde_json::json!({"usage": usage(10, 5, None)}).to_string(),
+                "cwd": serde_json::Value::Null,
+            })
+            .to_string();
+            let (records, skipped) = parse(&format!("{line}\n"));
+            assert_eq!(skipped, 0);
+            assert_eq!(records[0].project, "");
+        }
+
+        #[test]
+        fn a_requested_model_is_consumed_so_a_later_response_cannot_reuse_it() {
+            // The regression this spec exists for. The old "most recent request
+            // line" rule handed this second response the first request's model,
+            // which would select the wrong `[price]` row — a budget on the real
+            // model silently measuring a different rate.
+            let text = format!(
+                "{}\n{}\n{}\n",
+                request_line("gpt-4o"),
+                response_line(None, usage(1000, 200, None)),
+                response_line(None, usage(1000, 200, None)),
+            );
+            let (records, skipped) = parse(&text);
+            assert_eq!(skipped, 0);
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].model, "gpt-4o", "first response pairs up");
+            assert_eq!(
+                records[1].model, "",
+                "second response must not inherit the consumed request"
+            );
+        }
+
+        #[test]
+        fn an_unpaired_response_is_unpriced_rather_than_mispriced() {
+            // The honest outcome of not knowing: no model, so no price, so
+            // `not measured`. Never the wrong model's rate.
+            let text = format!("{}\n", response_line(None, usage(1000, 200, None)));
+            let (records, _) = parse(&text);
+            assert_eq!(records[0].model, "");
+            assert_eq!(records[0].cost, None);
+        }
+
+        #[test]
+        fn an_interleaved_log_never_invents_a_second_model() {
+            // request(A) request(B) response response — the shape that breaks a
+            // positional fallback. The log carries no request id, so the pairs
+            // genuinely cannot be reconstructed; all the reader can do is use
+            // the most recent unconsumed request once and then admit
+            // ignorance.
+            //
+            // The first request is overwritten when the second arrives, so the
+            // first response takes "mistral" and the second takes nothing.
+            // That asymmetry is deliberate: a queue would look tidier and be a
+            // guess. Losing a measurement is recoverable; charging one
+            // response at another request's rate is not.
+            let text = format!(
+                "{}\n{}\n{}\n{}\n",
+                request_line("gpt-4o"),
+                request_line("mistral"),
+                response_line(None, usage(1, 1, None)),
+                response_line(None, usage(1, 1, None)),
+            );
+            let (records, _) = parse(&text);
+            let models: Vec<&str> = records.iter().map(|r| r.model.as_str()).collect();
+            assert_eq!(models, vec!["mistral", ""]);
+            // Both are unpriced, because "mistral" is not in the test table and
+            // the second has no model at all.
+            assert_eq!(records[0].cost, None);
+            assert_eq!(records[1].cost, None);
+        }
+
+        #[test]
+        fn a_response_echo_beats_the_remembered_request_model() {
+            let text = format!(
+                "{}\n{}\n",
+                request_line("gpt-4o"),
+                response_line(Some("claude-3"), usage(10, 5, None))
+            );
+            let (records, _) = parse(&text);
+            assert_eq!(records[0].model, "claude-3");
+        }
+
+        #[test]
+        fn a_paired_request_and_response_still_prices_identically() {
+            // Spec 0029 changed the format and the pairing rule; the common
+            // one-request-one-response case must be untouched by both.
+            let text = format!(
+                "{}\n{}\n",
+                request_line("gpt-4o"),
+                response_line(None, usage(1000, 200, Some(50)))
+            );
+            let (records, _) = parse(&text);
+            assert_eq!(records[0].model, "gpt-4o");
+            assert_eq!(records[0].cost, Some(0.0041));
         }
     }
 }
