@@ -1,15 +1,15 @@
 ---
 id: 0028
 title: "distribution — make llmhelper installable and discoverable outside this checkout"
-status: done
+status: ready-for-agent
 created: 2026-09-27
-updated: 2026-09-29
-triage: done
+updated: 2026-09-27
+triage: ready-for-agent
 ---
 
 ## Problem Statement
 
-`llmhelper` is a finished tool — 10 subcommands, 790 tests, 27 shipped specs,
+- `llmhelper` is a finished tool — 10 subcommands, 799 tests, 27 shipped specs,
 7 ADRs — that nobody but this checkout's author can use. Four concrete
 blockers, in descending order of how much they cost a new user:
 
@@ -92,18 +92,22 @@ decide *where it is installed from*.
 
 ### Man pages and completions
 
-- A `build.rs` generates, at build time:
+- A `man` subcommand (`src/dist.rs`, hidden via `#[command(hide = true)]`)
+  renders, on demand, from the in-memory `Cli` tree of the running binary:
   - a man page per subcommand (`llmhelper.1`, `llmhelper-usage.1`, …) via
     `clap_mangen`;
   - completion scripts for bash, zsh, fish, and PowerShell via
     `clap_complete`.
-- **They are build artifacts, not checked in.** This is the whole point: a
-  checked-in man page drifts the first time a flag is added, and the drift is
-  invisible. Generating from the live clap definition makes drift impossible.
-- Output goes to `OUT_DIR` (the normal Rust mechanism) and is surfaced to the
-  user by a `dist` target that copies it into `target/dist/`.
-- A `Makefile` (or just a documented `make dist`) provides the copy step, so
-  a user who wants the man page installed has one command to run.
+- Output goes to a directory (`target/dist/` by default; `--out-dir`,
+  `--stdout`, and `--completions <shell>` for one script on stdout, for
+  packaging). A `build.rs` could not host this generator: `src/cli.rs` reaches
+  into `crate::filter`, `crate::config`, and the rest of the library, so a
+  build script would have to depend on the crate it builds — a circular
+  dependency cargo will not run (ADR 0008).
+- Man pages and completions are **generated at run time, not at build time** or
+  checked in. This is the whole point: a checked-in page drifts the first time
+  a flag is added, and the drift is invisible. Generating from the live clap
+  definition at the call site makes that drift unrepresentable.
 
 ### Help output as a map
 
@@ -115,12 +119,15 @@ decide *where it is installed from*.
   generation machinery: clap already renders `after_help`.
 
 ### CI
-
 - `.github/workflows/ci.yml` runs on push and pull request:
   - `cargo fmt --check`
-  - `cargo clippy --all-targets -- -D warnings`
-  - `cargo test` (all targets)
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+  - `cargo test --all-targets`
   on `ubuntu-latest` and `macos-latest`.
+- A separate `install` job runs `cargo install --path . --root /tmp/llmhelper-install`
+  on `ubuntu-latest` and smoke-tests the installed binary (`--version`,
+  `man --completions bash --stdout`, `--help`) — the exact command a user
+  runs, proving the release profile compiles.
 - A `rust-toolchain.toml` pins the channel, so a local toolchain and CI agree.
 
 ## Out of Scope
@@ -146,13 +153,16 @@ decide *where it is installed from*.
 
 ## Architectural Decisions
 
-- **Man pages and completions are generated at build time, not committed.**
+- **Man pages and completions are generated at run time, not committed.**
   The alternative — checking them in — means every flag change requires
   regenerating a binary-ish artifact, and a stale man page is worse than none
-  because a user trusts it. `build.rs` + `clap_mangen` + `clap_complete`
-  makes the drift unrepresentable. The cost is a `build-dependencies`
-  section and a slightly slower build; the benefit is that the help output is
-  *provably* the help output.
+  because a user trusts it. A `man` subcommand renders them from the live
+  `Cli` tree of the running binary; a `build.rs` cannot host the generator,
+  because `src/cli.rs` reaches into `crate::filter`, `crate::config`, and the
+  rest of the library, so a build script would have to depend on the crate it
+  builds — a circular dependency cargo will not run (ADR 0008). The cost is a
+  few hundred KB of runtime generator code a user never invokes; the benefit
+  is that the help output is *provably* the help output.
 - **Help text is written as answers, not as mechanics.** Every subcommand
   answers a question ("which project ate the budget?", "what did we say about
   X?"). The `about` line is that question's short form. This costs nothing
@@ -169,12 +179,13 @@ decide *where it is installed from*.
 
 ## Testing Decisions
 
-- The build script itself is exercised by a test that asserts the expected
-  man-page and completion filenames exist in `OUT_DIR` after a build. This
-  catches the "I renamed a subcommand and the generator silently produced
-  nothing" failure.
-- `cargo install --path .` is verified in CI on both platforms — it is the
-  exact command a user runs, so it is the contract.
+- A test that runs `llmhelper man` and asserts the expected man-page and
+  completion filenames appear and are non-empty. This is the runtime seam (not
+  a build script) catching the "I renamed a subcommand and the generator
+  silently produced nothing" failure.
+- `cargo install --path .` and `cargo package --list` are verified in CI — the
+  former is the exact command a user runs (it proves the release profile
+  compiles), the latter is what crates.io would reject on.
 - An assertion that every subcommand has a non-empty `about` prevents a
   subcommand from shipping with a blank help line.
 - No test asserts the *content* of generated man pages (that is clap's job);
@@ -185,8 +196,8 @@ decide *where it is installed from*.
 
 - `cargo install` builds with `--release`; the TUI is the only interactive
   part, so build time matters more than usual for a tool people install.
-- The `include` list keeps the `.crate` small: the 109 KB changelog and
-  33 KB README are the two large tracked docs, and the ADRs/specs are worth
+- The `include` list keeps the `.crate` small: the 108 KB changelog and
+  34 KB README are the two large tracked docs, and the ADRs/specs are worth
   shipping because the README links into them.
 - crates.io has a 10 MB package limit; the current tree is far under it, but
   `target/` must never be packaged (`.gitignore` already excludes it, and
