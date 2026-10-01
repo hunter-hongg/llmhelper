@@ -1338,7 +1338,10 @@ fn a_logged_request_carries_its_working_directory_as_the_project() {
     );
     let json: serde_json::Value = serde_json::from_slice(&grouped.stdout).unwrap();
     assert!(
-        json["groups"][0]["key"].as_str().unwrap().ends_with("myproj"),
+        json["groups"][0]["key"]
+            .as_str()
+            .unwrap()
+            .ends_with("myproj"),
         "a logged request must report the directory it was sent from"
     );
 

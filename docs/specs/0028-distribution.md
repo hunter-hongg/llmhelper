@@ -9,7 +9,7 @@ triage: ready-for-agent
 
 ## Problem Statement
 
-- `llmhelper` is a finished tool — 10 subcommands, 799 tests, 27 shipped specs,
+- `llmhelper` is a finished tool — 10 subcommands, 810 tests, 27 shipped specs,
 7 ADRs — that nobody but this checkout's author can use. Four concrete
 blockers, in descending order of how much they cost a new user:
 
@@ -27,7 +27,7 @@ blockers, in descending order of how much they cost a new user:
 - **It is undiscoverable.** No man page, no shell completions, no `build.rs`.
   A user who installs it must know that `--match` exists, that there are ten
   subcommands, and that `Tab` cycles a grouping in the `usage` TUI. None of
-  that is reachable from `llmhelper --help` alone, and the README — 33 KB —
+  that is reachable from `llmhelper --help` alone, and the README — 35 KB —
   is far too long to read before first use.
 - **Nobody checks it still builds.** No CI, no `rust-toolchain.toml`. Every
   claim in the changelog about "790 tests green" rests on one machine, one
@@ -43,7 +43,7 @@ never seen this repository, without changing what it does.
 - **Document the build prerequisites** (OpenSSL headers) in the README, so the
   one hard prerequisite is stated before it is hit rather than after.
 - **Generate man pages and shell completions** from the existing clap
-  definitions, at build time, so they cannot drift from the CLI.
+  definitions, at run time, so they cannot drift from the CLI.
 - **Add CI** that runs the test suite, clippy, and fmt on Linux and macOS.
 - **Add a "Getting started / install" section** at the top of the README —
   the first screen a crates.io visitor sees.
@@ -61,7 +61,7 @@ decide *where it is installed from*.
    a build error, so I am not confused by a `pkg-config` message about a
    crate I have never heard of.
 3. As a user, I want `man llmhelper` and `llmhelper <TAB>` to work, so I can
-   discover the ten subcommands and their flags without reading 33 KB.
+  discover the ten subcommands and their flags without reading 35 KB.
 4. As a user, I want the help output to be a usable map of the tool, so
    `--help` alone tells me what exists.
 5. As the author, I want CI to run the tests, clippy, and fmt on every push, so
