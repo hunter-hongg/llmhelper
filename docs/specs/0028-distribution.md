@@ -196,8 +196,8 @@ decide *where it is installed from*.
 
 - `cargo install` builds with `--release`; the TUI is the only interactive
   part, so build time matters more than usual for a tool people install.
-- The `include` list keeps the `.crate` small: the 108 KB changelog and
-  34 KB README are the two large tracked docs, and the ADRs/specs are worth
+- The `include` list keeps the `.crate` small: the 113 KB changelog and
+  35 KB README are the two large tracked docs, and the ADRs/specs are worth
   shipping because the README links into them.
 - crates.io has a 10 MB package limit; the current tree is far under it, but
   `target/` must never be packaged (`.gitignore` already excludes it, and
